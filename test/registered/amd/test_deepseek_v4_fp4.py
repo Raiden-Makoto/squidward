@@ -41,7 +41,6 @@ COMMON_ENV_VARS = {
     "SGLANG_OPT_USE_FUSED_COMPRESS": "false",
     "SGLANG_OPT_USE_OLD_COMPRESSOR": "true",
     "SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK": "false",
-    "SGLANG_OPT_USE_FUSED_HASH_TOPK": "false",
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "false",
     "SGLANG_ENABLE_THINKING": "1",
     "SGLANG_USE_AITER": "1",
@@ -59,7 +58,6 @@ COMMON_ENV_VARS = {
 # FP4 variant: FP4 mixed-precision experts.
 FP4_ENV_VARS = {
     "SGLANG_DSV4_FP4_EXPERTS": "true",
-    "SGLANG_FORCE_TRITON_MOE_FP8": "0",
 }
 
 
