@@ -702,13 +702,18 @@ def fused_store_cache(
     page_size: int,
     type: Literal["flashmla", "indexer"],
 ) -> None:
-    module = _jit_fused_store_module(
-        name=type,
-        input_dtype=input.dtype,
-        index_dtype=indices.dtype,
-        page_size=page_size,
-    )
-    module.run(input, cache, indices)
+    if is_hip_runtime() and get_bool_env_var("SGLANG_OPT_USE_FUSED_STORE_CACHE"):
+        from sglang.jit_kernel.triton_store_cache import triton_fused_store_cache
+
+        triton_fused_store_cache(input, cache, indices, page_size=page_size, type=type)
+    else:
+        module = _jit_fused_store_module(
+            name=type,
+            input_dtype=input.dtype,
+            index_dtype=indices.dtype,
+            page_size=page_size,
+        )
+        module.run(input, cache, indices)
 
 
 @cache_once
