@@ -1,3 +1,6 @@
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}/python:${PYTHONPATH}"
+
 export SGLANG_OPT_USE_OLD_COMPRESSOR=true
 export SGLANG_OPT_DEEPGEMM_HC_PRENORM=false
 
@@ -18,8 +21,7 @@ export SGLANG_OPT_USE_FUSED_HASH_TOPK=true
 
 export AITER_BF16_FP8_MOE_BOUND=1
 
-MODEL=/dockerx/data/deepseek-ai/DeepSeek-V4-Pro
-#MODEL=/dockerx/data/sgl-project/DeepSeek-V4-Flash-FP8/
+MODEL=${MODEL:-/shareddata/macui/hf_home/hub/models--sgl-project--DeepSeek-V4-Pro-FP8/snapshots/54eeff4ae56c7605c99bbb8b5fcd54412745fb5f}
 
 python3 -m sglang.launch_server \
     --model-path ${MODEL} \
