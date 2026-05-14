@@ -27,7 +27,6 @@ python3 -m sglang.launch_server \
     --model-path ${MODEL} \
     --trust-remote-code \
     --tp 8 \
-    --disable-radix-cache \
     --attention-backend compressed \
     --max-running-request 256 \
     --page-size 256 \
