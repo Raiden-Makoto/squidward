@@ -39,6 +39,8 @@ from sglang.srt.layers.communicator import LayerScatterModes, get_attn_tp_contex
 from sglang.srt.layers.deepseek_v4_rope import (
     apply_rotary_emb_triton,
     fused_norm_rope_inplace_triton,
+    fused_softmax_pool_split_triton,
+    fused_softmax_pool_triton,
 )
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
@@ -78,11 +80,11 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
+    is_gfx95_supported,
+    is_hip,
     log_info_on_rank0,
     make_layers,
     maybe_torch_compile,
-    is_gfx95_supported,
-    is_hip,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,6 +100,7 @@ _is_gfx95_supported = is_gfx95_supported()
 
 if _use_aiter:
     from aiter import rope_rotate_activation
+
     if is_gfx95_supported():
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
@@ -492,10 +495,16 @@ class Compressor(nn.Module):
                     pt += extend_lens[i]
                     continue
 
-            kv_compressed = (
-                kv_and_score_to_compress.kv
-                * kv_and_score_to_compress.score.softmax(dim=1)
-            ).sum(dim=1)
+            if self.use_hip_fused_compress:
+                kv_compressed = fused_softmax_pool_triton(
+                    kv_and_score_to_compress.kv_score,
+                    kv_and_score_to_compress._item_size,
+                )
+            else:
+                kv_compressed = (
+                    kv_and_score_to_compress.kv
+                    * kv_and_score_to_compress.score.softmax(dim=1)
+                ).sum(dim=1)
 
             # NOTE: ref code requires dtype as the same as hidden states (float32)
             # the raw output of kv_compressed is float32 already
@@ -605,9 +614,16 @@ class Compressor(nn.Module):
             bs, self.ratio * self.coff, self.head_dim
         )
 
-        kv_compressed = (
-            kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
-        ).sum(dim=1)
+        if self.use_hip_fused_compress:
+            kv_compressed = fused_softmax_pool_triton(
+                kv_and_score_to_compress.kv_score,
+                kv_and_score_to_compress._item_size,
+            )
+        else:
+            kv_compressed = (
+                kv_and_score_to_compress.kv
+                * kv_and_score_to_compress.score.softmax(dim=1)
+            ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
         if self.use_hip_fused_compress:
             # HIP-only: share the per-step freqs_cis gather across layers.
@@ -731,10 +747,16 @@ class Compressor(nn.Module):
                     pt += extend_lens[i]
                     continue
 
-            kv_compressed = (
-                kv_and_score_to_compress.kv
-                * kv_and_score_to_compress.score.softmax(dim=1)
-            ).sum(dim=1)
+            if self.use_hip_fused_compress:
+                kv_compressed = fused_softmax_pool_triton(
+                    kv_and_score_to_compress.kv_score,
+                    kv_and_score_to_compress._item_size,
+                )
+            else:
+                kv_compressed = (
+                    kv_and_score_to_compress.kv
+                    * kv_and_score_to_compress.score.softmax(dim=1)
+                ).sum(dim=1)
 
             # NOTE: ref code requires dtype as the same as hidden states (float32)
             # the raw output of kv_compressed is float32 already
@@ -832,9 +854,16 @@ class Compressor(nn.Module):
             bs, self.ratio * self.coff, self.head_dim
         )
 
-        kv_compressed = (
-            kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
-        ).sum(dim=1)
+        if self.use_hip_fused_compress:
+            kv_compressed = fused_softmax_pool_triton(
+                kv_and_score_to_compress.kv_score,
+                kv_and_score_to_compress._item_size,
+            )
+        else:
+            kv_compressed = (
+                kv_and_score_to_compress.kv
+                * kv_and_score_to_compress.score.softmax(dim=1)
+            ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
         if self.use_hip_fused_compress:
             # HIP-only: share the per-step freqs_cis gather across layers.
@@ -1034,10 +1063,17 @@ class Compressor(nn.Module):
                     pt += extend_lens[i]
                     continue
 
-            kv_compressed = (
-                kv_and_score_to_compress.kv
-                * kv_and_score_to_compress.score.softmax(dim=1)
-            ).sum(dim=1)
+            if self.use_hip_fused_compress:
+                kv_compressed = fused_softmax_pool_split_triton(
+                    kv_and_score_to_compress.kv,
+                    kv_and_score_to_compress.score,
+                    kv_and_score_to_compress.kv.shape[-1],
+                )
+            else:
+                kv_compressed = (
+                    kv_and_score_to_compress.kv
+                    * kv_and_score_to_compress.score.softmax(dim=1)
+                ).sum(dim=1)
 
             # NOTE: ref code requires dtype as the same as hidden states (float32)
             # the raw output of kv_compressed is float32 already
@@ -1183,10 +1219,17 @@ class Compressor(nn.Module):
                 bs, self.ratio * self.coff, self.head_dim
             )
 
-            kv_compressed = (
-                kv_and_score_to_compress.kv
-                * kv_and_score_to_compress.score.softmax(dim=1)
-            ).sum(dim=1)
+            if self.use_hip_fused_compress:
+                kv_compressed = fused_softmax_pool_split_triton(
+                    kv_and_score_to_compress.kv,
+                    kv_and_score_to_compress.score,
+                    self.head_dim,
+                )
+            else:
+                kv_compressed = (
+                    kv_and_score_to_compress.kv
+                    * kv_and_score_to_compress.score.softmax(dim=1)
+                ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
         if self.use_hip_fused_compress:
             # HIP-only: share the per-step freqs_cis gather across layers.
@@ -1477,13 +1520,30 @@ class MQALayer(nn.Module):
 
         # Note: attention sink should be replicated
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
-        self.wq_a = ReplicatedLinear(
-            self.hidden_size,
-            self.q_lora_rank,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("wq_a", prefix),
-        )
+        self.fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        if self.fuse_wqa_wkv:
+            self.wqkv_a = ReplicatedLinear(
+                self.hidden_size,
+                self.q_lora_rank + self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("wqkv_a", prefix),
+            )
+        else:
+            self.wq_a = ReplicatedLinear(
+                self.hidden_size,
+                self.q_lora_rank,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("wq_a", prefix),
+            )
+            self.wkv = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("wkv", prefix),
+            )
         self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
@@ -1493,13 +1553,6 @@ class MQALayer(nn.Module):
             prefix=add_prefix("wq_b", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
-        )
-        self.wkv = ReplicatedLinear(
-            self.hidden_size,
-            self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("wkv", prefix),
         )
         self.kv_norm = RMSNorm(self.head_dim, eps=self.eps)
         self.wo_a = ColumnParallelLinear(
@@ -1667,8 +1720,15 @@ class MQALayer(nn.Module):
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # fp8 tuple: Fp8LinearMethod.apply handles isinstance(x, tuple), skips per1x128 quant
-        q, _ = self.wq_a(x_quant if x_quant is not None else x)
+        if self.fuse_wqa_wkv:
+            qkv_a, _ = self.wqkv_a(x)
+            q = qkv_a[..., : self.q_lora_rank]
+            kv = qkv_a[..., self.q_lora_rank :]
+            del qkv_a
+        else:
+            kv, _ = self.wkv(x_quant if x_quant is not None else x)
+            # fp8 tuple: Fp8LinearMethod.apply handles isinstance(x, tuple), skips per1x128 quant
+            q, _ = self.wq_a(x_quant if x_quant is not None else x)
         # [bs, q_lora_rank]
         q = self.q_norm(q)
         q_lora = q  # only used for indexer
@@ -1679,7 +1739,6 @@ class MQALayer(nn.Module):
         q = rms_normalize_triton(q, self.eps)
 
         # fp8 tuple: same as wq_a
-        kv, _ = self.wkv(x_quant if x_quant is not None else x)
         kv = self.kv_norm(kv)
 
         fused_rope(
@@ -1776,7 +1835,12 @@ class MQALayer(nn.Module):
             )
         else:
             q, kv = self._forward_prepare(
-                x, positions, forward_batch, attn_backend, freqs_cis, q_out,
+                x,
+                positions,
+                forward_batch,
+                attn_backend,
+                freqs_cis,
+                q_out,
                 x_quant=x_quant,
             )
 
@@ -2638,6 +2702,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         cache_compressor_weight = {}
         COMPRESSOR_PART = ".compressor.w"  # match wkv and wgate, skip ape
 
+        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
+
         # use default weight loader if module has no custom weight_loader
         def auto_weight_loader(module):
             return getattr(module, "weight_loader", default_weight_loader)
@@ -2841,6 +2908,37 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     )
                                     loaded_params.add(param_name)
                                     cache_compressor_weight.pop(key)
+                            elif fuse_wqa_wkv and (
+                                name.endswith(".wq_a.weight")
+                                or name.endswith(".wq_a.weight_scale_inv")
+                                or name.endswith(".wkv.weight")
+                                or name.endswith(".wkv.weight_scale_inv")
+                            ):
+                                is_q = ".wq_a." in name
+                                param_name = name.replace(
+                                    ".wq_a." if is_q else ".wkv.", ".wqkv_a."
+                                )
+                                bucket = cache_wqkv_a_weight.setdefault(param_name, {})
+                                shard_key = "q" if is_q else "kv"
+                                assert (
+                                    shard_key not in bucket
+                                ), f"duplicate shard {shard_key} for {param_name}"
+                                bucket[shard_key] = loaded_weight
+                                if len(bucket) == 2:
+                                    fused_weight = torch.cat(
+                                        [bucket["q"], bucket["kv"]], dim=0
+                                    )
+                                    param = params_dict[param_name]
+                                    weight_loader = auto_weight_loader(param)
+                                    maybe_executor_submit(
+                                        executor=executor,
+                                        futures=futures,
+                                        use_async=use_async_loading,
+                                        func=weight_loader,
+                                        func_args=(param, fused_weight),
+                                    )
+                                    loaded_params.add(param_name)
+                                    cache_wqkv_a_weight.pop(param_name)
                             else:
                                 if (
                                     "k_scale" in name or "v_scale" in name
@@ -2890,6 +2988,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 future.result()
 
         assert len(cache_compressor_weight) == 0
+        assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
         unloaded_params = params_dict.keys() - loaded_params
 
         skipped_checking_patterns = ["attn_mqa.k_scale", "attn_mqa.v_scale"]
