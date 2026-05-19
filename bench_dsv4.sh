@@ -32,7 +32,7 @@ echo "TIMESTAMP=${TIMESTAMP}"
 echo "OUT_DIR=${OUT_DIR}"
 [ "${ENABLE_PROFILE}" -eq 1 ] && echo "PROFILER_DIR=${SGLANG_TORCH_PROFILER_DIR}"
 
-for concurrency in 2 4 8 16 32
+for concurrency in 2 4 8
 do
     prompt=$((concurrency * 4))
 
