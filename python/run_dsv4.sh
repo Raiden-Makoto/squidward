@@ -26,6 +26,7 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --tp 8 \
     --attention-backend compressed \
+    --mem-fraction-static 0.90 \
     --max-running-request 256 \
     --page-size 256 \
     --chunked-prefill-size 8192 \
