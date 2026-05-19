@@ -19,7 +19,7 @@ export SGLANG_OPT_USE_FUSED_PAGED_COMPRESS=true
 
 export AITER_BF16_FP8_MOE_BOUND=1
 
-MODEL=${MODEL:-/shareddata/macui/hf_home/hub/models--sgl-project--DeepSeek-V4-Pro-FP8/snapshots/54eeff4ae56c7605c99bbb8b5fcd54412745fb5f}
+MODEL=${MODEL:-/root/hf_home/hub/models--sgl-project--DeepSeek-V4-Pro-FP8/snapshots/54eeff4ae56c7605c99bbb8b5fcd54412745fb5f}
 
 python3 -m sglang.launch_server \
     --model-path ${MODEL} \
