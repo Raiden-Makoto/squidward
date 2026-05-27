@@ -1120,7 +1120,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         is_fp8_fnuz as _is_fp8_fnuz,
                     )
                     if _flydsl_available():
-                        logger.info(
+                        logger.debug(
                             "[FlyDSL] dispatching C4 NSA prefill (%d tokens)", q.shape[0]
                         )
                         total_tok = q.shape[0]   # b, with s_q=1 after unsqueeze
@@ -1138,14 +1138,13 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         )
                         # out_swa: [T, 1, H, D],  lse_swa: [T, 1, H]
 
-                        # ── Step 2: Build dequantized + rescaled fp8 C4 KV tensor ──
-                        # The C4 buffer (uint8) layout per page:
-                        #   [token_0 .. token_{P-1}] × 576 bytes (448 fp8 nope + 128 bf16 rope)
-                        #   [token_0 .. token_{P-1}] × 8  bytes  (7 ue8m0 scale + 1 pad)
-                        # The 448 fp8 nope bytes are split into 7 tiles of 64 values,
-                        # each with its own ue8m0 scale: k_bf16[tile] = k_fp8[tile] * 2^(s-127).
-                        # We must dequantize and then requantize with a single global
-                        # scale so that the FlyDSL MFMA dot products are meaningful.
+                        # ── Step 2: Selective gather + dequantize fp8 C4 KV ────────
+                        # Buffer layout per page (uint8):
+                        #   [token × 576 bytes]  nope(448 fp8) + rope(128 bf16)
+                        #   [token × 8  bytes]   7 ue8m0 scale bytes + 1 pad
+                        # Nope is split into 7 × 64-element tiles each with its own
+                        # ue8m0 scale.  We gather ONLY the T×TOPK entries actually
+                        # used by idx_2d (much cheaper than dequantizing the full cache).
                         _raw_c4 = token_to_kv_pool.get_extra_key_buffer(layer_id)
                         _np      = _raw_c4.shape[0]           # num C4 pages
                         _c4_psz  = page_sizes[compress_ratio] # tokens per C4 page
@@ -1162,43 +1161,65 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         )
                         _fp8_max = torch.finfo(_fp8_t).max
 
-                        # Data region: [_np, _c4_psz, 576] uint8
-                        _data = _raw_c4[:, : _c4_psz * _stride].view(
-                            _np, _c4_psz, _stride
+                        # Prepare indices first (needed for gather)
+                        idx_2d = extra_indices.reshape(
+                            total_tok, extra_indices.shape[-1]
+                        ).clamp(min=0)                         # [T, TOPK], range [0, _np*_c4_psz)
+                        TOPK = idx_2d.shape[-1]
+
+                        # Map flat token indices → (page, slot_in_page)
+                        _idx_flat  = idx_2d.reshape(-1)        # [T*TOPK]
+                        _page_idx  = _idx_flat // _c4_psz      # [T*TOPK]
+                        _tok_slot  = _idx_flat  % _c4_psz      # [T*TOPK]
+
+                        # Data view: [_np, _c4_psz, 576] uint8
+                        _data = _raw_c4[:, :_c4_psz * _stride].view(_np, _c4_psz, _stride)
+
+                        # Gather nope fp8: [T*TOPK, 448]
+                        _nope_fp8_g = (
+                            _data[:, :, :_nope].contiguous()
+                            .view(_fp8_t)[_page_idx, _tok_slot]
                         )
-                        # Scale region: [_np, _c4_psz, 7] uint8
-                        _s_off   = _c4_psz * _stride
-                        _s_reg   = _raw_c4[:, _s_off : _s_off + _c4_psz * _s_tok]
-                        _scale_u8 = _s_reg.view(_np, _c4_psz, _s_tok)[:, :, :_n_tiles]
 
-                        # Dequantize nope fp8 → bf16 using per-tile ue8m0 scales
-                        _nope_fp8_raw = _data[:, :, :_nope].contiguous().view(_fp8_t)
-                        _tile_scales  = torch.exp2(_scale_u8.float() - 127.0)         # [P,T,7]
-                        _tile_sc_exp  = _tile_scales.repeat_interleave(_tile_sz, dim=-1)  # [P,T,448]
-                        _nope_bf16    = (_nope_fp8_raw.float() * _tile_sc_exp).to(torch.bfloat16)
+                        # Gather ue8m0 scale bytes: [T*TOPK, 7]
+                        _s_off    = _c4_psz * _stride
+                        _scale_u8 = (
+                            _raw_c4[:, _s_off : _s_off + _c4_psz * _s_tok]
+                            .view(_np, _c4_psz, _s_tok)[:, :, :_n_tiles]
+                        )                                       # [_np, _c4_psz, 7]
+                        _scale_g  = _scale_u8[_page_idx, _tok_slot]  # [T*TOPK, 7]
 
-                        # Rope: already bf16
+                        # Dequantize: nope_bf16 = nope_fp8 × 2^(scale_u8 - 127)
+                        _tile_sc  = torch.exp2(_scale_g.float() - 127.0)        # [T*TOPK, 7]
+                        _tile_sc_e = _tile_sc.repeat_interleave(_tile_sz, dim=-1)  # [T*TOPK, 448]
+                        _nope_bf16 = (_nope_fp8_g.float() * _tile_sc_e).to(torch.bfloat16)
+
+                        # Gather rope bf16: [T*TOPK, 64]
                         _rope_bf16 = (
-                            _data[:, :, _nope:_stride].contiguous().view(torch.bfloat16)
+                            _data[:, :, _nope:_stride].contiguous()
+                            .view(torch.bfloat16)[_page_idx, _tok_slot]
                         )
 
-                        # Full KV in bf16: [P*T, 512]
-                        _kv_bf16 = (
-                            torch.cat([_nope_bf16, _rope_bf16], dim=-1)
-                            .view(_np * _c4_psz, 512)
-                        )
+                        # Full gathered KV in bf16: [T*TOPK, 512]
+                        _kv_bf16 = torch.cat([_nope_bf16, _rope_bf16], dim=-1)
 
-                        # Requantize KV to fp8 with a single global scale
+                        # Requantize gathered KV to fp8 with a single global scale
+                        # (scale computed over actually-used entries → tighter range)
                         _kv_amax  = _kv_bf16.abs().max().clamp(min=1e-8)
                         _kv_scale = (_kv_amax / _fp8_max).item()
                         _kv_flat  = (
                             (_kv_bf16.float() / _kv_scale)
                             .clamp(-_fp8_max, _fp8_max)
                             .to(_fp8_t)
-                        )
+                        )                                       # [T*TOPK, 512]
 
-                        # ── Step 3: Quantize Q to fp8 and prepare indices ──────────
-                        # q: [T, 1, H, 512] bf16 → [T, H, 512] fp8 with per-tensor scale
+                        # New sequential indices: token t → rows [t*TOPK, (t+1)*TOPK)
+                        idx_2d = torch.arange(
+                            total_tok * TOPK, device=q.device, dtype=torch.int32
+                        ).view(total_tok, TOPK)
+
+                        # ── Step 3: Quantize Q to fp8 with per-tensor scale ─────────
+                        # q: [T, 1, H, 512] bf16 → [T, H, 512] fp8
                         _q_bf16   = q.reshape(total_tok, h_q_dim, q.shape[-1])
                         _q_amax   = _q_bf16.abs().max().clamp(min=1e-8)
                         _q_scale  = (_q_amax / _fp8_max).item()
@@ -1207,15 +1228,8 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                             .clamp(-_fp8_max, _fp8_max)
                             .to(_fp8_t)
                         )
-                        # Effective softmax scale: true QK = Q_fp8*q_scale @ K_fp8*kv_scale,
-                        # so sm_scale must absorb both quantization denominators.
+                        # Effective sm_scale folds in both FP8 quantization denominators
                         _eff_sm_scale = self.softmax_scale * _q_scale * _kv_scale
-
-                        # extra_indices: [T, 1, 512] → [T, 512] int32
-                        # -1 sentinels mark padding slots; clamp to 0 for safe KV access.
-                        idx_2d = extra_indices.reshape(
-                            total_tok, extra_indices.shape[-1]
-                        ).clamp(min=0)
 
                         # ── Step 4: FlyDSL C4 attention ────────────────────────────
                         out_c4, lse_c4 = flydsl_nsa_prefill_with_lse(
