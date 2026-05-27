@@ -486,16 +486,19 @@ def flydsl_nsa_prefill(
     assert kv.dtype == q.dtype, f"kv dtype {kv.dtype} != q dtype {q.dtype}"
     assert indices.dtype == torch.int32
 
-    # Pad to TILE_M=16 rows so the kernel (which always writes all 16 rows per CTA)
-    # does not overflow the allocation and hit the guard page that ROCm places at the
-    # page boundary immediately following the tensor.
-    _pad   = ((total_tokens + 15) // 16) * 16
+    # Pad all token-indexed tensors to TILE_M=16 multiples so that every CTA can
+    # safely read/write its full 16-row tile without going OOB.
+    _pad    = ((total_tokens + 15) // 16) * 16
+    q_pad   = torch.zeros((_pad, h_q, head_dim), dtype=q.dtype, device=q.device)
+    q_pad[:total_tokens] = q
+    idx_pad = torch.zeros((_pad, topk), dtype=indices.dtype, device=indices.device)
+    idx_pad[:total_tokens] = indices
     out    = torch.empty((_pad, h_q, head_dim), dtype=torch.bfloat16, device=q.device)
     out_m  = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
     out_l  = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
     kernel = build_nsa_prefill_kernel(h_q=h_q, head_dim=head_dim, topk=topk, sm_scale=sm_scale)
     stream = torch.cuda.current_stream()
-    kernel(q, kv, indices, out, out_m, out_l, total_tokens=total_tokens,
+    kernel(q_pad, kv, idx_pad, out, out_m, out_l, total_tokens=total_tokens,
            stream=fx.Stream(stream.cuda_stream))
     return out[:total_tokens]
 
@@ -521,16 +524,19 @@ def flydsl_nsa_prefill_with_lse(
     assert kv.dtype == q.dtype,   f"kv dtype {kv.dtype} != q dtype {q.dtype}"
     assert indices.dtype == torch.int32
 
-    # Pad to TILE_M=16 rows so the kernel (which always writes all 16 rows per CTA)
-    # does not overflow the allocation and hit the guard page that ROCm places at the
-    # page boundary immediately following the tensor.
-    _pad   = ((total_tokens + 15) // 16) * 16
+    # Pad all token-indexed tensors to TILE_M=16 multiples so that every CTA can
+    # safely read/write its full 16-row tile without going OOB.
+    _pad    = ((total_tokens + 15) // 16) * 16
+    q_pad   = torch.zeros((_pad, h_q, head_dim), dtype=q.dtype, device=q.device)
+    q_pad[:total_tokens] = q
+    idx_pad = torch.zeros((_pad, topk), dtype=indices.dtype, device=indices.device)
+    idx_pad[:total_tokens] = indices
     out    = torch.empty((_pad, h_q, head_dim), dtype=torch.bfloat16, device=q.device)
     out_m  = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
     out_l  = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
     kernel = build_nsa_prefill_kernel(h_q=h_q, head_dim=head_dim, topk=topk, sm_scale=sm_scale)
     stream = torch.cuda.current_stream()
-    kernel(q, kv, indices, out, out_m, out_l, total_tokens=total_tokens,
+    kernel(q_pad, kv, idx_pad, out, out_m, out_l, total_tokens=total_tokens,
            stream=fx.Stream(stream.cuda_stream))
 
     # m is the running max in log2 space; l is sum of exp2 values.
