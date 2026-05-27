@@ -1234,7 +1234,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         # eliminating JIT recompilation overhead.  The ≤√2 rounding error
                         # in softmax scale is acceptable for attention accuracy.
                         _eff_sm_scale_raw = self.softmax_scale * _q_scale * _kv_scale
-                        _eff_sm_scale_raw = max(_eff_sm_scale_raw, 1e-38)  # guard log2(0)
+                        _eff_sm_scale_raw = max(min(_eff_sm_scale_raw, 1e38), 1e-38)  # guard log2(0/inf)
                         _eff_sm_scale = 2.0 ** round(math.log2(_eff_sm_scale_raw))
 
                         # ── Step 4: FlyDSL C4 attention ────────────────────────────
