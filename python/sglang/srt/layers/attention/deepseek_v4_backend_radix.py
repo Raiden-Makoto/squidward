@@ -1241,6 +1241,9 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         # out_c4: [T, H, D] bf16,   lse_c4: [T, H] float32
 
                         # ── Step 5: Online-softmax combine SWA + C4 ─────────────────
+                        # out_c4 is the weighted sum of V_fp8 values.  Since
+                        # V_fp8 = V_bf16 / _kv_scale, we must rescale the output
+                        # back to bf16 magnitude before combining with out_swa.
                         lse_swa_flat = lse_swa.view(total_tok, h_q_dim).float()
                         lse_c4       = lse_c4.float()
                         lse_max = torch.maximum(lse_swa_flat, lse_c4)
@@ -1248,9 +1251,10 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         exp_c4  = torch.exp(lse_c4       - lse_max)
                         exp_sum = exp_swa + exp_c4
                         out_swa_flat = out_swa.reshape(total_tok, h_q_dim, d_v)
+                        out_c4_scaled = out_c4.float() * _kv_scale
                         o = (
                             out_swa_flat * exp_swa.unsqueeze(-1)
-                            + out_c4     * exp_c4.unsqueeze(-1)
+                            + out_c4_scaled * exp_c4.unsqueeze(-1)
                         ) / exp_sum.unsqueeze(-1)
                         # o: [T, H, D] — cast back to bf16 to match non-FlyDSL path
                         return o.to(torch.bfloat16)
