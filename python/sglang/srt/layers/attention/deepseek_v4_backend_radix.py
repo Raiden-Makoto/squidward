@@ -1103,94 +1103,109 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 extra_topk_length=extra_topk_lengths,
             )
 
-            # ---- FlyDSL NSA prefill dispatch ----
+            # ---- FlyDSL NSA prefill dispatch (SWA via Triton + C4 via FlyDSL, then combine) ----
             if (
                 os.environ.get("SGLANG_FLYDSL_PREFILL", "0") == "1"
                 and compress_ratio == 4
                 and extra_k_cache is not None
                 and extra_indices is not None
-                and forward_batch.forward_mode == ForwardMode.EXTEND
+                and forward_batch.forward_mode.is_prefill()
             ):
-                logger.warning(
-                    "[FlyDSL] dispatching prefill kernel q=%s kv_packed=%s indices=%s",
-                    q.shape,
-                    extra_k_cache.shape,
-                    extra_indices.shape,
-                )
                 try:
-                    from sglang.srt.layers.attention.nsa.tilelang_kernel import (
-                        tilelang_sparse_fwd,
+                    from sglang.srt.layers.attention.nsa.flydsl_nsa_prefill import (
+                        _is_available as _flydsl_available,
+                        flydsl_nsa_prefill_with_lse,
                     )
                     from sglang.srt.layers.quantization.fp8_kernel import (
                         is_fp8_fnuz as _is_fp8_fnuz,
                     )
+                    if _flydsl_available():
+                        logger.info(
+                            "[FlyDSL] dispatching C4 NSA prefill (%d tokens)", q.shape[0]
+                        )
+                        total_tok = q.shape[0]   # b, with s_q=1 after unsqueeze
+                        h_q_dim   = q.shape[2]   # h_q
+                        d_v       = self.head_dim_v
 
-                    # The C4 buffer raw layout per token (576-byte data stride):
-                    #   [0,   448): fp8  nope  (448 bytes)
-                    #   [448, 576): bf16 rope  (128 bytes = 64 bf16 values)
-                    #   Scale is packed at the END of each page, not inline.
-                    #
-                    # c4_sparse_page_indices contains flat token-slot indices:
-                    #   slot = physical_page * c4_page_sz + offset_in_page
-                    # so they index directly into the flattened [P*T, 512] kv.
-                    #
-                    # WARNING: the `extra_k_cache` variable at this point has been
-                    # reshaped with a 584-byte stride (line ~1046), which does NOT
-                    # match the actual 576-byte data stride.  We must re-fetch the
-                    # raw uint8 buffer and extract from it directly.
-                    _raw_c4 = token_to_kv_pool.get_extra_key_buffer(layer_id)
-                    _num_c4_pages = _raw_c4.shape[0]
-                    _c4_psz = page_sizes[4]   # = page_size // 4
-                    _nope = 448               # fp8 bytes per token
-                    _rope = 64                # bf16 elements per token
-                    _tok_stride = _nope + _rope * 2  # 576 bytes per token
+                        # ── Step 1: SWA-only Triton attention ──────────────────────
+                        swa_dict = dict(input_dict)
+                        swa_dict["extra_k_cache"] = None
+                        swa_dict["extra_indices_in_kvcache"] = None
+                        swa_dict["extra_topk_length"] = None
+                        _backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
+                        out_swa, lse_swa = flash_mla_with_kvcache_entrypoint(
+                            **swa_dict, backend=_backend
+                        )
+                        # out_swa: [T, 1, H, D],  lse_swa: [T, 1, H]
 
-                    # data section: [P, T, 576] uint8  (all per-token data, no scale)
-                    _data = _raw_c4[:, : _c4_psz * _tok_stride].view(
-                        _num_c4_pages, _c4_psz, _tok_stride
-                    )
+                        # ── Step 2: Build flat fp8 C4 KV tensor for FlyDSL ─────────
+                        # extra_k_cache was reshaped with 584-byte stride; re-fetch
+                        # the raw uint8 buffer (576-byte data stride) directly.
+                        _raw_c4 = token_to_kv_pool.get_extra_key_buffer(layer_id)
+                        _np     = _raw_c4.shape[0]          # num C4 pages
+                        _c4_psz = page_sizes[compress_ratio] # tokens per C4 page
+                        _nope   = 448                        # fp8 bytes per token
+                        _rope   = 64                         # bf16 elems per token
+                        _stride = _nope + _rope * 2          # 576 bytes per token
+                        _data   = _raw_c4[:, : _c4_psz * _stride].view(
+                            _np, _c4_psz, _stride
+                        )
+                        _fp8_t = (
+                            torch.float8_e4m3fnuz
+                            if _is_fp8_fnuz()
+                            else torch.float8_e4m3fn
+                        )
+                        _nope_fp8 = _data[:, :, :_nope].contiguous().view(_fp8_t)
+                        _rope_fp8 = (
+                            _data[:, :, _nope:_stride]
+                            .contiguous()
+                            .view(torch.bfloat16)
+                            .to(_fp8_t)
+                        )
+                        # kv_flat: [P*T, 512] fp8
+                        _kv_flat = (
+                            torch.cat([_nope_fp8, _rope_fp8], dim=-1)
+                            .view(_np * _c4_psz, 512)
+                        )
 
-                    _fp8_t = (
-                        torch.float8_e4m3fnuz
-                        if _is_fp8_fnuz()
-                        else torch.float8_e4m3fn
-                    )
-                    # nope: [P, T, 448] fp8 — bytes are already fp8, just reinterpret
-                    _nope_fp8 = _data[:, :, :_nope].contiguous().view(_fp8_t)
-                    # rope: [P, T, 64] fp8 — cast from bf16
-                    _rope_fp8 = (
-                        _data[:, :, _nope : _tok_stride]
-                        .contiguous()
-                        .view(torch.bfloat16)
-                        .to(_fp8_t)
-                    )
-                    # kv_flat: [P*T, 1, 512] fp8
-                    _kv_flat = (
-                        torch.cat([_nope_fp8, _rope_fp8], dim=-1)
-                        .view(_num_c4_pages * _c4_psz, 512)
-                        .unsqueeze(1)
-                    )
+                        # ── Step 3: Prepare q and indices for FlyDSL ───────────────
+                        # q: [T, 1, H, 512] → [T, H, 512] fp8
+                        q_3d = q.reshape(total_tok, h_q_dim, q.shape[-1]).to(_fp8_t)
+                        # extra_indices: [T, 1, 512] → [T, 512] int32
+                        idx_2d = extra_indices.reshape(
+                            total_tok, extra_indices.shape[-1]
+                        )
 
-                    # FlashMLA receives q as [tokens, 1, heads, head_dim]; squeeze
-                    # the group dim so tilelang_sparse_fwd gets [tokens, heads, head_dim].
-                    q_3d = q.squeeze(1) if q.dim() == 4 else q
-                    o = tilelang_sparse_fwd(
-                        q=q_3d,
-                        kv=_kv_flat,
-                        indices=extra_indices,
-                        sm_scale=self.softmax_scale,
-                        d_v=self.head_dim_v,
-                    )
-                    # tilelang_sparse_fwd already returns [tokens, heads, d_v] — no squeeze.
-                    return o
+                        # ── Step 4: FlyDSL C4 attention ────────────────────────────
+                        out_c4, lse_c4 = flydsl_nsa_prefill_with_lse(
+                            q=q_3d,
+                            kv=_kv_flat,
+                            indices=idx_2d,
+                            sm_scale=self.softmax_scale,
+                        )
+                        # out_c4: [T, H, D] bf16,   lse_c4: [T, H] float32
+
+                        # ── Step 5: Online-softmax combine SWA + C4 ─────────────────
+                        lse_swa_flat = lse_swa.view(total_tok, h_q_dim).float()
+                        lse_c4       = lse_c4.float()
+                        lse_max = torch.maximum(lse_swa_flat, lse_c4)
+                        exp_swa = torch.exp(lse_swa_flat - lse_max)
+                        exp_c4  = torch.exp(lse_c4       - lse_max)
+                        exp_sum = exp_swa + exp_c4
+                        out_swa_flat = out_swa.reshape(total_tok, h_q_dim, d_v)
+                        o = (
+                            out_swa_flat * exp_swa.unsqueeze(-1)
+                            + out_c4     * exp_c4.unsqueeze(-1)
+                        ) / exp_sum.unsqueeze(-1)
+                        # o: [T, H, D] — already squeezed, skip o.squeeze(1) below
+                        return o
                 except Exception:
                     import traceback
-
                     logger.warning(
-                        "[FlyDSL] prefill kernel failed, falling back to FlashMLA:\n%s",
+                        "[FlyDSL] dispatch failed, falling back:\n%s",
                         traceback.format_exc(),
                     )
-            # ---- end FlyDSL dispatch ----
+            # ---- end FlyDSL NSA prefill dispatch ----
 
             backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
             o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]

@@ -58,6 +58,7 @@ from flydsl._mlir.dialects import (
 )
 
 _LOG2E = host_math.log2(host_math.e)
+_LN2   = host_math.log(2.0)   # ≈ 0.6931471805599453
 
 
 def _is_available() -> bool:
@@ -125,6 +126,8 @@ def build_nsa_prefill_kernel(
         KV:      fx.Tensor,   # [num_pages, HEAD_DIM]           fp8
         Indices: fx.Tensor,   # [total_tokens, TOPK]            int32
         Out:     fx.Tensor,   # [total_tokens, h_q, HEAD_DIM]  bf16
+        M_Raw:   fx.Tensor,   # [padded_tokens, h_q]           float32 (m, log2-space)
+        L_Raw:   fx.Tensor,   # [padded_tokens, h_q]           float32 (sum-of-exp2)
         total_tokens: fx.Int32,
     ):
         v4f32_type = Vec.make_type(4, fx.Float32)
@@ -153,6 +156,8 @@ def build_nsa_prefill_kernel(
         kv_ptr  = _as_ptr(KV)
         idx_ptr = _as_ptr(Indices)
         out_ptr = _as_ptr(Out)
+        m_ptr   = _as_ptr(M_Raw)
+        l_ptr   = _as_ptr(L_Raw)
 
         # ── Global load helpers (NO fp8 type in result) ────────────────────
         # Use T.i8 as GEP elem_type (byte addressing, LLVM-safe — avoids f8 in GEP).
@@ -373,8 +378,9 @@ def build_nsa_prefill_kernel(
             loop_results = yield list(m_run) + list(l_run) + list(o_acc)
 
         # ── Normalize and write output ────────────────────────────────────
-        l_final = [loop_results[4 + r] for r in range_constexpr(4)]
-        o_final = [loop_results[8 + d] for d in range_constexpr(D_BLKS)]
+        m_final_vals = [loop_results[r]     for r in range_constexpr(4)]
+        l_final      = [loop_results[4 + r] for r in range_constexpr(4)]
+        o_final      = [loop_results[8 + d] for d in range_constexpr(D_BLKS)]
 
         for d in range_constexpr(D_BLKS):
             ov = Vec(o_final[d])
@@ -392,10 +398,28 @@ def build_nsa_prefill_kernel(
                 out_gep = buffer_ops.get_element_ptr(out_ptr, out_idx, elem_type=T.bf16)
                 _llvm.StoreOp(o_bf16, out_gep)
 
+        # ── Write m_raw and l_raw for LSE-based SWA+C4 combination ──────────
+        # All 16 threads in the same k_group write identical f32 values to the
+        # same address — this is a safe GPU broadcast write (memory system
+        # collapses duplicate stores to a single write per warp).
+        _out_row = k_group * fx.Index(4)
+        for r in range_constexpr(4):
+            _lse_tok = q_start + _out_row + fx.Index(r)
+            _lse_idx = fx.Int64(_lse_tok * fx.Index(h_q) + bid_h)
+            _llvm.StoreOp(
+                _raw(m_final_vals[r]),
+                buffer_ops.get_element_ptr(m_ptr, _lse_idx, elem_type=T.f32),
+            )
+            _llvm.StoreOp(
+                _raw(l_final[r]),
+                buffer_ops.get_element_ptr(l_ptr, _lse_idx, elem_type=T.f32),
+            )
+
     # ── JIT launcher ────────────────────────────────────────────────────
     @flyc.jit
     def launch_nsa_prefill(
         Q: fx.Tensor, KV: fx.Tensor, Indices: fx.Tensor, Out: fx.Tensor,
+        M_Raw: fx.Tensor, L_Raw: fx.Tensor,
         total_tokens: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -406,7 +430,7 @@ def build_nsa_prefill_kernel(
 
         tokens_idx = fx.Index(total_tokens)
         grid_m     = (tokens_idx + TILE_M - 1) // TILE_M
-        launcher   = nsa_prefill_kernel(Q, KV, Indices, Out, total_tokens)
+        launcher   = nsa_prefill_kernel(Q, KV, Indices, Out, M_Raw, L_Raw, total_tokens)
 
         passthrough = []
         for pair in [
@@ -463,8 +487,49 @@ def flydsl_nsa_prefill(
     assert indices.dtype == torch.int32
 
     out    = torch.empty((total_tokens, h_q, head_dim), dtype=torch.bfloat16, device=q.device)
+    _pad   = ((total_tokens + 15) // 16) * 16
+    out_m  = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
+    out_l  = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
     kernel = build_nsa_prefill_kernel(h_q=h_q, head_dim=head_dim, topk=topk, sm_scale=sm_scale)
     stream = torch.cuda.current_stream()
-    kernel(q, kv, indices, out, total_tokens=total_tokens,
+    kernel(q, kv, indices, out, out_m, out_l, total_tokens=total_tokens,
            stream=fx.Stream(stream.cuda_stream))
     return out
+
+
+def flydsl_nsa_prefill_with_lse(
+    q:        "torch.Tensor",
+    kv:       "torch.Tensor",
+    indices:  "torch.Tensor",
+    sm_scale: float,
+) -> "tuple":
+    """Same as flydsl_nsa_prefill but also returns natural-log LSE.
+
+    Returns:
+        out: [total_tokens, h_q, 512]  bfloat16
+        lse: [total_tokens, h_q]       float32  (log of softmax denominator)
+    """
+    import torch
+
+    total_tokens, h_q, head_dim = q.shape
+    topk = indices.shape[1]
+    _fp8_types = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    assert q.dtype in _fp8_types, f"q must be fp8, got {q.dtype}"
+    assert kv.dtype == q.dtype,   f"kv dtype {kv.dtype} != q dtype {q.dtype}"
+    assert indices.dtype == torch.int32
+
+    _pad   = ((total_tokens + 15) // 16) * 16
+    out    = torch.empty((total_tokens, h_q, head_dim), dtype=torch.bfloat16, device=q.device)
+    out_m  = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
+    out_l  = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
+    kernel = build_nsa_prefill_kernel(h_q=h_q, head_dim=head_dim, topk=topk, sm_scale=sm_scale)
+    stream = torch.cuda.current_stream()
+    kernel(q, kv, indices, out, out_m, out_l, total_tokens=total_tokens,
+           stream=fx.Stream(stream.cuda_stream))
+
+    # m is the running max in log2 space; l is sum of exp2 values.
+    # Natural-log LSE = m * ln(2) + ln(l)
+    m   = out_m[:total_tokens]          # [T, H]
+    l   = out_l[:total_tokens]          # [T, H]
+    lse = m * _LN2 + torch.log(l)      # [T, H] float32
+    return out, lse
