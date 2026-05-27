@@ -1138,43 +1138,81 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         )
                         # out_swa: [T, 1, H, D],  lse_swa: [T, 1, H]
 
-                        # ── Step 2: Build flat fp8 C4 KV tensor for FlyDSL ─────────
-                        # extra_k_cache was reshaped with 584-byte stride; re-fetch
-                        # the raw uint8 buffer (576-byte data stride) directly.
+                        # ── Step 2: Build dequantized + rescaled fp8 C4 KV tensor ──
+                        # The C4 buffer (uint8) layout per page:
+                        #   [token_0 .. token_{P-1}] × 576 bytes (448 fp8 nope + 128 bf16 rope)
+                        #   [token_0 .. token_{P-1}] × 8  bytes  (7 ue8m0 scale + 1 pad)
+                        # The 448 fp8 nope bytes are split into 7 tiles of 64 values,
+                        # each with its own ue8m0 scale: k_bf16[tile] = k_fp8[tile] * 2^(s-127).
+                        # We must dequantize and then requantize with a single global
+                        # scale so that the FlyDSL MFMA dot products are meaningful.
                         _raw_c4 = token_to_kv_pool.get_extra_key_buffer(layer_id)
-                        _np     = _raw_c4.shape[0]          # num C4 pages
-                        _c4_psz = page_sizes[compress_ratio] # tokens per C4 page
-                        _nope   = 448                        # fp8 bytes per token
-                        _rope   = 64                         # bf16 elems per token
-                        _stride = _nope + _rope * 2          # 576 bytes per token
-                        _data   = _raw_c4[:, : _c4_psz * _stride].view(
-                            _np, _c4_psz, _stride
-                        )
+                        _np      = _raw_c4.shape[0]           # num C4 pages
+                        _c4_psz  = page_sizes[compress_ratio] # tokens per C4 page
+                        _nope    = 448                         # fp8 bytes per token
+                        _rope    = 64                          # bf16 elems per token
+                        _stride  = _nope + _rope * 2          # 576 data bytes / token
+                        _n_tiles = 7                           # ue8m0 scale tiles
+                        _tile_sz = 64                          # elems per scale tile
+                        _s_tok   = 8                           # scale bytes/token (7+1 pad)
                         _fp8_t = (
                             torch.float8_e4m3fnuz
                             if _is_fp8_fnuz()
                             else torch.float8_e4m3fn
                         )
-                        _nope_fp8 = _data[:, :, :_nope].contiguous().view(_fp8_t)
-                        _rope_fp8 = (
-                            _data[:, :, _nope:_stride]
-                            .contiguous()
-                            .view(torch.bfloat16)
-                            .to(_fp8_t)
+                        _fp8_max = torch.finfo(_fp8_t).max
+
+                        # Data region: [_np, _c4_psz, 576] uint8
+                        _data = _raw_c4[:, : _c4_psz * _stride].view(
+                            _np, _c4_psz, _stride
                         )
-                        # kv_flat: [P*T, 512] fp8
-                        _kv_flat = (
-                            torch.cat([_nope_fp8, _rope_fp8], dim=-1)
+                        # Scale region: [_np, _c4_psz, 7] uint8
+                        _s_off   = _c4_psz * _stride
+                        _s_reg   = _raw_c4[:, _s_off : _s_off + _c4_psz * _s_tok]
+                        _scale_u8 = _s_reg.view(_np, _c4_psz, _s_tok)[:, :, :_n_tiles]
+
+                        # Dequantize nope fp8 → bf16 using per-tile ue8m0 scales
+                        _nope_fp8_raw = _data[:, :, :_nope].contiguous().view(_fp8_t)
+                        _tile_scales  = torch.exp2(_scale_u8.float() - 127.0)         # [P,T,7]
+                        _tile_sc_exp  = _tile_scales.repeat_interleave(_tile_sz, dim=-1)  # [P,T,448]
+                        _nope_bf16    = (_nope_fp8_raw.float() * _tile_sc_exp).to(torch.bfloat16)
+
+                        # Rope: already bf16
+                        _rope_bf16 = (
+                            _data[:, :, _nope:_stride].contiguous().view(torch.bfloat16)
+                        )
+
+                        # Full KV in bf16: [P*T, 512]
+                        _kv_bf16 = (
+                            torch.cat([_nope_bf16, _rope_bf16], dim=-1)
                             .view(_np * _c4_psz, 512)
                         )
 
-                        # ── Step 3: Prepare q and indices for FlyDSL ───────────────
-                        # q: [T, 1, H, 512] → [T, H, 512] fp8
-                        q_3d = q.reshape(total_tok, h_q_dim, q.shape[-1]).to(_fp8_t)
+                        # Requantize KV to fp8 with a single global scale
+                        _kv_amax  = _kv_bf16.abs().max().clamp(min=1e-8)
+                        _kv_scale = (_kv_amax / _fp8_max).item()
+                        _kv_flat  = (
+                            (_kv_bf16.float() / _kv_scale)
+                            .clamp(-_fp8_max, _fp8_max)
+                            .to(_fp8_t)
+                        )
+
+                        # ── Step 3: Quantize Q to fp8 and prepare indices ──────────
+                        # q: [T, 1, H, 512] bf16 → [T, H, 512] fp8 with per-tensor scale
+                        _q_bf16   = q.reshape(total_tok, h_q_dim, q.shape[-1])
+                        _q_amax   = _q_bf16.abs().max().clamp(min=1e-8)
+                        _q_scale  = (_q_amax / _fp8_max).item()
+                        q_3d      = (
+                            (_q_bf16.float() / _q_scale)
+                            .clamp(-_fp8_max, _fp8_max)
+                            .to(_fp8_t)
+                        )
+                        # Effective softmax scale: true QK = Q_fp8*q_scale @ K_fp8*kv_scale,
+                        # so sm_scale must absorb both quantization denominators.
+                        _eff_sm_scale = self.softmax_scale * _q_scale * _kv_scale
+
                         # extra_indices: [T, 1, 512] → [T, 512] int32
-                        # -1 sentinels mark padding slots (fewer than 512 valid C4
-                        # history tokens); clamp to 0 so the kernel reads a valid KV
-                        # row instead of a negative byte offset.
+                        # -1 sentinels mark padding slots; clamp to 0 for safe KV access.
                         idx_2d = extra_indices.reshape(
                             total_tok, extra_indices.shape[-1]
                         ).clamp(min=0)
@@ -1184,7 +1222,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                             q=q_3d,
                             kv=_kv_flat,
                             indices=idx_2d,
-                            sm_scale=self.softmax_scale,
+                            sm_scale=_eff_sm_scale,
                         )
                         # out_c4: [T, H, D] bf16,   lse_c4: [T, H] float32
 
