@@ -1,3 +1,4 @@
+export PYTHONPATH=/sgl-workspace/squidward/python:${PYTHONPATH}
 export SGLANG_OPT_USE_TILELANG_SWA_PREPARE=false
 export SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=false
 
