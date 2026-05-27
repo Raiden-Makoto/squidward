@@ -486,15 +486,18 @@ def flydsl_nsa_prefill(
     assert kv.dtype == q.dtype, f"kv dtype {kv.dtype} != q dtype {q.dtype}"
     assert indices.dtype == torch.int32
 
-    out    = torch.empty((total_tokens, h_q, head_dim), dtype=torch.bfloat16, device=q.device)
+    # Pad to TILE_M=16 rows so the kernel (which always writes all 16 rows per CTA)
+    # does not overflow the allocation and hit the guard page that ROCm places at the
+    # page boundary immediately following the tensor.
     _pad   = ((total_tokens + 15) // 16) * 16
+    out    = torch.empty((_pad, h_q, head_dim), dtype=torch.bfloat16, device=q.device)
     out_m  = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
     out_l  = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
     kernel = build_nsa_prefill_kernel(h_q=h_q, head_dim=head_dim, topk=topk, sm_scale=sm_scale)
     stream = torch.cuda.current_stream()
     kernel(q, kv, indices, out, out_m, out_l, total_tokens=total_tokens,
            stream=fx.Stream(stream.cuda_stream))
-    return out
+    return out[:total_tokens]
 
 
 def flydsl_nsa_prefill_with_lse(
@@ -518,8 +521,11 @@ def flydsl_nsa_prefill_with_lse(
     assert kv.dtype == q.dtype,   f"kv dtype {kv.dtype} != q dtype {q.dtype}"
     assert indices.dtype == torch.int32
 
+    # Pad to TILE_M=16 rows so the kernel (which always writes all 16 rows per CTA)
+    # does not overflow the allocation and hit the guard page that ROCm places at the
+    # page boundary immediately following the tensor.
     _pad   = ((total_tokens + 15) // 16) * 16
-    out    = torch.empty((total_tokens, h_q, head_dim), dtype=torch.bfloat16, device=q.device)
+    out    = torch.empty((_pad, h_q, head_dim), dtype=torch.bfloat16, device=q.device)
     out_m  = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
     out_l  = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
     kernel = build_nsa_prefill_kernel(h_q=h_q, head_dim=head_dim, topk=topk, sm_scale=sm_scale)
@@ -532,4 +538,4 @@ def flydsl_nsa_prefill_with_lse(
     m   = out_m[:total_tokens]          # [T, H]
     l   = out_l[:total_tokens]          # [T, H]
     lse = m * _LN2 + torch.log(l)      # [T, H] float32
-    return out, lse
+    return out[:total_tokens], lse
