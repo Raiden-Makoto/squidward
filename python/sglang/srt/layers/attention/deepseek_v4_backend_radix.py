@@ -1197,8 +1197,8 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                             out_swa_flat * exp_swa.unsqueeze(-1)
                             + out_c4     * exp_c4.unsqueeze(-1)
                         ) / exp_sum.unsqueeze(-1)
-                        # o: [T, H, D] — already squeezed, skip o.squeeze(1) below
-                        return o
+                        # o: [T, H, D] — cast back to bf16 to match non-FlyDSL path
+                        return o.to(torch.bfloat16)
                 except Exception:
                     import traceback
                     logger.warning(
