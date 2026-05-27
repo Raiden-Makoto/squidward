@@ -1172,9 +1172,12 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         # q: [T, 1, H, 512] → [T, H, 512] fp8
                         q_3d = q.reshape(total_tok, h_q_dim, q.shape[-1]).to(_fp8_t)
                         # extra_indices: [T, 1, 512] → [T, 512] int32
+                        # -1 sentinels mark padding slots (fewer than 512 valid C4
+                        # history tokens); clamp to 0 so the kernel reads a valid KV
+                        # row instead of a negative byte offset.
                         idx_2d = extra_indices.reshape(
                             total_tok, extra_indices.shape[-1]
-                        )
+                        ).clamp(min=0)
 
                         # ── Step 4: FlyDSL C4 attention ────────────────────────────
                         out_c4, lse_c4 = flydsl_nsa_prefill_with_lse(
