@@ -33,7 +33,7 @@ export SGLANG_OPT_FUSE_WQA_WKV=true
 
 export AITER_BF16_FP8_MOE_BOUND=1
 
-export SGLANG_FLYDSL_PREFILL=1
+export SGLANG_FLYDSL_PREFILL=0
 
 MODEL=/root/hf_home/hub/models--deepseek-ai--DeepSeek-V4-Pro/snapshots/89d501aed998d33fa4f4702102ec1bb2331e10f6
 
