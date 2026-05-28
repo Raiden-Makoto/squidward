@@ -1315,15 +1315,20 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         # l_raw_swa: [T, H]    f32  (sum of exp2 values)
 
                         # ── Step 6: Online-softmax merge (log2 domain) ───────────────
-                        # Fuse SWA and C4 outputs so the combined result equals joint
-                        # attention over all SWA + C4 KV entries.
+                        # out_swa / out_c4 are already l-normalized inside the kernels
+                        # (each kernel divides by its own l before writing bf16 output).
+                        # To merge two partitions correctly we must undo that
+                        # normalization, weight by the re-scaled l, then re-normalize:
+                        #   o = (o_swa*l_swa*e_swa + o_c4*l_c4*e_c4) / (l_swa*e_swa + l_c4*e_c4)
                         _m_new = torch.maximum(m_raw_swa, m_raw_c4)        # [T, H]
                         _e_swa = torch.exp2(m_raw_swa - _m_new)            # [T, H]
                         _e_c4  = torch.exp2(m_raw_c4  - _m_new)            # [T, H]
-                        _l_new = (l_raw_swa * _e_swa + l_raw_c4 * _e_c4).clamp(min=1e-8)  # [T, H]
+                        _w_swa = (l_raw_swa * _e_swa)                      # [T, H]
+                        _w_c4  = (l_raw_c4  * _e_c4)                       # [T, H]
+                        _l_new = (_w_swa + _w_c4).clamp(min=1e-8)          # [T, H]
                         _o = (
-                            out_swa.float() * _e_swa.unsqueeze(-1)
-                            + out_c4.float() * _e_c4.unsqueeze(-1)
+                            out_swa.float() * _w_swa.unsqueeze(-1)
+                            + out_c4.float() * _w_c4.unsqueeze(-1)
                         ) / _l_new.unsqueeze(-1)
                         return _o.to(torch.bfloat16)
                 except Exception:
