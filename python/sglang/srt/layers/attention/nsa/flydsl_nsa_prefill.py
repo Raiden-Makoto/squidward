@@ -379,10 +379,13 @@ def build_nsa_prefill_paged_kernel(
                     _memref.store(result_i64, lds_kv_i64, [_raw(i64_off)])
 
                 else:
-                    # dc = 24..31: d_group=0 stays in nope, d_group=1 enters rope.
-                    # Avoid a runtime SelectOp (wrong API); instead each thread writes
-                    # its own slot unconditionally — stores never collide because
-                    # i64_off_d0 and i64_off_d1 are distinct.
+                    # dc = 24..31: d_group=0 → nope dims [192,248] (tile 3);
+                    #              d_group=1 → rope dims [0,63] (64 bf16 values).
+                    # Each thread writes ONLY to its own i64_off slot.
+                    # A branchless i64 mask selects the correct value:
+                    #   mask = -(d_group) → 0x0000...0 if d_group=0,
+                    #                       0xFFFF...F if d_group=1.
+                    #   result = (rope AND mask) OR (nope AND ~mask)
 
                     # d_group=0 path: abs_dim = dc*8 ∈ [192, 248], tile=3
                     nope_off_d0 = token_base + fx.Index(dc * 8)
@@ -404,11 +407,19 @@ def build_nsa_prefill_paged_kernel(
                     )
                     rope_i64 = requant_8bf16(rope_lo, rope_hi)
 
-                    # Write each result to its own slot; no select needed.
-                    i64_off_d0 = kv_row * fx.Index(HEAD_DIM // 8) + fx.Index(dc)
-                    i64_off_d1 = kv_row * fx.Index(HEAD_DIM // 8) + fx.Index(D_HALF // 8 + dc)
-                    _memref.store(nope_i64, lds_kv_i64, [_raw(i64_off_d0)])
-                    _memref.store(rope_i64, lds_kv_i64, [_raw(i64_off_d1)])
+                    # Branchless select: each thread writes its own i64_off slot.
+                    d_g_i64  = _mlir_arith.IndexCastOp(T.i64, _raw(d_group)).result
+                    mask_i64 = _mlir_arith.SubIOp(
+                        _raw(fx.Int64(0)), d_g_i64
+                    ).result  # 0x000...0 or 0xFFF...F
+                    inv_mask = _mlir_arith.XOrIOp(
+                        mask_i64, _raw(fx.Int64(-1))
+                    ).result
+                    result_i64 = _mlir_arith.OrIOp(
+                        _mlir_arith.AndIOp(rope_i64, mask_i64).result,
+                        _mlir_arith.AndIOp(nope_i64, inv_mask).result,
+                    ).result
+                    _memref.store(result_i64, lds_kv_i64, [_raw(i64_off)])
 
             gpu.barrier()
 
