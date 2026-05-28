@@ -1229,17 +1229,10 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                             .clamp(-_fp8_max, _fp8_max)
                             .to(_fp8_t)
                         )
-                        # Snap _eff_sm_scale to the nearest power of 2 so the FlyDSL
-                        # lru_cache sees at most ~5 unique values across all 61 layers,
-                        # eliminating JIT recompilation overhead.  The ≤√2 rounding error
-                        # in softmax scale is acceptable for attention accuracy.
-                        _eff_sm_scale_raw = self.softmax_scale * _q_scale * _kv_scale
-                        if not (0 < _eff_sm_scale_raw < float("inf")):
-                            raise ValueError(
-                                f"[FlyDSL] invalid _eff_sm_scale_raw={_eff_sm_scale_raw}"
-                                " (NaN/inf in Q or KV), skipping FlyDSL for this batch"
-                            )
-                        _eff_sm_scale = 2.0 ** round(math.log2(_eff_sm_scale_raw))
+                        # Effective sm_scale folds in both FP8 quantization denominators.
+                        # Round to 8 significant figures so the lru_cache key is stable
+                        # across calls with numerically similar but not identical scales.
+                        _eff_sm_scale = round(self.softmax_scale * _q_scale * _kv_scale, 8)
 
                         # ── Step 4: FlyDSL C4 attention ────────────────────────────
                         out_c4, lse_c4 = flydsl_nsa_prefill_with_lse(
