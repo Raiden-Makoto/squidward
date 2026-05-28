@@ -1235,7 +1235,10 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         # in softmax scale is acceptable for attention accuracy.
                         _eff_sm_scale_raw = self.softmax_scale * _q_scale * _kv_scale
                         if not (0 < _eff_sm_scale_raw < float("inf")):
-                            _eff_sm_scale_raw = self.softmax_scale  # NaN/inf/zero fallback
+                            raise ValueError(
+                                f"[FlyDSL] invalid _eff_sm_scale_raw={_eff_sm_scale_raw}"
+                                " (NaN/inf in Q or KV), skipping FlyDSL for this batch"
+                            )
                         _eff_sm_scale = 2.0 ** round(math.log2(_eff_sm_scale_raw))
 
                         # ── Step 4: FlyDSL C4 attention ────────────────────────────
