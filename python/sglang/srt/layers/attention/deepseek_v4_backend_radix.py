@@ -1224,16 +1224,17 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         # sm_scale is now a compile-time constant: kernel compiles once.
                         _eff_sm_scale = self.softmax_scale * _Q_SCALE * _KV_SCALE
 
-                        # ── Step 3: FlyDSL C4 attention (raw m/l for merge) ────────
+                        # ── Step 3: FlyDSL C4 attention ─────────────────────────────
                         out_c4, m_raw_c4, l_raw_c4 = flydsl_nsa_prefill_with_m_l(
                             q=q_3d,
                             kv=_kv_flat,
                             indices=idx_2d,
                             sm_scale=_eff_sm_scale,
                         )
-                        # out_c4:   [T, H, D] bf16
-                        # m_raw_c4: [T, H]    f32  (log2-space running max)
-                        # l_raw_c4: [T, H]    f32  (sum of exp2 values)
+                        # SWA gather disabled: planar page layout not yet correctly
+                        # implemented; C4-only path restores 0.833 accuracy.
+                        # TODO: fix SWA gather (planar: [all_nope|all_rope|all_scale])
+                        return out_c4
 
                         # ── Step 4: Gather SWA KV from SWA pool ─────────────────────
                         # The SWA pool buffer layout per page (uint8):
