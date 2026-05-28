@@ -1155,9 +1155,9 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         _c4_psz   = page_sizes[compress_ratio]  # tokens per C4 page
 
                         # Indices: [T, 1, TOPK] → [T, TOPK], values = flat pool token idx
-                        idx_2d = extra_indices.reshape(
-                            total_tok, extra_indices.shape[-1]
-                        ).clamp(min=0)
+                        idx_2d = extra_indices.reshape(total_tok, extra_indices.shape[-1])
+                        _c4_valid_mask = (idx_2d >= 0)   # [T, TOPK] bool
+                        idx_2d = idx_2d.clamp(min=0)     # safe for kernel indexing
 
                         out_c4, m_raw_c4, l_raw_c4 = flydsl_nsa_prefill_paged_with_m_l(
                             q=q_3d,
@@ -1167,6 +1167,13 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                             c4_page_size=_c4_psz,
                             fp8_max=_fp8_max,
                         )
+
+                        # Zero out C4 contributions for queries with no valid C4 indices
+                        _all_c4_invalid = ~_c4_valid_mask.any(dim=-1)  # [T]
+                        if _all_c4_invalid.any():
+                            out_c4[_all_c4_invalid] = 0.0
+                            m_raw_c4[_all_c4_invalid] = -1e9
+                            l_raw_c4[_all_c4_invalid] = 0.0
 
                         # ── Step 3: Gather SWA KV from SWA pool ─────────────────────
                         # Local constant used only in the SWA gather+dequant section.
@@ -1194,19 +1201,27 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         _swa_idx_2d = core_attn_metadata.swa_page_indices[:total_tok]
                         if _swa_idx_2d.ndim == 3:
                             _swa_idx_2d = _swa_idx_2d.squeeze(1)
-                        _swa_idx_flat = _swa_idx_2d.reshape(-1)        # [T * SWA_WINDOW]
+
+                        # Gather only for TILE_M=16 anchors: the FlyDSL SWA kernel reads
+                        # kv_flat at offset q_start*SWA_WINDOW where q_start is the first
+                        # token of each TILE_M-wide CTA (0, 16, 32, …).  All 16 queries
+                        # in a tile share that anchor's window, so gathering per-token data
+                        # for non-anchor tokens wastes work and is never read by the kernel.
+                        _TILE_M_SWA   = 16
+                        _swa_anchors  = torch.arange(0, total_tok, _TILE_M_SWA, device=q.device)  # [A]
+                        _swa_idx_flat = _swa_idx_2d[_swa_anchors].reshape(-1)  # [A * SWA_WINDOW]
                         _swa_valid    = _swa_idx_flat >= 0
                         _swa_clamped  = _swa_idx_flat.clamp(min=0).long()
                         _swa_pg       = _swa_clamped // _swa_psz
                         _swa_sl       = _swa_clamped % _swa_psz
 
                         # Gather from planar views — each section is contiguous.
-                        _swa_nope_u8  = _nope_v[_swa_pg, _swa_sl].contiguous()    # [T*SWA, 448] u8
-                        _swa_rope_u8  = _rope_v[_swa_pg, _swa_sl].contiguous()    # [T*SWA, 128] u8
-                        _swa_scale_u8 = _scale_v[_swa_pg, _swa_sl, :7].contiguous()  # [T*SWA, 7] u8
+                        _swa_nope_u8  = _nope_v[_swa_pg, _swa_sl].contiguous()    # [A*SWA, 448] u8
+                        _swa_rope_u8  = _rope_v[_swa_pg, _swa_sl].contiguous()    # [A*SWA, 128] u8
+                        _swa_scale_u8 = _scale_v[_swa_pg, _swa_sl, :7].contiguous()  # [A*SWA, 7] u8
 
-                        _swa_nope_fp8  = _swa_nope_u8.view(_fp8_t)          # [T*SWA,448]
-                        _swa_rope_bf16 = _swa_rope_u8.view(torch.bfloat16)  # [T*SWA, 64]
+                        _swa_nope_fp8  = _swa_nope_u8.view(_fp8_t)          # [A*SWA,448]
+                        _swa_rope_bf16 = _swa_rope_u8.view(torch.bfloat16)  # [A*SWA, 64]
 
                         # Dequantize: nope_bf16 = nope_fp8 × 2^(scale_u8 − 127)
                         _swa_tile_sc   = torch.exp2(_swa_scale_u8.float() - 127.0)
@@ -1224,12 +1239,13 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                             (_swa_kv_bf16.float() * (1.0 / _KV_SCALE))
                             .clamp(-_fp8_max, _fp8_max)
                             .to(_fp8_t)
-                        )                                               # [T*SWA_WINDOW, 512]
+                        )                                               # [A*SWA_WINDOW, 512]
 
                         # Build flat KV tensor for the FlyDSL SWA kernel.
-                        # Token tok occupies rows [tok*SWA_WINDOW, (tok+1)*SWA_WINDOW).
-                        # Rows beyond total_tok*SWA_WINDOW are zero-padded (harmless for
-                        # out-of-bounds CTAs: V=0 contributes nothing to the output).
+                        # Tile anchor a occupies rows [a*SWA_WINDOW, (a+1)*SWA_WINDOW).
+                        # Non-anchor rows (inter-tile tokens) remain zero — the kernel
+                        # never reads them.  Rows beyond _pad_tok*SWA_WINDOW are also
+                        # zero-padded (harmless for out-of-bounds CTAs).
                         _MAX_SWA_TILES = SWA_WINDOW // 32              # 4  (128/32)
                         _BLOCK_N       = 32
                         _pad_tok = ((total_tok + 15) // 16) * 16       # TILE_M-aligned
@@ -1237,7 +1253,12 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         _kv_swa_flat = torch.zeros(
                             (_swa_flat_rows, 512), dtype=_fp8_t, device=q.device
                         )
-                        _kv_swa_flat[: total_tok * SWA_WINDOW] = _swa_kv_fp8
+                        # Scatter anchor data at their canonical offsets (a*SWA_WINDOW)
+                        _dst_rows = (
+                            _swa_anchors.unsqueeze(1) * SWA_WINDOW
+                            + torch.arange(SWA_WINDOW, device=q.device).unsqueeze(0)
+                        ).reshape(-1)  # [A*SWA_WINDOW]
+                        _kv_swa_flat[_dst_rows] = _swa_kv_fp8
 
                         # ── Step 4: FlyDSL SWA attention ────────────────────────────
                         out_swa, m_raw_swa, l_raw_swa = flydsl_swa_prefill(
