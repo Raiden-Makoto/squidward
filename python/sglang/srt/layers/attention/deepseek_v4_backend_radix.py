@@ -1257,27 +1257,28 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         # m_raw_swa: [T, H]    f32  (log2-space running max)
                         # l_raw_swa: [T, H]    f32  (sum of exp2 values)
 
-                        # ── Step 5: Online-softmax merge (log2 domain) ───────────────
-                        # Guard against NaN/Inf before any computation that uses m_raw /
-                        # l_raw (empty SWA window → l_raw=0, kernel may emit NaN m_raw).
-                        m_raw_swa = torch.nan_to_num(m_raw_swa, nan=-1e9, posinf=-1e9, neginf=-1e9)
-                        m_raw_c4  = torch.nan_to_num(m_raw_c4,  nan=-1e9, posinf=-1e9, neginf=-1e9)
-                        l_raw_swa = torch.nan_to_num(l_raw_swa, nan=0.0,  posinf=0.0,  neginf=0.0).clamp(min=0.0)
-                        l_raw_c4  = torch.nan_to_num(l_raw_c4,  nan=0.0,  posinf=0.0,  neginf=0.0).clamp(min=0.0)
-                        out_swa = torch.nan_to_num(out_swa.float(), nan=0.0, posinf=0.0, neginf=0.0)
-                        out_c4  = torch.nan_to_num(out_c4.float(),  nan=0.0, posinf=0.0, neginf=0.0)
+                        # DIAG: bypass SWA to test C4-only through merge
+                        out_swa = torch.zeros_like(out_swa)
+                        m_raw_swa = torch.full_like(m_raw_swa, -1e30)
+                        l_raw_swa = torch.zeros_like(l_raw_swa)
 
-                        _m_new = torch.maximum(m_raw_swa, m_raw_c4)        # [T, H]
-                        _e_swa = torch.exp2(m_raw_swa - _m_new)            # [T, H]
-                        _e_c4  = torch.exp2(m_raw_c4  - _m_new)            # [T, H]
-                        _w_swa = l_raw_swa * _e_swa                        # [T, H]
-                        _w_c4  = l_raw_c4  * _e_c4                        # [T, H]
-                        _l_new = (_w_swa + _w_c4).clamp(min=1e-9)          # [T, H]
-                        _o = (
-                            out_swa * _w_swa[..., None]
-                            + out_c4 * _w_c4[..., None]
-                        ) / _l_new[..., None]
-                        _o = torch.nan_to_num(_o, nan=0.0, posinf=0.0, neginf=0.0)
+                        # ── Step 5: Online-softmax merge (log2 domain) ───────────────
+                        # NaN guards — must run before any merge computation
+                        m_raw_swa = torch.nan_to_num(m_raw_swa, nan=-1e30, posinf=-1e30, neginf=-1e30)
+                        m_raw_c4  = torch.nan_to_num(m_raw_c4,  nan=-1e30, posinf=-1e30, neginf=-1e30)
+                        l_raw_swa = torch.nan_to_num(l_raw_swa, nan=0.0,   posinf=0.0,   neginf=0.0).clamp(min=0.0)
+                        l_raw_c4  = torch.nan_to_num(l_raw_c4,  nan=0.0,   posinf=0.0,   neginf=0.0).clamp(min=0.0)
+                        out_swa   = torch.nan_to_num(out_swa,   nan=0.0,   posinf=0.0,   neginf=0.0)
+                        out_c4    = torch.nan_to_num(out_c4,    nan=0.0,   posinf=0.0,   neginf=0.0)
+
+                        _m_new = torch.maximum(m_raw_swa, m_raw_c4)
+                        _e_swa = torch.exp2(m_raw_swa - _m_new)
+                        _e_c4  = torch.exp2(m_raw_c4  - _m_new)
+                        _w_swa = l_raw_swa * _e_swa
+                        _w_c4  = l_raw_c4  * _e_c4
+                        _l_new = (_w_swa + _w_c4).clamp(min=1e-9)
+                        _o     = (out_swa * _w_swa.unsqueeze(-1) + out_c4 * _w_c4.unsqueeze(-1)) / _l_new.unsqueeze(-1)
+                        _o     = torch.nan_to_num(_o, nan=0.0, posinf=0.0, neginf=0.0)
                         return _o.to(torch.bfloat16)
                 except Exception:
                     import traceback
