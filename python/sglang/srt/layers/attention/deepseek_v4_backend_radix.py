@@ -1115,128 +1115,63 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 try:
                     from sglang.srt.layers.attention.nsa.flydsl_nsa_prefill import (
                         _is_available as _flydsl_available,
-                        flydsl_nsa_prefill_with_m_l,
+                        flydsl_nsa_prefill_paged_with_m_l,
                     )
                     from sglang.srt.layers.quantization.fp8_kernel import (
                         is_fp8_fnuz as _is_fp8_fnuz,
                     )
                     if _flydsl_available():
                         logger.debug(
-                            "[FlyDSL] dispatching C4+SWA fused prefill (%d tokens)", q.shape[0]
+                            "[FlyDSL] dispatching C4+SWA fused paged prefill (%d tokens)",
+                            q.shape[0],
                         )
-                        total_tok = q.shape[0]   # b, with s_q=1 after unsqueeze
+                        total_tok = q.shape[0]   # T, with s_q=1 after unsqueeze
                         h_q_dim   = q.shape[2]   # h_q
-                        d_v       = self.head_dim_v
 
-                        # ── Step 1: Selective gather + dequantize fp8 C4 KV ─────────
-                        # Buffer layout per page (uint8):
-                        #   [token × 576 bytes]  nope(448 fp8) + rope(128 bf16)
-                        #   [token × 8  bytes]   7 ue8m0 scale bytes + 1 pad
-                        # Nope is split into 7 × 64-element tiles each with its own
-                        # ue8m0 scale.  We gather ONLY the T×TOPK entries actually
-                        # used by idx_2d (much cheaper than dequantizing the full cache).
-                        _raw_c4 = token_to_kv_pool.get_extra_key_buffer(layer_id)
-                        _np      = _raw_c4.shape[0]           # num C4 pages
-                        _c4_psz  = page_sizes[compress_ratio] # tokens per C4 page
-                        _nope    = 448                         # fp8 bytes per token
-                        _rope    = 64                          # bf16 elems per token
-                        _stride  = _nope + _rope * 2          # 576 data bytes / token
-                        _n_tiles = 7                           # ue8m0 scale tiles
-                        _tile_sz = 64                          # elems per scale tile
-                        _s_tok   = 8                           # scale bytes/token (7+1 pad)
                         _fp8_t = (
                             torch.float8_e4m3fnuz
                             if _is_fp8_fnuz()
                             else torch.float8_e4m3fn
                         )
-                        _fp8_max = torch.finfo(_fp8_t).max
-
-                        # Prepare indices first (needed for gather)
-                        idx_2d = extra_indices.reshape(
-                            total_tok, extra_indices.shape[-1]
-                        ).clamp(min=0)                         # [T, TOPK], range [0, _np*_c4_psz)
-                        TOPK = idx_2d.shape[-1]
-
-                        # Data view: [_np, _c4_psz, 576] uint8
-                        _data = _raw_c4[:, :_c4_psz * _stride].view(_np, _c4_psz, _stride)
-
-                        # Pre-build typed views over the full cache once (outside the chunk loop)
-                        _data_nope_fp8  = _data[:, :, :_nope].contiguous().view(_fp8_t)
-                        _data_rope_bf16 = _data[:, :, _nope:_stride].contiguous().view(torch.bfloat16)
-
-                        # Scale view: [_np, _c4_psz, 7]
-                        _s_off    = _c4_psz * _stride
-                        _scale_u8 = (
-                            _raw_c4[:, _s_off : _s_off + _c4_psz * _s_tok]
-                            .view(_np, _c4_psz, _s_tok)[:, :, :_n_tiles]
-                        )
-
+                        _fp8_max  = torch.finfo(_fp8_t).max
                         _CLIP     = 8.0
                         _Q_SCALE  = _CLIP / _fp8_max
                         _KV_SCALE = _CLIP / _fp8_max
 
-
-                        # ── Step 2: Quantize Q to fp8 with fixed scale ──────────────
-                        # q: [T, 1, H, 512] bf16 → [T, H, 512] fp8
+                        # ── Step 1: Quantize Q to fp8 with fixed scale ──────────────
                         _q_bf16   = q.reshape(total_tok, h_q_dim, q.shape[-1])
                         q_3d      = (
                             (_q_bf16.float() * (1.0 / _Q_SCALE))
                             .clamp(-_fp8_max, _fp8_max)
                             .to(_fp8_t)
                         )
-                        # sm_scale is now a compile-time constant: kernel compiles once.
                         _eff_sm_scale = self.softmax_scale * _Q_SCALE * _KV_SCALE
 
-                        # ── Step 3: FlyDSL C4 attention — fully-chunked dispatch ────
-                        # Never materialise the full [T*TOPK, 512] fp8 tensor; run the
-                        # kernel once per CHUNK tokens to bound peak memory.
-                        _CHUNK    = 256
-                        _head_dim = q_3d.shape[-1]
+                        # ── Step 2: FlyDSL fused paged C4 attention (zero-copy) ─────
+                        # The raw C4 pool buffer is passed directly — no gather, no
+                        # intermediate tensor.  Page/slot decomposition and
+                        # dequantization happen inside the kernel.
+                        _raw_c4   = token_to_kv_pool.get_extra_key_buffer(layer_id)
+                        _c4_psz   = page_sizes[compress_ratio]  # tokens per C4 page
 
-                        out_c4   = torch.empty(total_tok, h_q_dim, _head_dim, dtype=torch.bfloat16, device=q.device)
-                        m_raw_c4 = torch.empty(total_tok, h_q_dim, device=q.device)
-                        l_raw_c4 = torch.empty(total_tok, h_q_dim, device=q.device)
+                        # Indices: [T, 1, TOPK] → [T, TOPK], values = flat pool token idx
+                        idx_2d = extra_indices.reshape(
+                            total_tok, extra_indices.shape[-1]
+                        ).clamp(min=0)
 
-                        for _t0 in range(0, total_tok, _CHUNK):
-                            _t1 = min(_t0 + _CHUNK, total_tok)
-                            _C  = _t1 - _t0
+                        out_c4, m_raw_c4, l_raw_c4 = flydsl_nsa_prefill_paged_with_m_l(
+                            q=q_3d,
+                            kv_pool=_raw_c4,
+                            indices=idx_2d,
+                            sm_scale=_eff_sm_scale,
+                            c4_page_size=_c4_psz,
+                            fp8_max=_fp8_max,
+                        )
 
-                            _idx_c  = idx_2d[_t0:_t1].reshape(-1)       # [C*TOPK]
-                            _page_c = _idx_c // _c4_psz
-                            _slot_c = _idx_c  % _c4_psz
+                        # ── Step 3: Gather SWA KV from SWA pool ─────────────────────
+                        # Local constant used only in the SWA gather+dequant section.
+                        _tile_sz  = 64   # elems per ue8m0 scale tile
 
-                            _nope_fp8_c  = _data_nope_fp8[_page_c, _slot_c]       # [C*TOPK, 448]
-                            _scale_c     = _scale_u8[_page_c, _slot_c]             # [C*TOPK, 7]
-                            _tile_sc_c   = torch.exp2(_scale_c.float() - 127.0)
-                            _tile_sc_ec  = _tile_sc_c.repeat_interleave(_tile_sz, dim=-1)
-                            _nope_bf16_c = (_nope_fp8_c.float() * _tile_sc_ec).to(torch.bfloat16)
-
-                            _rope_bf16_c = _data_rope_bf16[_page_c, _slot_c]       # [C*TOPK, 64]
-                            _kv_bf16_c   = torch.cat([_nope_bf16_c, _rope_bf16_c], dim=-1)  # [C*TOPK, 512]
-                            _kv_chunk    = (
-                                (_kv_bf16_c.float() * (1.0 / _Q_SCALE))
-                                .clamp(-_fp8_max, _fp8_max)
-                                .to(_fp8_t)
-                            )                                                       # [C*TOPK, 512] fp8
-
-                            _idx_chunk = torch.arange(_C * TOPK, device=q.device, dtype=torch.int32).view(_C, TOPK)
-
-                            _out_c, _m_c, _l_c = flydsl_nsa_prefill_with_m_l(
-                                q=q_3d[_t0:_t1],
-                                kv=_kv_chunk,
-                                indices=_idx_chunk,
-                                sm_scale=_eff_sm_scale,
-                            )
-
-                            out_c4[_t0:_t1]   = _out_c
-                            m_raw_c4[_t0:_t1] = _m_c
-                            l_raw_c4[_t0:_t1] = _l_c
-
-                        # ── Step 4: Gather SWA KV from SWA pool ─────────────────────
-                        # Planar layout per page (uint8):
-                        #   bytes [0            .. swa_psz*448): nope fp8,  448 bytes/token
-                        #   bytes [swa_psz*448  .. swa_psz*576): rope bf16, 128 bytes/token
-                        #   bytes [swa_psz*576  .. swa_psz*584): scale u8,  8 bytes/token
                         from sglang.srt.layers.attention.nsa.flydsl_swa_prefill import (
                             flydsl_swa_prefill,
                         )
@@ -1304,7 +1239,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         )
                         _kv_swa_flat[: total_tok * SWA_WINDOW] = _swa_kv_fp8
 
-                        # ── Step 5: FlyDSL SWA attention ────────────────────────────
+                        # ── Step 4: FlyDSL SWA attention ────────────────────────────
                         out_swa, m_raw_swa, l_raw_swa = flydsl_swa_prefill(
                             q=q_3d,
                             kv_swa_flat=_kv_swa_flat,
@@ -1315,7 +1250,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         # m_raw_swa: [T, H]    f32  (log2-space running max)
                         # l_raw_swa: [T, H]    f32  (sum of exp2 values)
 
-                        # ── Step 6: Online-softmax merge (log2 domain) ───────────────
+                        # ── Step 5: Online-softmax merge (log2 domain) ───────────────
                         # Guard against NaN/Inf in m_raw (can occur when SWA window is empty)
                         _NEG_INF = -1e30
                         m_raw_swa = torch.nan_to_num(m_raw_swa, nan=_NEG_INF, posinf=_NEG_INF, neginf=_NEG_INF)
