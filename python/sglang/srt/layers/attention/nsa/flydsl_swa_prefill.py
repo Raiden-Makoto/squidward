@@ -1,11 +1,19 @@
-"""FlyDSL SWA (sliding-window) flash-attention kernel for AMD gfx950 (MI350X).
+"""FlyDSL sliding-window attention (SWA) prefill kernel for AMD gfx950 (MI350X).
 
-Structurally identical to flydsl_nsa_prefill.py, but instead of loading a KV
-row via a sparse index table (Indices tensor), the KV row address is computed
-directly as a flat offset into a pre-gathered, densely-packed KV tensor.
+Online flash-attention over a flat, pre-gathered SWA KV tensor using MFMA
+16x16x32 FP8 wave64.  Structure mirrors flydsl_nsa_prefill.py; the only
+difference is the KV addressing: instead of looking up sparse page indices,
+we use a flat pre-gathered tensor addressed by a compile-time tile count.
 
-Layout: kv_swa_flat[tok_i * MAX_SWA_TILES * BLOCK_N + tile_j * BLOCK_N + row_k, :]
-(Python caller pre-pads and fills out-of-range rows with -fp8_max.)
+KV flat layout (pre-gathered by Python):
+    kv_swa_flat[T_pad * MAX_SWA_TILES * BLOCK_N, HEAD_DIM]  fp8
+    For the CTA handling tokens starting at q_start = bid_m * TILE_M:
+        kv_flat_base = q_start * MAX_SWA_TILES * BLOCK_N
+    KV rows [kv_flat_base, kv_flat_base + MAX_SWA_TILES * BLOCK_N) hold the
+    SWA window for token group q_start.
+
+LLVM / fp8 constraints are identical to flydsl_nsa_prefill.py — no f8 types
+may appear in LLVM IR; all fp8 data is carried as i64 (8-byte packs).
 """
 
 from __future__ import annotations
@@ -51,7 +59,7 @@ def _is_available() -> bool:
 def build_swa_prefill_kernel(
     h_q: int,
     head_dim: int = 512,
-    max_swa_tiles: int = 32,
+    max_swa_tiles: int = 4,      # SWA_WINDOW // BLOCK_N  (e.g. 128//32 = 4)
     tile_m: int = 16,
     block_n: int = 32,
     sm_scale: float | None = None,
@@ -73,23 +81,21 @@ def build_swa_prefill_kernel(
     MAX_SWA_TILES = max_swa_tiles
     BLOCK_SIZE    = WARP_SIZE
 
-    MFMA_N     = 16
-    MFMA_K     = 32
-    K_STEPS_QK = HEAD_DIM // MFMA_K    # 16
-    N_BLKS_S   = BLOCK_N  // MFMA_N    # 2
-    D_BLKS     = HEAD_DIM // MFMA_N    # 32
-    KV_TILES   = MAX_SWA_TILES
+    MFMA_N      = 16
+    MFMA_K      = 32
+    K_STEPS_QK  = HEAD_DIM // MFMA_K    # 16
+    N_BLKS_S    = BLOCK_N  // MFMA_N    # 2
+    D_BLKS      = HEAD_DIM // MFMA_N    # 32
+    D_HALF      = HEAD_DIM // 2          # 256
+    D_CHUNKS    = D_HALF // 8            # 32
 
-    # LDS layout:
-    #   KV  : T.i64 memref, LDS_KV_I64 entries (8 FP8 per i64)
-    #   P   : T.f32 memref, LDS_P_F32  entries (1 f32 per attention weight)
-    LDS_KV_I64   = BLOCK_N * HEAD_DIM // 8    # 32*512//8 = 2048
-    LDS_KV_BYTES = LDS_KV_I64 * 8             # 16384
-    LDS_P_F32    = TILE_M * BLOCK_N            # 16*32 = 512
-    LDS_P_BYTES  = LDS_P_F32 * 4              # 2048
-    LDS_TOTAL    = LDS_KV_BYTES + LDS_P_BYTES
+    LDS_KV_I64    = BLOCK_N * HEAD_DIM // 8    # 2048
+    LDS_KV_BYTES  = LDS_KV_I64 * 8             # 16384
+    LDS_P_F32     = TILE_M * BLOCK_N            # 512
+    LDS_P_BYTES   = LDS_P_F32 * 4              # 2048
+    LDS_TOTAL     = LDS_KV_BYTES + LDS_P_BYTES
 
-    Q_STOK = h_q * HEAD_DIM
+    Q_STOK = h_q * HEAD_DIM    # token stride in bytes for Q / Out
 
     alloc      = SmemAllocator(None, arch=gpu_arch, global_sym_name="swa_smem")
     base_off   = alloc._align(alloc.ptr, 16)
@@ -99,11 +105,11 @@ def build_swa_prefill_kernel(
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def swa_prefill_kernel(
-        Q:      fx.Tensor,   # [total_tokens, h_q, HEAD_DIM]                         fp8
-        KV_SWA: fx.Tensor,   # [_pad * MAX_SWA_TILES * BLOCK_N, HEAD_DIM]            fp8
-        Out:    fx.Tensor,   # [total_tokens, h_q, HEAD_DIM]                         bf16
-        M_Raw:  fx.Tensor,   # [padded_tokens, h_q]                                  float32
-        L_Raw:  fx.Tensor,   # [padded_tokens, h_q]                                  float32
+        Q:     fx.Tensor,   # [T_pad, h_q, HEAD_DIM]                       fp8
+        KV:    fx.Tensor,   # [T_pad * MAX_SWA_TILES * BLOCK_N, HEAD_DIM]  fp8 (flat)
+        Out:   fx.Tensor,   # [T_pad, h_q, HEAD_DIM]                       bf16
+        M_Raw: fx.Tensor,   # [T_pad, h_q]                                 f32
+        L_Raw: fx.Tensor,   # [T_pad, h_q]                                 f32
         total_tokens: fx.Int32,
     ):
         v4f32_type = Vec.make_type(4, fx.Float32)
@@ -120,7 +126,7 @@ def build_swa_prefill_kernel(
         c_sm_log2e   = fx.Float32(sm_scale * _LOG2E)
         c_zero_v4f32 = Vec.filled(4, 0.0, fx.Float32)
 
-        # ── LLVM pointers ────────────────────────────────────────────────────
+        # ── LLVM pointers ─────────────────────────────────────────────────
         def _ptr_ty():  return ir.Type.parse("!llvm.ptr")
         def _as_ptr(t):
             v = t
@@ -129,17 +135,16 @@ def build_swa_prefill_kernel(
             return _fly.extract_aligned_pointer_as_index(_ptr_ty(), v)
 
         q_ptr   = _as_ptr(Q)
-        kv_ptr  = _as_ptr(KV_SWA)
+        kv_ptr  = _as_ptr(KV)
         out_ptr = _as_ptr(Out)
         m_ptr   = _as_ptr(M_Raw)
         l_ptr   = _as_ptr(L_Raw)
 
-        # ── Global load helpers (NO fp8 type in result) ────────────────────
+        # ── Load helpers ──────────────────────────────────────────────────
         def load_8bytes_as_i64(ptr, byte_off_index):
             gep = buffer_ops.get_element_ptr(ptr, fx.Int64(byte_off_index), elem_type=T.i8)
             return _llvm.LoadOp(T.i64, gep).result
 
-        # ── MFMA (fp8 MFMA takes i64 operands) ────────────────────────────
         def mfma_fp8(acc, a_i64, b_i64):
             return rocdl.mfma_f32_16x16x32_fp8_fp8(
                 v4f32_type, [a_i64, b_i64, acc, 0, 0, 0]
@@ -153,7 +158,10 @@ def build_swa_prefill_kernel(
         k_group = tid // 16
         q_start = bid_m * fx.Index(TILE_M)
 
-        # V-extraction lane decomposition (const per thread, outside d-loop)
+        # Flat KV base for this CTA's token group (no page-table lookup)
+        kv_flat_base = q_start * fx.Index(MAX_SWA_TILES * BLOCK_N)
+
+        # V-extraction lane decomposition (const per thread)
         lane_mod8      = lane % fx.Index(8)
         lane_div8      = lane // fx.Index(8)
         lane_shift_i64 = fx.Int64(lane_mod8) * fx.Int64(8)
@@ -163,7 +171,7 @@ def build_swa_prefill_kernel(
         lds_kv_i64 = SmemPtr(lds_base, kv_lds_off, T.i64, shape=(LDS_KV_I64,)).get()
         lds_p_f32  = SmemPtr(lds_base, p_lds_off,  T.f32, shape=(LDS_P_F32,)).get()
 
-        # ── Pre-load Q into registers (K_STEPS_QK × i64) ────────────────
+        # ── Pre-load Q into registers (K_STEPS_QK x i64) ─────────────────
         q_packs = []
         for ks in range_constexpr(K_STEPS_QK):
             q_byte_off = (
@@ -174,41 +182,31 @@ def build_swa_prefill_kernel(
             )
             q_packs.append(load_8bytes_as_i64(q_ptr, q_byte_off))
 
-        # ── Online softmax init ──────────────────────────────────────────
+        # ── Online softmax init ───────────────────────────────────────────
         _init = (
             [_raw(c_neg_inf)] * 4
             + [_raw(c_zero_f)]  * 4
             + [_raw(c_zero_v4f32)] * D_BLKS
         )
-        anchor_tok = q_start
 
-        # ── Main KV-tile loop ────────────────────────────────────────────
+        # ── Main KV-tile loop (MAX_SWA_TILES = compile-time constant) ─────
         loop_results = _init
-        for kv_tile, _carry in range(0, KV_TILES, 1, init=_init):
+        for kv_tile, _carry in range(0, MAX_SWA_TILES, 1, init=_init):
             m_run = [_carry[r]     for r in range_constexpr(4)]
             l_run = [_carry[4 + r] for r in range_constexpr(4)]
             o_acc = [_carry[8 + d] for d in range_constexpr(D_BLKS)]
 
-            kv_pos_base = kv_tile * fx.Index(BLOCK_N)
-
-            # ── Gather KV → LDS i64 ──────────────────────────────────────
+            # ── Gather flat KV -> LDS i64 ─────────────────────────────────
+            # Direct flat offset: no page-table lookup needed.
             kv_row  = tid % fx.Index(BLOCK_N)
             d_group = tid // fx.Index(BLOCK_N)
 
-            # Direct flat addressing: no Indices tensor needed.
-            # kv_swa_flat[tok_i * MAX_SWA_TILES * BLOCK_N + tile_j * BLOCK_N + row_k]
-            kv_row_flat = (
-                anchor_tok * fx.Index(MAX_SWA_TILES * BLOCK_N)
-                + kv_pos_base + kv_row
-            )
-            kv_byte_off_base = kv_row_flat * fx.Index(HEAD_DIM)
+            kv_row_flat = kv_flat_base + kv_tile * fx.Index(BLOCK_N) + kv_row
 
-            D_HALF   = HEAD_DIM // 2
-            D_CHUNKS = D_HALF // 8
             for dc in range_constexpr(D_CHUNKS):
                 d_byte_in_half = fx.Index(dc * 8)
                 d_byte_abs     = d_group * fx.Index(D_HALF) + d_byte_in_half
-                kv_byte_off    = kv_byte_off_base + d_byte_abs
+                kv_byte_off    = kv_row_flat * fx.Index(HEAD_DIM) + d_byte_abs
                 raw_i64        = load_8bytes_as_i64(kv_ptr, kv_byte_off)
                 i64_off = (
                     kv_row * fx.Index(HEAD_DIM // 8)
@@ -219,7 +217,7 @@ def build_swa_prefill_kernel(
 
             gpu.barrier()
 
-            # ── GEMM1: S = Q @ K^T (fp8 MFMA) ───────────────────────────
+            # ── GEMM1: S = Q @ K^T (fp8 MFMA) ────────────────────────────
             s_acc = [_raw(c_zero_v4f32) for _ in range(N_BLKS_S)]
             for ks in range_constexpr(K_STEPS_QK):
                 q_a = q_packs[ks]
@@ -232,7 +230,7 @@ def build_swa_prefill_kernel(
                     k_pack    = _memref.load(lds_kv_i64, [_raw(k_i64_off)])
                     s_acc[nb] = mfma_fp8(s_acc[nb], q_a, k_pack)
 
-            # ── Online softmax ───────────────────────────────────────────
+            # ── Online softmax (log2 space, warp-level reduction) ─────────
             s_scaled = []
             for nb in range_constexpr(N_BLKS_S):
                 sv = Vec(s_acc[nb])
@@ -265,6 +263,7 @@ def build_swa_prefill_kernel(
 
             l_new = [_fadd(_fmul(corr[r], l_run[r]), tile_sum[r]) for r in range_constexpr(4)]
 
+            # Scale old output accumulator by correction factor
             for d in range_constexpr(D_BLKS):
                 ov = Vec(o_acc[d])
                 o_acc[d] = Vec.from_elements(
@@ -274,17 +273,17 @@ def build_swa_prefill_kernel(
             m_run = m_new
             l_run = l_new
 
-            # ── Store P → f32 LDS (transposed) ──────────────────────────
+            # ── Store P -> f32 LDS (P[k_group*4+r][nb*16+lane]) ──────────
             for nb in range_constexpr(N_BLKS_S):
                 for r in range_constexpr(4):
-                    p_row  = k_group * fx.Index(4) + fx.Index(r)
-                    p_col  = fx.Index(nb * MFMA_N) + lane
-                    p_off  = p_row * fx.Index(BLOCK_N) + p_col
+                    p_row = k_group * fx.Index(4) + fx.Index(r)
+                    p_col = fx.Index(nb * MFMA_N) + lane
+                    p_off = p_row * fx.Index(BLOCK_N) + p_col
                     _memref.store(p_vals[nb][r], lds_p_f32, [_raw(p_off)])
 
             gpu.barrier()
 
-            # ── GEMM2: O += P @ V (fp8 MFMA) ────────────────────────────
+            # ── GEMM2: O += P @ V (fp8 MFMA) ─────────────────────────────
             p_base_off = lane * fx.Index(BLOCK_N) + k_group * fx.Index(8)
             p_f32_vals = [
                 _memref.load(lds_p_f32, [_raw(p_base_off + fx.Index(j))])
@@ -349,7 +348,7 @@ def build_swa_prefill_kernel(
                 out_gep = buffer_ops.get_element_ptr(out_ptr, out_idx, elem_type=T.bf16)
                 _llvm.StoreOp(o_bf16, out_gep)
 
-        # ── Write m_raw and l_raw for online-softmax combination ─────────
+        # Write m_raw / l_raw for the online-softmax combine step
         _out_row = k_group * fx.Index(4)
         for r in range_constexpr(4):
             _lse_tok = q_start + _out_row + fx.Index(r)
@@ -363,10 +362,10 @@ def build_swa_prefill_kernel(
                 buffer_ops.get_element_ptr(l_ptr, _lse_idx, elem_type=T.f32),
             )
 
-    # ── JIT launcher ────────────────────────────────────────────────────
+    # ── JIT launcher ──────────────────────────────────────────────────────
     @flyc.jit
     def launch_swa_prefill(
-        Q: fx.Tensor, KV_SWA: fx.Tensor, Out: fx.Tensor,
+        Q: fx.Tensor, KV: fx.Tensor, Out: fx.Tensor,
         M_Raw: fx.Tensor, L_Raw: fx.Tensor,
         total_tokens: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
@@ -378,7 +377,7 @@ def build_swa_prefill_kernel(
 
         tokens_idx = fx.Index(total_tokens)
         grid_m     = (tokens_idx + TILE_M - 1) // TILE_M
-        launcher   = swa_prefill_kernel(Q, KV_SWA, Out, M_Raw, L_Raw, total_tokens)
+        launcher   = swa_prefill_kernel(Q, KV, Out, M_Raw, L_Raw, total_tokens)
 
         passthrough = []
         for pair in [
@@ -414,29 +413,49 @@ def build_swa_prefill_kernel(
 
 
 def flydsl_swa_prefill(
-    q: "torch.Tensor",           # [T, H, 512] fp8
-    kv_swa_flat: "torch.Tensor", # [T_pad * max_swa_tiles * BLOCK_N, 512] fp8
+    q:             "torch.Tensor",
+    kv_swa_flat:   "torch.Tensor",
     max_swa_tiles: int,
-    sm_scale: float,
-) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
-    """Returns (out [T_pad, H, 512] bf16, m_raw [T_pad, H] f32, l_raw [T_pad, H] f32)"""
+    sm_scale:      float,
+) -> "tuple":
+    """FlyDSL sliding-window attention prefill for gfx950.
+
+    Args:
+        q:             [T, h_q, 512]                          fp8 (any fp8 variant)
+        kv_swa_flat:   [T_pad * max_swa_tiles * 32, 512]      fp8 (pre-gathered SWA KV)
+        max_swa_tiles: SWA_WINDOW // BLOCK_N (e.g. 4 for SWA_WINDOW=128, BLOCK_N=32)
+        sm_scale:      softmax scale (pre-multiplied by Q/K quantization scales)
+
+    Returns:
+        out:   [T, h_q, 512]  bfloat16
+        m_raw: [T, h_q]       float32  (log2-space running max)
+        l_raw: [T, h_q]       float32  (sum of exp2 values)
+    """
     import torch
+
     total_tokens, h_q, head_dim = q.shape
-    _pad = (total_tokens + 15) // 16 * 16
-    fp8_t = q.dtype
-    out   = torch.zeros(_pad, h_q, head_dim, dtype=torch.bfloat16, device=q.device)
-    m_raw = torch.full((_pad, h_q), float("-inf"), dtype=torch.float32, device=q.device)
-    l_raw = torch.zeros(_pad, h_q, dtype=torch.float32, device=q.device)
-    if _pad > total_tokens:
-        q_pad = torch.nn.functional.pad(
-            q.view(total_tokens, -1), (0, 0, 0, _pad - total_tokens)
-        ).view(_pad, h_q, head_dim)
-    else:
-        q_pad = q
+    _fp8_types = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    assert q.dtype in _fp8_types,          f"q must be fp8, got {q.dtype}"
+    assert kv_swa_flat.dtype == q.dtype,   f"kv dtype {kv_swa_flat.dtype} != q dtype {q.dtype}"
+
+    _pad   = ((total_tokens + 15) // 16) * 16
+    q_pad  = torch.zeros((_pad, h_q, head_dim), dtype=q.dtype, device=q.device)
+    q_pad[:total_tokens] = q
+
+    out   = torch.empty((_pad, h_q, head_dim), dtype=torch.bfloat16, device=q.device)
+    out_m = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
+    out_l = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
+
     kernel = build_swa_prefill_kernel(
-        h_q=h_q, head_dim=head_dim, max_swa_tiles=max_swa_tiles, sm_scale=sm_scale
+        h_q=h_q,
+        head_dim=head_dim,
+        max_swa_tiles=max_swa_tiles,
+        sm_scale=sm_scale,
     )
     stream = torch.cuda.current_stream()
-    kernel(q_pad, kv_swa_flat, out, m_raw, l_raw, total_tokens,
-           stream=fx.Stream(stream.cuda_stream))
-    return out[:total_tokens], m_raw[:total_tokens], l_raw[:total_tokens]
+    kernel(
+        q_pad, kv_swa_flat, out, out_m, out_l,
+        total_tokens=total_tokens,
+        stream=fx.Stream(stream.cuda_stream),
+    )
+    return out[:total_tokens], out_m[:total_tokens], out_l[:total_tokens]

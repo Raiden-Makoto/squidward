@@ -1115,7 +1115,6 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 try:
                     from sglang.srt.layers.attention.nsa.flydsl_nsa_prefill import (
                         _is_available as _flydsl_available,
-                        flydsl_nsa_prefill_with_lse,
                         flydsl_nsa_prefill_with_m_l,
                     )
                     from sglang.srt.layers.quantization.fp8_kernel import (
@@ -1123,7 +1122,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                     )
                     if _flydsl_available():
                         logger.debug(
-                            "[FlyDSL] dispatching C4 NSA prefill (%d tokens)", q.shape[0]
+                            "[FlyDSL] dispatching C4+SWA fused prefill (%d tokens)", q.shape[0]
                         )
                         total_tok = q.shape[0]   # b, with s_q=1 after unsqueeze
                         h_q_dim   = q.shape[2]   # h_q
@@ -1225,75 +1224,107 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         # sm_scale is now a compile-time constant: kernel compiles once.
                         _eff_sm_scale = self.softmax_scale * _Q_SCALE * _KV_SCALE
 
-                        # ── Step 3: FlyDSL C4 attention ────────────────────────────
-                        out_c4, lse_c4, lse_c4_l = flydsl_nsa_prefill_with_m_l(
+                        # ── Step 3: FlyDSL C4 attention (raw m/l for merge) ────────
+                        out_c4, m_raw_c4, l_raw_c4 = flydsl_nsa_prefill_with_m_l(
                             q=q_3d,
                             kv=_kv_flat,
                             indices=idx_2d,
                             sm_scale=_eff_sm_scale,
                         )
-                        # out_c4:  [T, H, D] bf16
-                        # lse_c4:  [T, H] float32  (m_raw, log2-space running max)
-                        # lse_c4_l:[T, H] float32  (l_raw, sum of exp2)
+                        # out_c4:   [T, H, D] bf16
+                        # m_raw_c4: [T, H]    f32  (log2-space running max)
+                        # l_raw_c4: [T, H]    f32  (sum of exp2 values)
 
-                        # ── Step 4: FlyDSL SWA attention ────────────────────────────
+                        # ── Step 4: Gather SWA KV from SWA pool ─────────────────────
+                        # The SWA pool buffer layout per page (uint8):
+                        #   bytes [0 .. swa_psz*448):       nope fp8 (448 elem/tok)
+                        #   bytes [swa_psz*448 .. swa_psz*576): rope bf16 (64 elem/tok)
+                        #   bytes [swa_psz*576 .. swa_psz*584): scale uint8 (7+1 pad/tok)
+                        # as_strided creates a (N_pages, swa_psz, 584) view without
+                        # copying memory, stepping over any per-page alignment padding.
                         from sglang.srt.layers.attention.nsa.flydsl_swa_prefill import (
-                            flydsl_swa_prefill as _flydsl_swa,
+                            flydsl_swa_prefill,
                         )
-                        _MAX_SWA_TILES = 32
-                        _BLOCK_N_SWA   = 32
-                        _SWA_KV_ROWS   = _pad * _MAX_SWA_TILES * _BLOCK_N_SWA
+                        _raw_swa   = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
+                        _swa_psz   = token_to_kv_pool.swa_window_size  # = SWA_WINDOW = 128
+                        _swa_bptok = 584                                # bytes per SWA token
+                        _n_swa_pg  = _raw_swa.shape[0]
 
-                        # Get paged regular KV buffer for this layer
-                        _kv_reg = token_to_kv_pool.get_key_buffer(layer_id)
+                        _swa_tok_v = _raw_swa.as_strided(
+                            (_n_swa_pg, _swa_psz, _swa_bptok),
+                            (_raw_swa.stride(0), _swa_bptok, 1),
+                        )   # (N_swa_pages, swa_psz, 584) uint8 — zero-copy view
 
-                        # Build flat SWA KV tensor padded with -fp8_max (= -inf attention for out-of-range rows)
-                        _kv_swa_flat = torch.full(
-                            (_SWA_KV_ROWS, _nope + _rope),   # 512 total
-                            -_fp8_max,
-                            dtype=_fp8_t,
-                            device=q.device,
+                        # swa_page_indices: (T, SWA_WINDOW) flat SWA pool token indices
+                        # Use the pre-unsqueeze attribute to get the canonical 2-D shape.
+                        _swa_idx_2d = core_attn_metadata.swa_page_indices[:total_tok]
+                        if _swa_idx_2d.ndim == 3:
+                            _swa_idx_2d = _swa_idx_2d.squeeze(1)
+                        _swa_idx_flat = _swa_idx_2d.reshape(-1)        # [T * SWA_WINDOW]
+                        _swa_valid    = _swa_idx_flat >= 0
+                        _swa_clamped  = _swa_idx_flat.clamp(min=0).long()
+                        _swa_pg       = _swa_clamped // _swa_psz
+                        _swa_sl       = _swa_clamped % _swa_psz
+
+                        # Advanced-index gather (contiguous result, no extra alloc loop)
+                        _swa_nope_u8  = _swa_tok_v[_swa_pg, _swa_sl, :448].contiguous()
+                        _swa_rope_u8  = _swa_tok_v[_swa_pg, _swa_sl, 448:576].contiguous()
+                        _swa_scale_u8 = _swa_tok_v[_swa_pg, _swa_sl, 576:583].contiguous()
+
+                        _swa_nope_fp8  = _swa_nope_u8.view(_fp8_t)          # [T*SWA,448]
+                        _swa_rope_bf16 = _swa_rope_u8.view(torch.bfloat16)  # [T*SWA, 64]
+
+                        # Dequantize: nope_bf16 = nope_fp8 × 2^(scale_u8 − 127)
+                        _swa_tile_sc   = torch.exp2(_swa_scale_u8.float() - 127.0)
+                        _swa_tile_sce  = _swa_tile_sc.repeat_interleave(_tile_sz, dim=-1)
+                        _swa_nope_bf16 = (_swa_nope_fp8.float() * _swa_tile_sce).to(torch.bfloat16)
+
+                        _swa_kv_bf16 = torch.cat([_swa_nope_bf16, _swa_rope_bf16], dim=-1)
+                        # Zero out invalid (pre-causal) KV entries; V=0 → zero output
+                        # contribution regardless of attention weight, so l_new inflation
+                        # doesn't corrupt the merged output numerator.
+                        _swa_kv_bf16[~_swa_valid] = 0.0
+
+                        # Requantize to fp8 using the same fixed scale as Q / C4 KV
+                        _swa_kv_fp8 = (
+                            (_swa_kv_bf16.float() * (1.0 / _KV_SCALE))
+                            .clamp(-_fp8_max, _fp8_max)
+                            .to(_fp8_t)
+                        )                                               # [T*SWA_WINDOW, 512]
+
+                        # Build flat KV tensor for the FlyDSL SWA kernel.
+                        # Token tok occupies rows [tok*SWA_WINDOW, (tok+1)*SWA_WINDOW).
+                        # Rows beyond total_tok*SWA_WINDOW are zero-padded (harmless for
+                        # out-of-bounds CTAs: V=0 contributes nothing to the output).
+                        _MAX_SWA_TILES = SWA_WINDOW // 32              # 4  (128/32)
+                        _BLOCK_N       = 32
+                        _pad_tok = ((total_tok + 15) // 16) * 16       # TILE_M-aligned
+                        _swa_flat_rows = _pad_tok * _MAX_SWA_TILES * _BLOCK_N  # _pad*128
+                        _kv_swa_flat = torch.zeros(
+                            (_swa_flat_rows, 512), dtype=_fp8_t, device=q.device
                         )
-                        # Gather: for each token i, copy min(seq_lens_casual[i], _MAX_SWA_TILES*_BLOCK_N_SWA) KV rows
-                        # from the paged KV cache into _kv_swa_flat[i * _MAX_SWA_TILES * _BLOCK_N_SWA : ...]
-                        # Per-request KV page table: kv_indptr[req], kv_indices[kv_indptr[req]:kv_indptr[req+1]]
-                        for _i in range(total_tok):
-                            _l = min(int(seq_lens_casual[_i].item()), _MAX_SWA_TILES * _BLOCK_N_SWA)
-                            if _l == 0:
-                                continue
-                            _req = int(req_pool_indices_repeated[_i].item())
-                            _pg_start = int(kv_indptr[_req].item())
-                            _pg_end   = int(kv_indptr[_req + 1].item())
-                            _pages    = kv_indices[_pg_start:_pg_end]
-                            _page_size_reg = token_to_kv_pool.page_size
-                            for _pos in range(_l):
-                                _pg = int(_pages[_pos // _page_size_reg].item())
-                                _sl = _pos % _page_size_reg
-                                _kv_row  = _kv_reg[_pg, _sl]
-                                _kv_bf16 = _kv_row.to(torch.bfloat16)
-                                _kv_fp8  = (
-                                    (_kv_bf16.float() * (_fp8_max / _CLIP))
-                                    .clamp(-_fp8_max, _fp8_max)
-                                    .to(_fp8_t)
-                                )
-                                _kv_swa_flat[_i * _MAX_SWA_TILES * _BLOCK_N_SWA + _pos] = _kv_fp8[:512]
+                        _kv_swa_flat[: total_tok * SWA_WINDOW] = _swa_kv_fp8
 
-                        # Call FlyDSL SWA
-                        _out_swa, _m_swa, _l_swa = _flydsl_swa(
-                            q=q_3d[:total_tok],
+                        # ── Step 5: FlyDSL SWA attention ────────────────────────────
+                        out_swa, m_raw_swa, l_raw_swa = flydsl_swa_prefill(
+                            q=q_3d,
                             kv_swa_flat=_kv_swa_flat,
                             max_swa_tiles=_MAX_SWA_TILES,
                             sm_scale=_eff_sm_scale,
                         )
+                        # out_swa:   [T, H, D] bf16
+                        # m_raw_swa: [T, H]    f32  (log2-space running max)
+                        # l_raw_swa: [T, H]    f32  (sum of exp2 values)
 
-                        # Online-softmax merge (log2 space, both from FlyDSL)
-                        _m_c4  = lse_c4.float()    # [T, H] log2-space m from NSA kernel
-                        _m_new = torch.maximum(_m_swa, _m_c4)
-                        _e_swa = torch.exp2(_m_swa - _m_new)
-                        _e_c4  = torch.exp2(_m_c4  - _m_new)
-                        _l_new = _l_swa * _e_swa + lse_c4_l * _e_c4
+                        # ── Step 6: Online-softmax merge (log2 domain) ───────────────
+                        # Fuse SWA and C4 outputs so the combined result equals joint
+                        # attention over all SWA + C4 KV entries.
+                        _m_new = torch.maximum(m_raw_swa, m_raw_c4)        # [T, H]
+                        _e_swa = torch.exp2(m_raw_swa - _m_new)            # [T, H]
+                        _e_c4  = torch.exp2(m_raw_c4  - _m_new)            # [T, H]
+                        _l_new = l_raw_swa * _e_swa + l_raw_c4 * _e_c4    # [T, H]
                         _o = (
-                            _out_swa.float() * _e_swa.unsqueeze(-1)
+                            out_swa.float() * _e_swa.unsqueeze(-1)
                             + out_c4.float() * _e_c4.unsqueeze(-1)
                         ) / _l_new.unsqueeze(-1).clamp(min=1e-8)
                         return _o.to(torch.bfloat16)
