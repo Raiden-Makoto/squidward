@@ -1251,26 +1251,30 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         # l_raw_swa: [T, H]    f32  (sum of exp2 values)
 
                         # ── Step 5: Online-softmax merge (log2 domain) ───────────────
-                        # Guard against NaN/Inf in m_raw (can occur when SWA window is empty)
-                        _NEG_INF = -1e30
-                        m_raw_swa = torch.nan_to_num(m_raw_swa, nan=_NEG_INF, posinf=_NEG_INF, neginf=_NEG_INF)
-                        m_raw_c4  = torch.nan_to_num(m_raw_c4,  nan=_NEG_INF, posinf=_NEG_INF, neginf=_NEG_INF)
-                        l_raw_swa = torch.nan_to_num(l_raw_swa, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0)
-                        l_raw_c4  = torch.nan_to_num(l_raw_c4,  nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0)
-                        out_swa = torch.nan_to_num(out_swa.float(), nan=0.0)
-                        out_c4  = torch.nan_to_num(out_c4.float(),  nan=0.0)
+                        # Guard against NaN/Inf in m_raw (can occur when SWA window is
+                        # empty or fast-math fp overflow occurs inside the kernel).
+                        # posinf=0.0: replace +inf m_raw with a neutral score (exp2(0)=1)
+                        # rather than -1e9 which would silently zero-weight that branch.
+                        _NEG_M = -1e9
+                        m_raw_swa = torch.nan_to_num(m_raw_swa, nan=_NEG_M, posinf=0.0, neginf=_NEG_M)
+                        m_raw_c4  = torch.nan_to_num(m_raw_c4,  nan=_NEG_M, posinf=0.0, neginf=_NEG_M)
+                        # posinf=1.0: if l_raw overflowed to +inf treat as a single token sum
+                        l_raw_swa = torch.nan_to_num(l_raw_swa, nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0)
+                        l_raw_c4  = torch.nan_to_num(l_raw_c4,  nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0)
+                        out_swa = torch.nan_to_num(out_swa.float(), nan=0.0, posinf=0.0, neginf=0.0)
+                        out_c4  = torch.nan_to_num(out_c4.float(),  nan=0.0, posinf=0.0, neginf=0.0)
 
                         _m_new = torch.maximum(m_raw_swa, m_raw_c4)        # [T, H]
                         _e_swa = torch.exp2(m_raw_swa - _m_new)            # [T, H]
                         _e_c4  = torch.exp2(m_raw_c4  - _m_new)            # [T, H]
                         _w_swa = (l_raw_swa * _e_swa)                      # [T, H]
                         _w_c4  = (l_raw_c4  * _e_c4)                       # [T, H]
-                        _l_new = (_w_swa + _w_c4).clamp(min=1e-8)          # [T, H]
+                        _l_new = (_w_swa + _w_c4).clamp(min=1e-9)          # [T, H]
                         _o = (
                             out_swa * _w_swa.unsqueeze(-1)
                             + out_c4 * _w_c4.unsqueeze(-1)
                         ) / _l_new.unsqueeze(-1)
-                        return torch.nan_to_num(_o, nan=0.0).to(torch.bfloat16)
+                        return torch.nan_to_num(_o, nan=0.0, posinf=0.0, neginf=0.0).to(torch.bfloat16)
                 except Exception:
                     import traceback
                     logger.warning(
