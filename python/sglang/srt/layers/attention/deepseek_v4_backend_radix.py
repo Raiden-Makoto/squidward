@@ -1157,65 +1157,49 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         ).clamp(min=0)                         # [T, TOPK], range [0, _np*_c4_psz)
                         TOPK = idx_2d.shape[-1]
 
-                        _MAX_C4_KV_ROWS = 256 * 2048  # 512K rows max ~256 MB fp8
-                        if total_tok * TOPK > _MAX_C4_KV_ROWS:
-                            logger.debug(
-                                "[FlyDSL] batch too large (%d tokens * %d topk), falling back",
-                                total_tok,
-                                TOPK,
-                            )
-                            raise RuntimeError("batch too large for FlyDSL C4 gather")
-
-                        # Map flat token indices → (page, slot_in_page)
-                        _idx_flat  = idx_2d.reshape(-1)        # [T*TOPK]
-                        _page_idx  = _idx_flat // _c4_psz      # [T*TOPK]
-                        _tok_slot  = _idx_flat  % _c4_psz      # [T*TOPK]
-
                         # Data view: [_np, _c4_psz, 576] uint8
                         _data = _raw_c4[:, :_c4_psz * _stride].view(_np, _c4_psz, _stride)
 
-                        # Gather nope fp8: [T*TOPK, 448]
-                        _nope_fp8_g = (
-                            _data[:, :, :_nope].contiguous()
-                            .view(_fp8_t)[_page_idx, _tok_slot]
-                        )
+                        # Pre-build typed views over the full cache once (outside the chunk loop)
+                        _data_nope_fp8  = _data[:, :, :_nope].contiguous().view(_fp8_t)
+                        _data_rope_bf16 = _data[:, :, _nope:_stride].contiguous().view(torch.bfloat16)
 
-                        # Gather ue8m0 scale bytes: [T*TOPK, 7]
+                        # Scale view: [_np, _c4_psz, 7]
                         _s_off    = _c4_psz * _stride
                         _scale_u8 = (
                             _raw_c4[:, _s_off : _s_off + _c4_psz * _s_tok]
                             .view(_np, _c4_psz, _s_tok)[:, :, :_n_tiles]
-                        )                                       # [_np, _c4_psz, 7]
-                        _scale_g  = _scale_u8[_page_idx, _tok_slot]  # [T*TOPK, 7]
-
-                        # Dequantize: nope_bf16 = nope_fp8 × 2^(scale_u8 - 127)
-                        _tile_sc  = torch.exp2(_scale_g.float() - 127.0)        # [T*TOPK, 7]
-                        _tile_sc_e = _tile_sc.repeat_interleave(_tile_sz, dim=-1)  # [T*TOPK, 448]
-                        _nope_bf16 = (_nope_fp8_g.float() * _tile_sc_e).to(torch.bfloat16)
-
-                        # Gather rope bf16: [T*TOPK, 64]
-                        _rope_bf16 = (
-                            _data[:, :, _nope:_stride].contiguous()
-                            .view(torch.bfloat16)[_page_idx, _tok_slot]
                         )
 
-                        # Full gathered KV in bf16: [T*TOPK, 512]
-                        _kv_bf16 = torch.cat([_nope_bf16, _rope_bf16], dim=-1)
-
-                        # Fixed FP8 quantization scales: clip at 8× the FP8 LSB so the
-                        # kernel sm_scale is a compile-time constant (compiles ONCE).
-                        # Clip range 8.0 is ~2× the typical per-tensor amax (≈4.0 from
-                        # earlier profiling), so virtually no clipping in practice.
-                        _CLIP = 8.0
-                        _Q_SCALE  = _CLIP / _fp8_max   # fixed scalar, no GPU sync
+                        _CLIP     = 8.0
+                        _Q_SCALE  = _CLIP / _fp8_max
                         _KV_SCALE = _CLIP / _fp8_max
 
-                        # Requantize gathered KV to fp8 with fixed scale
-                        _kv_flat  = (
-                            (_kv_bf16.float() * (1.0 / _Q_SCALE))
-                            .clamp(-_fp8_max, _fp8_max)
-                            .to(_fp8_t)
-                        )                                       # [T*TOPK, 512]
+                        # Chunked C4 KV gather: process CHUNK tokens at a time to
+                        # bound peak memory regardless of batch size.
+                        _CHUNK = 256
+                        _kv_flat_chunks: list = []
+                        for _t0 in range(0, total_tok, _CHUNK):
+                            _t1      = min(_t0 + _CHUNK, total_tok)
+                            _idx_c   = idx_2d[_t0:_t1].reshape(-1)   # [C*TOPK]
+                            _page_c  = _idx_c // _c4_psz
+                            _slot_c  = _idx_c  % _c4_psz
+
+                            _nope_fp8_c  = _data_nope_fp8[_page_c, _slot_c]   # [C*TOPK, 448]
+                            _scale_c     = _scale_u8[_page_c, _slot_c]         # [C*TOPK, 7]
+                            _tile_sc_c   = torch.exp2(_scale_c.float() - 127.0)
+                            _tile_sc_ec  = _tile_sc_c.repeat_interleave(_tile_sz, dim=-1)
+                            _nope_bf16_c = (_nope_fp8_c.float() * _tile_sc_ec).to(torch.bfloat16)
+
+                            _rope_bf16_c = _data_rope_bf16[_page_c, _slot_c]  # [C*TOPK, 64]
+                            _kv_bf16_c   = torch.cat([_nope_bf16_c, _rope_bf16_c], dim=-1)
+                            _kv_flat_chunks.append(
+                                (_kv_bf16_c.float() * (1.0 / _Q_SCALE))
+                                .clamp(-_fp8_max, _fp8_max)
+                                .to(_fp8_t)
+                            )
+
+                        _kv_flat = torch.cat(_kv_flat_chunks, dim=0)  # [T*TOPK, 512]
 
                         # New sequential indices: token t → rows [t*TOPK, (t+1)*TOPK)
                         idx_2d = torch.arange(
