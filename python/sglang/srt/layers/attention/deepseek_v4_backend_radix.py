@@ -1243,9 +1243,6 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                             sm_scale=_eff_sm_scale,
                         )
                         # out_c4: [T, H, D] bf16,   lse_c4: [T, H] float32
-                        # FlyDSL output is P @ V_fp8 = (P @ V_bf16) / _KV_SCALE.
-                        # Multiply by _KV_SCALE to restore true BF16 magnitude.
-                        out_c4 = out_c4.float() * _KV_SCALE
 
                         # ── Step 5: Online-softmax combine SWA + C4 ─────────────────
                         lse_swa_flat = lse_swa.view(total_tok, h_q_dim).float()
