@@ -355,11 +355,6 @@ def build_nsa_prefill_paged_kernel(
                 + slot_idx * fx.Index(_SCALE_BYTES)
             )
 
-            # d_group as i32 for the select in dc=24..31
-            d_group_i32 = _mlir_arith.IndexCastOp(T.i32, _raw(d_group)).result
-            # is_rope: True when d_group==1 (selects rope path for dc>=24)
-            is_rope = _mlir_arith.CmpIOp(0, d_group_i32, _raw(fx.Int32(1))).result
-
             for dc in range_constexpr(D_CHUNKS):  # 0..31
                 i64_off = (
                     kv_row * fx.Index(HEAD_DIM // 8)
@@ -381,11 +376,15 @@ def build_nsa_prefill_paged_kernel(
                     tile_scale   = ue8m0_to_f32(scale_u8_i32)
                     result_i64   = dequant_requant_8fp8(raw_i64, tile_scale)
 
+                    _memref.store(result_i64, lds_kv_i64, [_raw(i64_off)])
+
                 else:
                     # dc = 24..31: d_group=0 stays in nope, d_group=1 enters rope.
-                    #
-                    # d_group=0 path:
-                    #   abs_dim = dc*8 ∈ [192, 248], always tile=3
+                    # Avoid a runtime SelectOp (wrong API); instead each thread writes
+                    # its own slot unconditionally — stores never collide because
+                    # i64_off_d0 and i64_off_d1 are distinct.
+
+                    # d_group=0 path: abs_dim = dc*8 ∈ [192, 248], tile=3
                     nope_off_d0 = token_base + fx.Index(dc * 8)
                     sc_off_3    = scale_base + fx.Index(3)
                     raw_nope_d0 = load_8bytes_as_i64(pool_ptr, nope_off_d0)
@@ -393,26 +392,23 @@ def build_nsa_prefill_paged_kernel(
                     tile_scale_3 = ue8m0_to_f32(scale_u8_3)
                     nope_i64    = dequant_requant_8fp8(raw_nope_d0, tile_scale_3)
 
-                    # d_group=1 path:
-                    #   rope bf16 values at bf16 index (dc-24)*8..(dc-24)*8+8
-                    #   raw bytes: NOPE_BYTES + bf16_idx * 2 within token slot
-                    _rope_bf16_start = (dc - 24) * 8   # Python const: 0,8,...,56
+                    # d_group=1 path: rope bf16 at byte offset (dc-24)*16 within rope section
+                    _rope_start = (dc - 24) * 16   # bytes: 0,16,...,112
                     rope_lo = load_8bytes_as_i64(
                         pool_ptr,
-                        token_base + fx.Index(_NOPE_BYTES + _rope_bf16_start * 2),
+                        token_base + fx.Index(_NOPE_BYTES + _rope_start),
                     )
                     rope_hi = load_8bytes_as_i64(
                         pool_ptr,
-                        token_base + fx.Index(_NOPE_BYTES + _rope_bf16_start * 2 + 8),
+                        token_base + fx.Index(_NOPE_BYTES + _rope_start + 8),
                     )
                     rope_i64 = requant_8bf16(rope_lo, rope_hi)
 
-                    # Select: d_group==1 → rope, d_group==0 → nope
-                    result_i64 = _mlir_arith.SelectOp(
-                        is_rope, rope_i64, nope_i64
-                    ).result
-
-                _memref.store(result_i64, lds_kv_i64, [_raw(i64_off)])
+                    # Write each result to its own slot; no select needed.
+                    i64_off_d0 = kv_row * fx.Index(HEAD_DIM // 8) + fx.Index(dc)
+                    i64_off_d1 = kv_row * fx.Index(HEAD_DIM // 8) + fx.Index(D_HALF // 8 + dc)
+                    _memref.store(nope_i64, lds_kv_i64, [_raw(i64_off_d0)])
+                    _memref.store(rope_i64, lds_kv_i64, [_raw(i64_off_d1)])
 
             gpu.barrier()
 
