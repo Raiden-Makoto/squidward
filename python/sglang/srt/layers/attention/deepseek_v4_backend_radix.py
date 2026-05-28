@@ -1157,6 +1157,15 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         ).clamp(min=0)                         # [T, TOPK], range [0, _np*_c4_psz)
                         TOPK = idx_2d.shape[-1]
 
+                        _MAX_C4_KV_ROWS = 256 * 2048  # 512K rows max ~256 MB fp8
+                        if total_tok * TOPK > _MAX_C4_KV_ROWS:
+                            logger.debug(
+                                "[FlyDSL] batch too large (%d tokens * %d topk), falling back",
+                                total_tok,
+                                TOPK,
+                            )
+                            raise RuntimeError("batch too large for FlyDSL C4 gather")
+
                         # Map flat token indices → (page, slot_in_page)
                         _idx_flat  = idx_2d.reshape(-1)        # [T*TOPK]
                         _page_idx  = _idx_flat // _c4_psz      # [T*TOPK]
@@ -1243,16 +1252,16 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         _swa_psz  = token_to_kv_pool.swa_window_size
                         _n_swa_pg = _raw_swa.shape[0]
 
-                        # Three planar section views — no per-token interleaving.
-                        _bpp      = _raw_swa.numel() // _n_swa_pg  # actual bytes per page
-                        _raw_flat = _raw_swa.view(_n_swa_pg, _bpp)   # [N_pg, bpp] u8
-                        # Section offsets within each page (extra tail bytes are padding)
-                        _nope_end  = _swa_psz * 448
-                        _rope_end  = _swa_psz * 576
-                        _scale_end = _swa_psz * 584
-                        _nope_v   = _raw_flat[:, :_nope_end].view(_n_swa_pg, _swa_psz, 448)              # [N, P, 448] u8
-                        _rope_v   = _raw_flat[:, _nope_end:_rope_end].view(_n_swa_pg, _swa_psz, 128)     # [N, P, 128] u8
-                        _scale_v  = _raw_flat[:, _rope_end:_scale_end].view(_n_swa_pg, _swa_psz, 8)      # [N, P, 8]   u8
+                        # Actual layout: each 576-byte per-token slot = 448 NoPE fp8 + 128 RoPE bf16
+                        # (interleaved, not planar), followed by a planar scale section.
+                        _bpp       = _raw_swa.numel() // _n_swa_pg   # actual bytes per page
+                        _raw_flat  = _raw_swa.view(_n_swa_pg, _bpp)   # [N_pg, bpp] u8
+                        _slot_bytes = 576                              # 448 nope + 128 rope per token
+                        _s_off      = _swa_psz * _slot_bytes           # byte offset of scale section
+                        _slots  = _raw_flat[:, :_s_off].view(_n_swa_pg, _swa_psz, _slot_bytes)  # [N, P, 576] u8
+                        _nope_v = _slots[:, :, :448]                   # [N, P, 448] u8
+                        _rope_v = _slots[:, :, 448:576]                # [N, P, 128] u8
+                        _scale_v = _raw_flat[:, _s_off:_s_off + _swa_psz * 8].view(_n_swa_pg, _swa_psz, 8)  # [N, P, 8] u8
 
                         # swa_page_indices: (T, SWA_WINDOW) flat SWA pool token indices
                         _swa_idx_2d = core_attn_metadata.swa_page_indices[:total_tok]
@@ -1315,12 +1324,6 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         # l_raw_swa: [T, H]    f32  (sum of exp2 values)
 
                         # ── Step 6: Online-softmax merge (log2 domain) ───────────────
-                        # Diagnostic: return SWA-only to verify SWA kernel quality
-                        return out_swa
-                        # (each kernel divides by its own l before writing bf16 output).
-                        # To merge two partitions correctly we must undo that
-                        # normalization, weight by the re-scaled l, then re-normalize:
-                        #   o = (o_swa*l_swa*e_swa + o_c4*l_c4*e_c4) / (l_swa*e_swa + l_c4*e_c4)
                         _m_new = torch.maximum(m_raw_swa, m_raw_c4)        # [T, H]
                         _e_swa = torch.exp2(m_raw_swa - _m_new)            # [T, H]
                         _e_c4  = torch.exp2(m_raw_c4  - _m_new)            # [T, H]
