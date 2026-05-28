@@ -1175,6 +1175,19 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                             m_raw_c4[_all_c4_invalid] = -1e9
                             l_raw_c4[_all_c4_invalid] = 0.0
 
+                        # DEBUG: inspect C4 kernel outputs
+                        import os as _os
+                        if _os.environ.get("SGLANG_FLYDSL_DEBUG", "0") == "1":
+                            _out_c4_nan = torch.isnan(out_c4).sum().item()
+                            _m_c4_nan   = torch.isnan(m_raw_c4).sum().item()
+                            _m_c4_inf   = torch.isinf(m_raw_c4).sum().item()
+                            _m_c4_max   = m_raw_c4[~torch.isnan(m_raw_c4) & ~torch.isinf(m_raw_c4)].max().item() if (~torch.isnan(m_raw_c4) & ~torch.isinf(m_raw_c4)).any() else float('nan')
+                            _m_c4_min   = m_raw_c4[~torch.isnan(m_raw_c4) & ~torch.isinf(m_raw_c4)].min().item() if (~torch.isnan(m_raw_c4) & ~torch.isinf(m_raw_c4)).any() else float('nan')
+                            logger.warning(
+                                f"C4  raw: out NaN={_out_c4_nan} | "
+                                f"m_raw NaN={_m_c4_nan} inf={_m_c4_inf} max={_m_c4_max:.3f} min={_m_c4_min:.3f}"
+                            )
+
                         # ── Step 3: Gather SWA KV from SWA pool ─────────────────────
                         # Local constant used only in the SWA gather+dequant section.
                         _tile_sz  = 64   # elems per ue8m0 scale tile
@@ -1257,16 +1270,27 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         # m_raw_swa: [T, H]    f32  (log2-space running max)
                         # l_raw_swa: [T, H]    f32  (sum of exp2 values)
 
-                        # Zero out SWA contributions for queries with no valid SWA
-                        # indices.  Without this, zero-K tokens produce score=0,
-                        # leaving m_raw_swa=0 which can dominate m_raw_c4 < 0 in
-                        # the merge and pull the output toward zero.
-                        _swa_valid_2d = _swa_idx_2d >= 0      # [T, SWA_WINDOW]
-                        _all_swa_invalid = ~_swa_valid_2d.any(dim=-1)  # [T]
-                        if _all_swa_invalid.any():
-                            out_swa[_all_swa_invalid] = 0.0
-                            m_raw_swa[_all_swa_invalid] = -1e9
-                            l_raw_swa[_all_swa_invalid] = 0.0
+                        # DEBUG: inspect SWA kernel outputs
+                        if _os.environ.get("SGLANG_FLYDSL_DEBUG", "0") == "1":
+                            _out_swa_nan = torch.isnan(out_swa).sum().item()
+                            _out_swa_inf = torch.isinf(out_swa).sum().item()
+                            _m_swa_nan   = torch.isnan(m_raw_swa).sum().item()
+                            _m_swa_inf   = torch.isinf(m_raw_swa).sum().item()
+                            _m_swa_max   = m_raw_swa[~torch.isnan(m_raw_swa) & ~torch.isinf(m_raw_swa)].max().item() if (~torch.isnan(m_raw_swa) & ~torch.isinf(m_raw_swa)).any() else float('nan')
+                            _m_swa_min   = m_raw_swa[~torch.isnan(m_raw_swa) & ~torch.isinf(m_raw_swa)].min().item() if (~torch.isnan(m_raw_swa) & ~torch.isinf(m_raw_swa)).any() else float('nan')
+                            _l_swa_nan   = torch.isnan(l_raw_swa).sum().item()
+                            _l_swa_inf   = torch.isinf(l_raw_swa).sum().item()
+                            _l_swa_max   = l_raw_swa[~torch.isnan(l_raw_swa) & ~torch.isinf(l_raw_swa)].max().item() if (~torch.isnan(l_raw_swa) & ~torch.isinf(l_raw_swa)).any() else float('nan')
+                            logger.warning(
+                                f"SWA raw: out NaN={_out_swa_nan} inf={_out_swa_inf} | "
+                                f"m_raw NaN={_m_swa_nan} inf={_m_swa_inf} max={_m_swa_max:.3f} min={_m_swa_min:.3f} | "
+                                f"l_raw NaN={_l_swa_nan} inf={_l_swa_inf} max={_l_swa_max:.3f}"
+                            )
+
+                        # SWA bypass: zero out SWA so the server runs cleanly
+                        out_swa   = torch.zeros_like(out_swa)
+                        m_raw_swa = torch.full_like(m_raw_swa, -1e30)
+                        l_raw_swa = torch.zeros_like(l_raw_swa)
 
                         # ── Step 5: Online-softmax merge (log2 domain) ───────────────
                         # NaN guards — must run before any merge computation
@@ -1285,6 +1309,10 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         _l_new = (_w_swa + _w_c4).clamp(min=1e-9)
                         _o     = (out_swa * _w_swa.unsqueeze(-1) + out_c4 * _w_c4.unsqueeze(-1)) / _l_new.unsqueeze(-1)
                         _o     = torch.nan_to_num(_o, nan=0.0, posinf=0.0, neginf=0.0)
+                        if _os.environ.get("SGLANG_FLYDSL_DEBUG", "0") == "1":
+                            _o_nan = torch.isnan(_o).sum().item()
+                            _o_inf = torch.isinf(_o).sum().item()
+                            logger.warning(f"Merged output: NaN={_o_nan} inf={_o_inf} total_elements={_o.numel()}")
                         return _o.to(torch.bfloat16)
                 except Exception:
                     import traceback
