@@ -1246,14 +1246,27 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                             flydsl_swa_prefill,
                         )
                         _raw_swa   = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
-                        _swa_psz   = token_to_kv_pool.swa_window_size  # = SWA_WINDOW = 128
-                        _swa_bptok = 584                                # bytes per SWA token
+                        # swa_window_size == SWA pool page_size (256 in radix, 128 non-radix)
+                        _swa_psz   = token_to_kv_pool.swa_window_size
                         _n_swa_pg  = _raw_swa.shape[0]
 
-                        _swa_tok_v = _raw_swa.as_strided(
-                            (_n_swa_pg, _swa_psz, _swa_bptok),
-                            (_raw_swa.stride(0), _swa_bptok, 1),
-                        )   # (N_swa_pages, swa_psz, 584) uint8 — zero-copy view
+                        # FlashMLA on-device layout per page of _swa_psz tokens:
+                        #   data:  bytes [0,            _swa_psz*576):  NoPE(448)|RoPE(128) per token
+                        #   scale: bytes [_swa_psz*576, _swa_psz*584):  7×ue8m0 + 1 pad per token
+                        #
+                        # The prior as_strided used a 584-byte stride per token (wrong) which
+                        # drifts +8 bytes per slot from the correct 576-byte data stride,
+                        # causing garbage reads for every slot except slot 0.
+                        _swa_data_v = _raw_swa.as_strided(
+                            (_n_swa_pg, _swa_psz, 576),
+                            (_raw_swa.stride(0), 576, 1),
+                        )                                   # (N_pages, _swa_psz, 576) uint8
+
+                        _swa_scale_v = _raw_swa.as_strided(
+                            (_n_swa_pg, _swa_psz, 8),
+                            (_raw_swa.stride(0), 8, 1),
+                            storage_offset=_swa_psz * 576,
+                        )                                   # (N_pages, _swa_psz, 8) uint8
 
                         # swa_page_indices: (T, SWA_WINDOW) flat SWA pool token indices
                         # Use the pre-unsqueeze attribute to get the canonical 2-D shape.
@@ -1266,10 +1279,10 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         _swa_pg       = _swa_clamped // _swa_psz
                         _swa_sl       = _swa_clamped % _swa_psz
 
-                        # Advanced-index gather (contiguous result, no extra alloc loop)
-                        _swa_nope_u8  = _swa_tok_v[_swa_pg, _swa_sl, :448].contiguous()
-                        _swa_rope_u8  = _swa_tok_v[_swa_pg, _swa_sl, 448:576].contiguous()
-                        _swa_scale_u8 = _swa_tok_v[_swa_pg, _swa_sl, 576:583].contiguous()
+                        # GPU tensor-index gather — correct FlashMLA data/scale offsets
+                        _swa_nope_u8  = _swa_data_v[_swa_pg, _swa_sl, :448].contiguous()
+                        _swa_rope_u8  = _swa_data_v[_swa_pg, _swa_sl, 448:].contiguous()
+                        _swa_scale_u8 = _swa_scale_v[_swa_pg, _swa_sl, :7].contiguous()
 
                         _swa_nope_fp8  = _swa_nope_u8.view(_fp8_t)          # [T*SWA,448]
                         _swa_rope_bf16 = _swa_rope_u8.view(torch.bfloat16)  # [T*SWA, 64]
