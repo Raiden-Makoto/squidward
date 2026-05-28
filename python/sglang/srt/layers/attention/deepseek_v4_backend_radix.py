@@ -1244,11 +1244,15 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         _n_swa_pg = _raw_swa.shape[0]
 
                         # Three planar section views — no per-token interleaving.
-                        _bpp      = _swa_psz * 584          # bytes per page
+                        _bpp      = _raw_swa.numel() // _n_swa_pg  # actual bytes per page
                         _raw_flat = _raw_swa.view(_n_swa_pg, _bpp)   # [N_pg, bpp] u8
-                        _nope_v   = _raw_flat[:, :_swa_psz*448].view(_n_swa_pg, _swa_psz, 448)            # [N, P, 448] u8
-                        _rope_v   = _raw_flat[:, _swa_psz*448:_swa_psz*576].view(_n_swa_pg, _swa_psz, 128) # [N, P, 128] u8
-                        _scale_v  = _raw_flat[:, _swa_psz*576:].view(_n_swa_pg, _swa_psz, 8)              # [N, P, 8]   u8
+                        # Section offsets within each page (extra tail bytes are padding)
+                        _nope_end  = _swa_psz * 448
+                        _rope_end  = _swa_psz * 576
+                        _scale_end = _swa_psz * 584
+                        _nope_v   = _raw_flat[:, :_nope_end].view(_n_swa_pg, _swa_psz, 448)              # [N, P, 448] u8
+                        _rope_v   = _raw_flat[:, _nope_end:_rope_end].view(_n_swa_pg, _swa_psz, 128)     # [N, P, 128] u8
+                        _scale_v  = _raw_flat[:, _rope_end:_scale_end].view(_n_swa_pg, _swa_psz, 8)      # [N, P, 8]   u8
 
                         # swa_page_indices: (T, SWA_WINDOW) flat SWA pool token indices
                         _swa_idx_2d = core_attn_metadata.swa_page_indices[:total_tok]
