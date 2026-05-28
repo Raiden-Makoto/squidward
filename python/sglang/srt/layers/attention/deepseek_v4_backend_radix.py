@@ -1257,10 +1257,16 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         # m_raw_swa: [T, H]    f32  (log2-space running max)
                         # l_raw_swa: [T, H]    f32  (sum of exp2 values)
 
-                        # DIAG: bypass SWA to test C4-only through merge
-                        out_swa = torch.zeros_like(out_swa)
-                        m_raw_swa = torch.full_like(m_raw_swa, -1e30)
-                        l_raw_swa = torch.zeros_like(l_raw_swa)
+                        # Zero out SWA contributions for queries with no valid SWA
+                        # indices.  Without this, zero-K tokens produce score=0,
+                        # leaving m_raw_swa=0 which can dominate m_raw_c4 < 0 in
+                        # the merge and pull the output toward zero.
+                        _swa_valid_2d = _swa_idx_2d >= 0      # [T, SWA_WINDOW]
+                        _all_swa_invalid = ~_swa_valid_2d.any(dim=-1)  # [T]
+                        if _all_swa_invalid.any():
+                            out_swa[_all_swa_invalid] = 0.0
+                            m_raw_swa[_all_swa_invalid] = -1e9
+                            l_raw_swa[_all_swa_invalid] = 0.0
 
                         # ── Step 5: Online-softmax merge (log2 domain) ───────────────
                         # NaN guards — must run before any merge computation
