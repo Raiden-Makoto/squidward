@@ -1168,9 +1168,6 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                             fp8_max=_fp8_max,
                         )
 
-                        # DIAG: C4-only return
-                        return out_c4.to(torch.bfloat16) if out_c4.dtype != torch.bfloat16 else out_c4
-
                         # ── Step 3: Gather SWA KV from SWA pool ─────────────────────
                         # Local constant used only in the SWA gather+dequant section.
                         _tile_sz  = 64   # elems per ue8m0 scale tile
