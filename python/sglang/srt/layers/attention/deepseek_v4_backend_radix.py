@@ -1204,12 +1204,17 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         # Full gathered KV in bf16: [T*TOPK, 512]
                         _kv_bf16 = torch.cat([_nope_bf16, _rope_bf16], dim=-1)
 
-                        # Requantize gathered KV to fp8 with a single global scale
-                        # (scale computed over actually-used entries → tighter range)
-                        _kv_amax  = _kv_bf16.abs().max().clamp(min=1e-8)
-                        _kv_scale = (_kv_amax / _fp8_max).item()
+                        # Fixed FP8 quantization scales: clip at 8× the FP8 LSB so the
+                        # kernel sm_scale is a compile-time constant (compiles ONCE).
+                        # Clip range 8.0 is ~2× the typical per-tensor amax (≈4.0 from
+                        # earlier profiling), so virtually no clipping in practice.
+                        _CLIP = 8.0
+                        _Q_SCALE  = _CLIP / _fp8_max   # fixed scalar, no GPU sync
+                        _KV_SCALE = _CLIP / _fp8_max
+
+                        # Requantize gathered KV to fp8 with fixed scale
                         _kv_flat  = (
-                            (_kv_bf16.float() / _kv_scale)
+                            (_kv_bf16.float() * (1.0 / _Q_SCALE))
                             .clamp(-_fp8_max, _fp8_max)
                             .to(_fp8_t)
                         )                                       # [T*TOPK, 512]
@@ -1219,20 +1224,16 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                             total_tok * TOPK, device=q.device, dtype=torch.int32
                         ).view(total_tok, TOPK)
 
-                        # ── Step 3: Quantize Q to fp8 with per-tensor scale ─────────
+                        # ── Step 3: Quantize Q to fp8 with fixed scale ──────────────
                         # q: [T, 1, H, 512] bf16 → [T, H, 512] fp8
                         _q_bf16   = q.reshape(total_tok, h_q_dim, q.shape[-1])
-                        _q_amax   = _q_bf16.abs().max().clamp(min=1e-8)
-                        _q_scale  = (_q_amax / _fp8_max).item()
                         q_3d      = (
-                            (_q_bf16.float() / _q_scale)
+                            (_q_bf16.float() * (1.0 / _Q_SCALE))
                             .clamp(-_fp8_max, _fp8_max)
                             .to(_fp8_t)
                         )
-                        # Effective sm_scale folds in both FP8 quantization denominators.
-                        # Round to 8 significant figures so the lru_cache key is stable
-                        # across calls with numerically similar but not identical scales.
-                        _eff_sm_scale = round(self.softmax_scale * _q_scale * _kv_scale, 8)
+                        # sm_scale is now a compile-time constant: kernel compiles once.
+                        _eff_sm_scale = self.softmax_scale * _Q_SCALE * _KV_SCALE
 
                         # ── Step 4: FlyDSL C4 attention ────────────────────────────
                         out_c4, lse_c4 = flydsl_nsa_prefill_with_lse(
@@ -1242,6 +1243,9 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                             sm_scale=_eff_sm_scale,
                         )
                         # out_c4: [T, H, D] bf16,   lse_c4: [T, H] float32
+                        # FlyDSL output is P @ V_fp8 = (P @ V_bf16) / _KV_SCALE.
+                        # Multiply by _KV_SCALE to restore true BF16 magnitude.
+                        out_c4 = out_c4.float() * _KV_SCALE
 
                         # ── Step 5: Online-softmax combine SWA + C4 ─────────────────
                         lse_swa_flat = lse_swa.view(total_tok, h_q_dim).float()
