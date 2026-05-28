@@ -1315,7 +1315,8 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         # l_raw_swa: [T, H]    f32  (sum of exp2 values)
 
                         # ── Step 6: Online-softmax merge (log2 domain) ───────────────
-                        # out_swa / out_c4 are already l-normalized inside the kernels
+                        # Diagnostic: return SWA-only to verify SWA kernel quality
+                        return out_swa
                         # (each kernel divides by its own l before writing bf16 output).
                         # To merge two partitions correctly we must undo that
                         # normalization, weight by the re-scaled l, then re-normalize:
