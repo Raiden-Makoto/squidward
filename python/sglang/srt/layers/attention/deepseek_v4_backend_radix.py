@@ -1231,46 +1231,26 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                             indices=idx_2d,
                             sm_scale=_eff_sm_scale,
                         )
-                        # SWA gather disabled: planar page layout not yet correctly
-                        # implemented; C4-only path restores 0.833 accuracy.
-                        # TODO: fix SWA gather (planar: [all_nope|all_rope|all_scale])
-                        return out_c4
-
                         # ── Step 4: Gather SWA KV from SWA pool ─────────────────────
-                        # The SWA pool buffer layout per page (uint8):
-                        #   bytes [0 .. swa_psz*448):       nope fp8 (448 elem/tok)
-                        #   bytes [swa_psz*448 .. swa_psz*576): rope bf16 (64 elem/tok)
-                        #   bytes [swa_psz*576 .. swa_psz*584): scale uint8 (7+1 pad/tok)
-                        # as_strided creates a (N_pages, swa_psz, 584) view without
-                        # copying memory, stepping over any per-page alignment padding.
+                        # Planar layout per page (uint8):
+                        #   bytes [0            .. swa_psz*448): nope fp8,  448 bytes/token
+                        #   bytes [swa_psz*448  .. swa_psz*576): rope bf16, 128 bytes/token
+                        #   bytes [swa_psz*576  .. swa_psz*584): scale u8,  8 bytes/token
                         from sglang.srt.layers.attention.nsa.flydsl_swa_prefill import (
                             flydsl_swa_prefill,
                         )
-                        _raw_swa   = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
-                        # swa_window_size == SWA pool page_size (256 in radix, 128 non-radix)
-                        _swa_psz   = token_to_kv_pool.swa_window_size
-                        _n_swa_pg  = _raw_swa.shape[0]
+                        _raw_swa  = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
+                        _swa_psz  = token_to_kv_pool.swa_window_size
+                        _n_swa_pg = _raw_swa.shape[0]
 
-                        # FlashMLA on-device layout per page of _swa_psz tokens:
-                        #   data:  bytes [0,            _swa_psz*576):  NoPE(448)|RoPE(128) per token
-                        #   scale: bytes [_swa_psz*576, _swa_psz*584):  7×ue8m0 + 1 pad per token
-                        #
-                        # The prior as_strided used a 584-byte stride per token (wrong) which
-                        # drifts +8 bytes per slot from the correct 576-byte data stride,
-                        # causing garbage reads for every slot except slot 0.
-                        _swa_data_v = _raw_swa.as_strided(
-                            (_n_swa_pg, _swa_psz, 576),
-                            (_raw_swa.stride(0), 576, 1),
-                        )                                   # (N_pages, _swa_psz, 576) uint8
-
-                        _swa_scale_v = _raw_swa.as_strided(
-                            (_n_swa_pg, _swa_psz, 8),
-                            (_raw_swa.stride(0), 8, 1),
-                            storage_offset=_swa_psz * 576,
-                        )                                   # (N_pages, _swa_psz, 8) uint8
+                        # Three planar section views — no per-token interleaving.
+                        _bpp      = _swa_psz * 584          # bytes per page
+                        _raw_flat = _raw_swa.view(_n_swa_pg, _bpp)   # [N_pg, bpp] u8
+                        _nope_v   = _raw_flat[:, :_swa_psz*448].view(_n_swa_pg, _swa_psz, 448)            # [N, P, 448] u8
+                        _rope_v   = _raw_flat[:, _swa_psz*448:_swa_psz*576].view(_n_swa_pg, _swa_psz, 128) # [N, P, 128] u8
+                        _scale_v  = _raw_flat[:, _swa_psz*576:].view(_n_swa_pg, _swa_psz, 8)              # [N, P, 8]   u8
 
                         # swa_page_indices: (T, SWA_WINDOW) flat SWA pool token indices
-                        # Use the pre-unsqueeze attribute to get the canonical 2-D shape.
                         _swa_idx_2d = core_attn_metadata.swa_page_indices[:total_tok]
                         if _swa_idx_2d.ndim == 3:
                             _swa_idx_2d = _swa_idx_2d.squeeze(1)
@@ -1280,10 +1260,10 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         _swa_pg       = _swa_clamped // _swa_psz
                         _swa_sl       = _swa_clamped % _swa_psz
 
-                        # GPU tensor-index gather — correct FlashMLA data/scale offsets
-                        _swa_nope_u8  = _swa_data_v[_swa_pg, _swa_sl, :448].contiguous()
-                        _swa_rope_u8  = _swa_data_v[_swa_pg, _swa_sl, 448:].contiguous()
-                        _swa_scale_u8 = _swa_scale_v[_swa_pg, _swa_sl, :7].contiguous()
+                        # Gather from planar views — each section is contiguous.
+                        _swa_nope_u8  = _nope_v[_swa_pg, _swa_sl].contiguous()    # [T*SWA, 448] u8
+                        _swa_rope_u8  = _rope_v[_swa_pg, _swa_sl].contiguous()    # [T*SWA, 128] u8
+                        _swa_scale_u8 = _scale_v[_swa_pg, _swa_sl, :7].contiguous()  # [T*SWA, 7] u8
 
                         _swa_nope_fp8  = _swa_nope_u8.view(_fp8_t)          # [T*SWA,448]
                         _swa_rope_bf16 = _swa_rope_u8.view(torch.bfloat16)  # [T*SWA, 64]
@@ -1336,11 +1316,11 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         _m_new = torch.maximum(m_raw_swa, m_raw_c4)        # [T, H]
                         _e_swa = torch.exp2(m_raw_swa - _m_new)            # [T, H]
                         _e_c4  = torch.exp2(m_raw_c4  - _m_new)            # [T, H]
-                        _l_new = l_raw_swa * _e_swa + l_raw_c4 * _e_c4    # [T, H]
+                        _l_new = (l_raw_swa * _e_swa + l_raw_c4 * _e_c4).clamp(min=1e-8)  # [T, H]
                         _o = (
                             out_swa.float() * _e_swa.unsqueeze(-1)
                             + out_c4.float() * _e_c4.unsqueeze(-1)
-                        ) / _l_new.unsqueeze(-1).clamp(min=1e-8)
+                        ) / _l_new.unsqueeze(-1)
                         return _o.to(torch.bfloat16)
                 except Exception:
                     import traceback
