@@ -1287,10 +1287,36 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                                 f"l_raw NaN={_l_swa_nan} inf={_l_swa_inf} max={_l_swa_max:.3f}"
                             )
 
-                        # SWA bypass: zero out SWA so the server runs cleanly
-                        out_swa   = torch.zeros_like(out_swa)
-                        m_raw_swa = torch.full_like(m_raw_swa, -1e30)
-                        l_raw_swa = torch.zeros_like(l_raw_swa)
+                        # ── Invalid-KV correction ──────────────────────────────────────────────
+                        # Zero-padded invalid KV entries produce score=0 → each contributes
+                        # exp2(0 - m_raw_swa) to l_raw_swa without contributing to out_swa.
+                        # Subtract their contribution so the merge is not dominated by padding.
+                        _swa_n_invalid = (~_swa_valid).view(total_tok, SWA_WINDOW).float().sum(dim=-1)  # [T]
+                        if _swa_n_invalid.any():
+                            # per-head contribution of one zero-score token
+                            _inv_w_per_tok = torch.exp2(-m_raw_swa.float()).clamp(max=1e9)          # [T, H]
+                            _n_inv_h       = _swa_n_invalid.unsqueeze(-1).expand_as(m_raw_swa)      # [T, H]
+                            _inv_total     = (_n_inv_h * _inv_w_per_tok).clamp(max=l_raw_swa)       # [T, H]
+                            _l_valid       = (l_raw_swa - _inv_total).clamp(min=0.0)                # [T, H]
+
+                            # Renormalise out_swa: it was divided by l_total inside kernel;
+                            # rescale to be divided by l_valid instead.
+                            _has_valid = _l_valid > 1e-9                                             # [T, H]
+                            _rescale   = torch.where(
+                                _has_valid,
+                                (l_raw_swa / _l_valid.clamp(min=1e-9)).clamp(max=1e6),
+                                torch.ones_like(l_raw_swa),
+                            )                                                                         # [T, H]
+                            out_swa  = (out_swa.float() * _rescale.unsqueeze(-1)).to(out_swa.dtype)
+
+                            # Suppress fully-invalid heads
+                            m_raw_swa = torch.where(_has_valid, m_raw_swa, torch.full_like(m_raw_swa, -1e30))
+                            out_swa   = torch.where(
+                                _has_valid.unsqueeze(-1).expand_as(out_swa),
+                                out_swa,
+                                torch.zeros_like(out_swa),
+                            )
+                            l_raw_swa = _l_valid
 
                         # ── Step 5: Online-softmax merge (log2 domain) ───────────────
                         # NaN guards — must run before any merge computation
