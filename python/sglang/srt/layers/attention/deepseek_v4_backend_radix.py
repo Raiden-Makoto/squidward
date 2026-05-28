@@ -1202,26 +1202,21 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         if _swa_idx_2d.ndim == 3:
                             _swa_idx_2d = _swa_idx_2d.squeeze(1)
 
-                        # Gather only for TILE_M=16 anchors: the FlyDSL SWA kernel reads
-                        # kv_flat at offset q_start*SWA_WINDOW where q_start is the first
-                        # token of each TILE_M-wide CTA (0, 16, 32, …).  All 16 queries
-                        # in a tile share that anchor's window, so gathering per-token data
-                        # for non-anchor tokens wastes work and is never read by the kernel.
-                        _TILE_M_SWA   = 16
-                        _swa_anchors  = torch.arange(0, total_tok, _TILE_M_SWA, device=q.device)  # [A]
-                        _swa_idx_flat = _swa_idx_2d[_swa_anchors].reshape(-1)  # [A * SWA_WINDOW]
+                        # Per-token gather: every token 0..total_tok-1 contributes its
+                        # own SWA window so all queries get the correct KV neighbourhood.
+                        _swa_idx_flat = _swa_idx_2d.reshape(-1)  # [T * SWA_WINDOW]
                         _swa_valid    = _swa_idx_flat >= 0
                         _swa_clamped  = _swa_idx_flat.clamp(min=0).long()
                         _swa_pg       = _swa_clamped // _swa_psz
                         _swa_sl       = _swa_clamped % _swa_psz
 
                         # Gather from planar views — each section is contiguous.
-                        _swa_nope_u8  = _nope_v[_swa_pg, _swa_sl].contiguous()    # [A*SWA, 448] u8
-                        _swa_rope_u8  = _rope_v[_swa_pg, _swa_sl].contiguous()    # [A*SWA, 128] u8
-                        _swa_scale_u8 = _scale_v[_swa_pg, _swa_sl, :7].contiguous()  # [A*SWA, 7] u8
+                        _swa_nope_u8  = _nope_v[_swa_pg, _swa_sl].contiguous()    # [T*SWA, 448] u8
+                        _swa_rope_u8  = _rope_v[_swa_pg, _swa_sl].contiguous()    # [T*SWA, 128] u8
+                        _swa_scale_u8 = _scale_v[_swa_pg, _swa_sl, :7].contiguous()  # [T*SWA, 7] u8
 
-                        _swa_nope_fp8  = _swa_nope_u8.view(_fp8_t)          # [A*SWA,448]
-                        _swa_rope_bf16 = _swa_rope_u8.view(torch.bfloat16)  # [A*SWA, 64]
+                        _swa_nope_fp8  = _swa_nope_u8.view(_fp8_t)          # [T*SWA, 448]
+                        _swa_rope_bf16 = _swa_rope_u8.view(torch.bfloat16)  # [T*SWA, 64]
 
                         # Dequantize: nope_bf16 = nope_fp8 × 2^(scale_u8 − 127)
                         _swa_tile_sc   = torch.exp2(_swa_scale_u8.float() - 127.0)
@@ -1230,8 +1225,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
 
                         _swa_kv_bf16 = torch.cat([_swa_nope_bf16, _swa_rope_bf16], dim=-1)
                         # Zero out invalid (pre-causal) KV entries; V=0 → zero output
-                        # contribution regardless of attention weight, so l_new inflation
-                        # doesn't corrupt the merged output numerator.
+                        # contribution regardless of attention weight.
                         _swa_kv_bf16[~_swa_valid] = 0.0
 
                         # Requantize to fp8 using the same fixed scale as Q / C4 KV
@@ -1239,13 +1233,10 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                             (_swa_kv_bf16.float() * (1.0 / _KV_SCALE))
                             .clamp(-_fp8_max, _fp8_max)
                             .to(_fp8_t)
-                        )                                               # [A*SWA_WINDOW, 512]
+                        )                                               # [T*SWA_WINDOW, 512]
 
                         # Build flat KV tensor for the FlyDSL SWA kernel.
-                        # Tile anchor a occupies rows [a*SWA_WINDOW, (a+1)*SWA_WINDOW).
-                        # Non-anchor rows (inter-tile tokens) remain zero — the kernel
-                        # never reads them.  Rows beyond _pad_tok*SWA_WINDOW are also
-                        # zero-padded (harmless for out-of-bounds CTAs).
+                        # Token t occupies rows [t*SWA_WINDOW, (t+1)*SWA_WINDOW).
                         _MAX_SWA_TILES = SWA_WINDOW // 32              # 4  (128/32)
                         _BLOCK_N       = 32
                         _pad_tok = ((total_tok + 15) // 16) * 16       # TILE_M-aligned
@@ -1253,12 +1244,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         _kv_swa_flat = torch.zeros(
                             (_swa_flat_rows, 512), dtype=_fp8_t, device=q.device
                         )
-                        # Scatter anchor data at their canonical offsets (a*SWA_WINDOW)
-                        _dst_rows = (
-                            _swa_anchors.unsqueeze(1) * SWA_WINDOW
-                            + torch.arange(SWA_WINDOW, device=q.device).unsqueeze(0)
-                        ).reshape(-1)  # [A*SWA_WINDOW]
-                        _kv_swa_flat[_dst_rows] = _swa_kv_fp8
+                        _kv_swa_flat[:total_tok * SWA_WINDOW] = _swa_kv_fp8
 
                         # ── Step 4: FlyDSL SWA attention ────────────────────────────
                         out_swa, m_raw_swa, l_raw_swa = flydsl_swa_prefill(
@@ -1272,30 +1258,27 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         # l_raw_swa: [T, H]    f32  (sum of exp2 values)
 
                         # ── Step 5: Online-softmax merge (log2 domain) ───────────────
-                        # Guard against NaN/Inf in m_raw (can occur when SWA window is
-                        # empty or fast-math fp overflow occurs inside the kernel).
-                        # posinf=0.0: replace +inf m_raw with a neutral score (exp2(0)=1)
-                        # rather than -1e9 which would silently zero-weight that branch.
-                        _NEG_M = -1e9
-                        m_raw_swa = torch.nan_to_num(m_raw_swa, nan=_NEG_M, posinf=0.0, neginf=_NEG_M)
-                        m_raw_c4  = torch.nan_to_num(m_raw_c4,  nan=_NEG_M, posinf=0.0, neginf=_NEG_M)
-                        # posinf=1.0: if l_raw overflowed to +inf treat as a single token sum
-                        l_raw_swa = torch.nan_to_num(l_raw_swa, nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0)
-                        l_raw_c4  = torch.nan_to_num(l_raw_c4,  nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0)
+                        # Guard against NaN/Inf before any computation that uses m_raw /
+                        # l_raw (empty SWA window → l_raw=0, kernel may emit NaN m_raw).
+                        m_raw_swa = torch.nan_to_num(m_raw_swa, nan=-1e9, posinf=-1e9, neginf=-1e9)
+                        m_raw_c4  = torch.nan_to_num(m_raw_c4,  nan=-1e9, posinf=-1e9, neginf=-1e9)
+                        l_raw_swa = torch.nan_to_num(l_raw_swa, nan=0.0,  posinf=0.0,  neginf=0.0).clamp(min=0.0)
+                        l_raw_c4  = torch.nan_to_num(l_raw_c4,  nan=0.0,  posinf=0.0,  neginf=0.0).clamp(min=0.0)
                         out_swa = torch.nan_to_num(out_swa.float(), nan=0.0, posinf=0.0, neginf=0.0)
                         out_c4  = torch.nan_to_num(out_c4.float(),  nan=0.0, posinf=0.0, neginf=0.0)
 
                         _m_new = torch.maximum(m_raw_swa, m_raw_c4)        # [T, H]
                         _e_swa = torch.exp2(m_raw_swa - _m_new)            # [T, H]
                         _e_c4  = torch.exp2(m_raw_c4  - _m_new)            # [T, H]
-                        _w_swa = (l_raw_swa * _e_swa)                      # [T, H]
-                        _w_c4  = (l_raw_c4  * _e_c4)                       # [T, H]
+                        _w_swa = l_raw_swa * _e_swa                        # [T, H]
+                        _w_c4  = l_raw_c4  * _e_c4                        # [T, H]
                         _l_new = (_w_swa + _w_c4).clamp(min=1e-9)          # [T, H]
                         _o = (
-                            out_swa * _w_swa.unsqueeze(-1)
-                            + out_c4 * _w_c4.unsqueeze(-1)
-                        ) / _l_new.unsqueeze(-1)
-                        return torch.nan_to_num(_o, nan=0.0, posinf=0.0, neginf=0.0).to(torch.bfloat16)
+                            out_swa * _w_swa[..., None]
+                            + out_c4 * _w_c4[..., None]
+                        ) / _l_new[..., None]
+                        _o = torch.nan_to_num(_o, nan=0.0, posinf=0.0, neginf=0.0)
+                        return _o.to(torch.bfloat16)
                 except Exception:
                     import traceback
                     logger.warning(
