@@ -1116,6 +1116,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                     from sglang.srt.layers.attention.nsa.flydsl_nsa_prefill import (
                         _is_available as _flydsl_available,
                         flydsl_nsa_prefill_with_lse,
+                        flydsl_nsa_prefill_with_m_l,
                     )
                     from sglang.srt.layers.quantization.fp8_kernel import (
                         is_fp8_fnuz as _is_fp8_fnuz,
@@ -1225,20 +1226,77 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         _eff_sm_scale = self.softmax_scale * _Q_SCALE * _KV_SCALE
 
                         # ── Step 3: FlyDSL C4 attention ────────────────────────────
-                        out_c4, lse_c4 = flydsl_nsa_prefill_with_lse(
+                        out_c4, lse_c4, lse_c4_l = flydsl_nsa_prefill_with_m_l(
                             q=q_3d,
                             kv=_kv_flat,
                             indices=idx_2d,
                             sm_scale=_eff_sm_scale,
                         )
-                        # out_c4: [T, H, D] bf16,   lse_c4: [T, H] float32
-                        # Return C4-only attention output.  The triton SWA-only path
-                        # does not return reliable LSE (garbage values observed on all
-                        # 8 TP ranks with h_q=16), so a proper online-softmax combine
-                        # with SWA is not yet possible.  Layer norm in the MLP
-                        # corrects the FP8 scale factor; this matches the previously
-                        # validated 0.833 accuracy result.
-                        return out_c4
+                        # out_c4:  [T, H, D] bf16
+                        # lse_c4:  [T, H] float32  (m_raw, log2-space running max)
+                        # lse_c4_l:[T, H] float32  (l_raw, sum of exp2)
+
+                        # ── Step 4: FlyDSL SWA attention ────────────────────────────
+                        from sglang.srt.layers.attention.nsa.flydsl_swa_prefill import (
+                            flydsl_swa_prefill as _flydsl_swa,
+                        )
+                        _MAX_SWA_TILES = 32
+                        _BLOCK_N_SWA   = 32
+                        _SWA_KV_ROWS   = _pad * _MAX_SWA_TILES * _BLOCK_N_SWA
+
+                        # Get paged regular KV buffer for this layer
+                        _kv_reg = token_to_kv_pool.get_key_buffer(layer_id)
+
+                        # Build flat SWA KV tensor padded with -fp8_max (= -inf attention for out-of-range rows)
+                        _kv_swa_flat = torch.full(
+                            (_SWA_KV_ROWS, _nope + _rope),   # 512 total
+                            -_fp8_max,
+                            dtype=_fp8_t,
+                            device=q.device,
+                        )
+                        # Gather: for each token i, copy min(seq_lens_casual[i], _MAX_SWA_TILES*_BLOCK_N_SWA) KV rows
+                        # from the paged KV cache into _kv_swa_flat[i * _MAX_SWA_TILES * _BLOCK_N_SWA : ...]
+                        # Per-request KV page table: kv_indptr[req], kv_indices[kv_indptr[req]:kv_indptr[req+1]]
+                        for _i in range(total_tok):
+                            _l = min(int(seq_lens_casual[_i].item()), _MAX_SWA_TILES * _BLOCK_N_SWA)
+                            if _l == 0:
+                                continue
+                            _req = int(req_pool_indices_repeated[_i].item())
+                            _pg_start = int(kv_indptr[_req].item())
+                            _pg_end   = int(kv_indptr[_req + 1].item())
+                            _pages    = kv_indices[_pg_start:_pg_end]
+                            _page_size_reg = token_to_kv_pool.page_size
+                            for _pos in range(_l):
+                                _pg = int(_pages[_pos // _page_size_reg].item())
+                                _sl = _pos % _page_size_reg
+                                _kv_row  = _kv_reg[_pg, _sl]
+                                _kv_bf16 = _kv_row.to(torch.bfloat16)
+                                _kv_fp8  = (
+                                    (_kv_bf16.float() * (_fp8_max / _CLIP))
+                                    .clamp(-_fp8_max, _fp8_max)
+                                    .to(_fp8_t)
+                                )
+                                _kv_swa_flat[_i * _MAX_SWA_TILES * _BLOCK_N_SWA + _pos] = _kv_fp8[:512]
+
+                        # Call FlyDSL SWA
+                        _out_swa, _m_swa, _l_swa = _flydsl_swa(
+                            q=q_3d[:total_tok],
+                            kv_swa_flat=_kv_swa_flat,
+                            max_swa_tiles=_MAX_SWA_TILES,
+                            sm_scale=_eff_sm_scale,
+                        )
+
+                        # Online-softmax merge (log2 space, both from FlyDSL)
+                        _m_c4  = lse_c4.float()    # [T, H] log2-space m from NSA kernel
+                        _m_new = torch.maximum(_m_swa, _m_c4)
+                        _e_swa = torch.exp2(_m_swa - _m_new)
+                        _e_c4  = torch.exp2(_m_c4  - _m_new)
+                        _l_new = _l_swa * _e_swa + lse_c4_l * _e_c4
+                        _o = (
+                            _out_swa.float() * _e_swa.unsqueeze(-1)
+                            + out_c4.float() * _e_c4.unsqueeze(-1)
+                        ) / _l_new.unsqueeze(-1).clamp(min=1e-8)
+                        return _o.to(torch.bfloat16)
                 except Exception:
                     import traceback
                     logger.warning(

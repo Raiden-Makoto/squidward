@@ -1,32 +1,11 @@
-"""FlyDSL sparse NSA prefill attention kernel for AMD gfx950 (MI350X).
+"""FlyDSL SWA (sliding-window) flash-attention kernel for AMD gfx950 (MI350X).
 
-Online flash-attention over NSA sparse KV using MFMA 16x16x32 FP8 wave64.
+Structurally identical to flydsl_nsa_prefill.py, but instead of loading a KV
+row via a sparse index table (Indices tensor), the KV row address is computed
+directly as a flat offset into a pre-gathered, densely-packed KV tensor.
 
-LLVM type constraint: LLVM has NO knowledge of f8E4M3FN. Any MLIR op that
-keeps f8E4M3FN alive until LLVM lowering crashes with "unknown LLVM dialect
-type". This means:
-  ❌ memref<Nxf8>            (load/store/GEP → LLVM fp8 type)
-  ❌ arith.truncf f32 → f8   (fx.Float32.to(fp8_t))
-  ❌ arith.bitcast f8 → i8   (scalar fp8 bitcast)
-  ❌ vector<Nxf8>            (any fp8 vector op)
-
-Safe pattern (used here):
-  ✓ _llvm.LoadOp(T.i64, gep_with_T_i8_elem)   # 8 raw FP8 bytes as i64
-  ✓ memref<T.i64> for KV LDS                  # i64 memref, LLVM-safe
-  ✓ memref<T.f32> for P LDS                   # f32 memref, LLVM-safe
-  ✓ _memref.store/load on f32 memref          # f32 scalar, LLVM-safe
-  ✓ rocdl.cvt_f32_fp8 to decode V bytes       # AMD hardware fp8→f32
-  ✓ mfma_f32_16x16x32_fp8_fp8 with i64 A/B   # MFMA takes i64, no fp8 type
-
-Kernel structure:
-  GEMM1: Q[16,512]@K[32,512]^T — fp8 MFMA with Q/K as raw i64
-  Softmax: f32 online softmax
-  P→LDS: store f32 attention weights to f32 LDS (transposed)
-  GEMM2: P[16,32]@V[32,512] — fp8 MFMA; P packed via rocdl.cvt_pk_fp8_f32, V bytes strided from KV LDS
-
-MFMA 16x16x32 FP8 layout (wave64):
-  A/B: thread t → row t%16, cols t//16*8:+8  (8 FP8 as i64)
-  C/D: thread t, reg r → C[(t//16)*4+r][t%16]  (v4f32)
+Layout: kv_swa_flat[tok_i * MAX_SWA_TILES * BLOCK_N + tile_j * BLOCK_N + row_k, :]
+(Python caller pre-pads and fills out-of-range rows with -fp8_max.)
 """
 
 from __future__ import annotations
@@ -58,7 +37,7 @@ from flydsl._mlir.dialects import (
 )
 
 _LOG2E = host_math.log2(host_math.e)
-_LN2   = host_math.log(2.0)   # ≈ 0.6931471805599453
+_LN2   = host_math.log(2.0)
 
 
 def _is_available() -> bool:
@@ -69,10 +48,10 @@ def _is_available() -> bool:
 
 
 @functools.lru_cache(maxsize=64)
-def build_nsa_prefill_kernel(
+def build_swa_prefill_kernel(
     h_q: int,
     head_dim: int = 512,
-    topk: int = 2048,
+    max_swa_tiles: int = 32,
     tile_m: int = 16,
     block_n: int = 32,
     sm_scale: float | None = None,
@@ -81,53 +60,50 @@ def build_nsa_prefill_kernel(
     assert head_dim == 512
     assert tile_m == 16
     assert block_n == 32
-    assert topk % block_n == 0
 
     if sm_scale is None:
         sm_scale = 1.0 / host_math.sqrt(head_dim)
 
     gpu_arch = get_rocm_arch()
 
-    WARP_SIZE  = 64
-    TILE_M     = tile_m
-    BLOCK_N    = block_n
-    HEAD_DIM   = head_dim
-    TOPK       = topk
-    BLOCK_SIZE = WARP_SIZE
+    WARP_SIZE     = 64
+    TILE_M        = tile_m
+    BLOCK_N       = block_n
+    HEAD_DIM      = head_dim
+    MAX_SWA_TILES = max_swa_tiles
+    BLOCK_SIZE    = WARP_SIZE
 
-    MFMA_N      = 16
-    MFMA_K      = 32
-    K_STEPS_QK  = HEAD_DIM // MFMA_K    # 16
-    N_BLKS_S    = BLOCK_N  // MFMA_N    # 2
-    D_BLKS      = HEAD_DIM // MFMA_N    # 32
-    KV_TILES    = TOPK // BLOCK_N
+    MFMA_N     = 16
+    MFMA_K     = 32
+    K_STEPS_QK = HEAD_DIM // MFMA_K    # 16
+    N_BLKS_S   = BLOCK_N  // MFMA_N    # 2
+    D_BLKS     = HEAD_DIM // MFMA_N    # 32
+    KV_TILES   = MAX_SWA_TILES
 
     # LDS layout:
     #   KV  : T.i64 memref, LDS_KV_I64 entries (8 FP8 per i64)
     #   P   : T.f32 memref, LDS_P_F32  entries (1 f32 per attention weight)
-    LDS_KV_I64    = BLOCK_N * HEAD_DIM // 8    # 32*512//8 = 2048
-    LDS_KV_BYTES  = LDS_KV_I64 * 8             # 16384
-    LDS_P_F32     = TILE_M * BLOCK_N            # 16*32 = 512
-    LDS_P_BYTES   = LDS_P_F32 * 4              # 2048
-    LDS_TOTAL     = LDS_KV_BYTES + LDS_P_BYTES
+    LDS_KV_I64   = BLOCK_N * HEAD_DIM // 8    # 32*512//8 = 2048
+    LDS_KV_BYTES = LDS_KV_I64 * 8             # 16384
+    LDS_P_F32    = TILE_M * BLOCK_N            # 16*32 = 512
+    LDS_P_BYTES  = LDS_P_F32 * 4              # 2048
+    LDS_TOTAL    = LDS_KV_BYTES + LDS_P_BYTES
 
-    Q_STOK  = h_q * HEAD_DIM
-    IDX_STR = TOPK
+    Q_STOK = h_q * HEAD_DIM
 
-    alloc      = SmemAllocator(None, arch=gpu_arch, global_sym_name="nsa_smem")
+    alloc      = SmemAllocator(None, arch=gpu_arch, global_sym_name="swa_smem")
     base_off   = alloc._align(alloc.ptr, 16)
     alloc.ptr  = base_off + LDS_TOTAL
     kv_lds_off = base_off
     p_lds_off  = base_off + LDS_KV_BYTES
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
-    def nsa_prefill_kernel(
-        Q:       fx.Tensor,   # [total_tokens, h_q, HEAD_DIM]  fp8
-        KV:      fx.Tensor,   # [num_pages, HEAD_DIM]           fp8
-        Indices: fx.Tensor,   # [total_tokens, TOPK]            int32
-        Out:     fx.Tensor,   # [total_tokens, h_q, HEAD_DIM]  bf16
-        M_Raw:   fx.Tensor,   # [padded_tokens, h_q]           float32 (m, log2-space)
-        L_Raw:   fx.Tensor,   # [padded_tokens, h_q]           float32 (sum-of-exp2)
+    def swa_prefill_kernel(
+        Q:      fx.Tensor,   # [total_tokens, h_q, HEAD_DIM]                         fp8
+        KV_SWA: fx.Tensor,   # [_pad * MAX_SWA_TILES * BLOCK_N, HEAD_DIM]            fp8
+        Out:    fx.Tensor,   # [total_tokens, h_q, HEAD_DIM]                         bf16
+        M_Raw:  fx.Tensor,   # [padded_tokens, h_q]                                  float32
+        L_Raw:  fx.Tensor,   # [padded_tokens, h_q]                                  float32
         total_tokens: fx.Int32,
     ):
         v4f32_type = Vec.make_type(4, fx.Float32)
@@ -153,35 +129,21 @@ def build_nsa_prefill_kernel(
             return _fly.extract_aligned_pointer_as_index(_ptr_ty(), v)
 
         q_ptr   = _as_ptr(Q)
-        kv_ptr  = _as_ptr(KV)
-        idx_ptr = _as_ptr(Indices)
+        kv_ptr  = _as_ptr(KV_SWA)
         out_ptr = _as_ptr(Out)
         m_ptr   = _as_ptr(M_Raw)
         l_ptr   = _as_ptr(L_Raw)
 
         # ── Global load helpers (NO fp8 type in result) ────────────────────
-        # Use T.i8 as GEP elem_type (byte addressing, LLVM-safe — avoids f8 in GEP).
-        # Load 8 bytes as i64: T.i64 is LLVM-native.
         def load_8bytes_as_i64(ptr, byte_off_index):
             gep = buffer_ops.get_element_ptr(ptr, fx.Int64(byte_off_index), elem_type=T.i8)
             return _llvm.LoadOp(T.i64, gep).result
 
-        def load_i32_elem(ptr, elem_off_index):
-            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(elem_off_index), elem_type=T.i32)
-            return _llvm.LoadOp(T.i32, gep).result
-
-        # ── MFMA (fp8 MFMA takes i64 operands — no fp8 type in LLVM) ─────
+        # ── MFMA (fp8 MFMA takes i64 operands) ────────────────────────────
         def mfma_fp8(acc, a_i64, b_i64):
             return rocdl.mfma_f32_16x16x32_fp8_fp8(
                 v4f32_type, [a_i64, b_i64, acc, 0, 0, 0]
             )
-
-        # ── Decode FP8 byte (in low 8 bits of i32) to f32 ─────────────────
-        # Uses AMD hardware instruction rocdl.cvt_f32_fp8 (gfx940+).
-        # Input: i32 with fp8 byte in bits [7:0]; byte_sel=0 decodes byte 0.
-        def fp8_byte_to_f32(byte_i32):
-            # Signature: cvt_f32_fp8(result_type, src_i32, byte_sel_i32)
-            return rocdl.cvt_f32_fp8(T.f32, byte_i32, fx.Int32(0))
 
         # ── Thread / block ids ────────────────────────────────────────────
         tid     = fx.Index(gpu.thread_idx.x)
@@ -192,7 +154,6 @@ def build_nsa_prefill_kernel(
         q_start = bid_m * fx.Index(TILE_M)
 
         # V-extraction lane decomposition (const per thread, outside d-loop)
-        # d_col = d*16+lane; (d*16)%8=0 so d_col//8 = d*2+lane//8, d_col%8 = lane%8
         lane_mod8      = lane % fx.Index(8)
         lane_div8      = lane // fx.Index(8)
         lane_shift_i64 = fx.Int64(lane_mod8) * fx.Int64(8)
@@ -234,16 +195,20 @@ def build_nsa_prefill_kernel(
             kv_row  = tid % fx.Index(BLOCK_N)
             d_group = tid // fx.Index(BLOCK_N)
 
-            idx_flat = anchor_tok * fx.Index(IDX_STR) + kv_pos_base + kv_row
-            page_i32 = load_i32_elem(idx_ptr, idx_flat)
-            page_idx = fx.Index(page_i32)
+            # Direct flat addressing: no Indices tensor needed.
+            # kv_swa_flat[tok_i * MAX_SWA_TILES * BLOCK_N + tile_j * BLOCK_N + row_k]
+            kv_row_flat = (
+                anchor_tok * fx.Index(MAX_SWA_TILES * BLOCK_N)
+                + kv_pos_base + kv_row
+            )
+            kv_byte_off_base = kv_row_flat * fx.Index(HEAD_DIM)
 
             D_HALF   = HEAD_DIM // 2
             D_CHUNKS = D_HALF // 8
             for dc in range_constexpr(D_CHUNKS):
                 d_byte_in_half = fx.Index(dc * 8)
                 d_byte_abs     = d_group * fx.Index(D_HALF) + d_byte_in_half
-                kv_byte_off    = page_idx * fx.Index(HEAD_DIM) + d_byte_abs
+                kv_byte_off    = kv_byte_off_base + d_byte_abs
                 raw_i64        = load_8bytes_as_i64(kv_ptr, kv_byte_off)
                 i64_off = (
                     kv_row * fx.Index(HEAD_DIM // 8)
@@ -310,7 +275,6 @@ def build_nsa_prefill_kernel(
             l_run = l_new
 
             # ── Store P → f32 LDS (transposed) ──────────────────────────
-            # P[k_group*4+r][nb*16+lane] stored at row*BLOCK_N+col
             for nb in range_constexpr(N_BLKS_S):
                 for r in range_constexpr(4):
                     p_row  = k_group * fx.Index(4) + fx.Index(r)
@@ -320,22 +284,13 @@ def build_nsa_prefill_kernel(
 
             gpu.barrier()
 
-            # -- GEMM2: O += P @ V (fp8 MFMA) ----------------------------------------
-            # mfma_f32_16x16x32_fp8_fp8: M=16(TILE_M), K=32(BLOCK_N), N=16(per d-block)
-            # A (P): thread t -> P[lane][k_group*8:k_group*8+8] as i64 (8 FP8 bytes)
-            # B (V): thread t -> V[k_group*8:k_group*8+8][d*16+lane] as i64 (8 FP8 bytes)
-            # C/D: o_acc[d] (v4f32), same layout as before
-
-            # Pack P -> i64: read 8 consecutive f32 from f32 LDS, convert via cvt_pk_fp8_f32
-            # P[lane][k_group*8+j] at flat offset lane*BLOCK_N + k_group*8 + j
+            # ── GEMM2: O += P @ V (fp8 MFMA) ────────────────────────────
             p_base_off = lane * fx.Index(BLOCK_N) + k_group * fx.Index(8)
             p_f32_vals = [
                 _memref.load(lds_p_f32, [_raw(p_base_off + fx.Index(j))])
                 for j in range(8)
             ]
 
-            # rocdl.cvt_pk_fp8_f32(result_i32, src1_f32, src0_f32, old_i32, op_sel)
-            # op_sel=0: writes 2 FP8 bytes to bits [15:0]; op_sel=1: bits [31:16]
             i32_lo = rocdl.cvt_pk_fp8_f32(T.i32, p_f32_vals[1], p_f32_vals[0], fx.Int32(0), fx.Int32(0))
             i32_lo = rocdl.cvt_pk_fp8_f32(T.i32, p_f32_vals[3], p_f32_vals[2], i32_lo,       fx.Int32(1))
             i32_hi = rocdl.cvt_pk_fp8_f32(T.i32, p_f32_vals[5], p_f32_vals[4], fx.Int32(0), fx.Int32(0))
@@ -348,9 +303,6 @@ def build_nsa_prefill_kernel(
             p_a_i64 = _mlir_arith.OrIOp(lo64, hi64).result
 
             for d in range_constexpr(D_BLKS):
-                # Pack V -> i64: V[k_group*8+j][d*16+lane] for j=0..7 (strided KV rows)
-                # i64_off(j) = (k_group*8+j) * (HEAD_DIM//8) + d*2 + lane//8
-                # byte within i64 = lane%8
                 hd_off_f = fx.Index(d * 2) + lane_div8
                 v_bytes_i32 = []
                 for j in range_constexpr(8):
@@ -363,7 +315,6 @@ def build_nsa_prefill_kernel(
                     v_b64  = _mlir_arith.AndIOp(v_sh, _raw(fx.Int64(0xFF))).result
                     v_bytes_i32.append(_mlir_arith.TruncIOp(T.i32, v_b64).result)
 
-                # Pack 8 extracted bytes into i64 (byte j at bit position j*8)
                 v_b_i64 = _mlir_arith.ExtUIOp(T.i64, v_bytes_i32[0]).result
                 for j in range_constexpr(7):
                     bj = _mlir_arith.ShLIOp(
@@ -398,10 +349,7 @@ def build_nsa_prefill_kernel(
                 out_gep = buffer_ops.get_element_ptr(out_ptr, out_idx, elem_type=T.bf16)
                 _llvm.StoreOp(o_bf16, out_gep)
 
-        # ── Write m_raw and l_raw for LSE-based SWA+C4 combination ──────────
-        # All 16 threads in the same k_group write identical f32 values to the
-        # same address — this is a safe GPU broadcast write (memory system
-        # collapses duplicate stores to a single write per warp).
+        # ── Write m_raw and l_raw for online-softmax combination ─────────
         _out_row = k_group * fx.Index(4)
         for r in range_constexpr(4):
             _lse_tok = q_start + _out_row + fx.Index(r)
@@ -417,8 +365,8 @@ def build_nsa_prefill_kernel(
 
     # ── JIT launcher ────────────────────────────────────────────────────
     @flyc.jit
-    def launch_nsa_prefill(
-        Q: fx.Tensor, KV: fx.Tensor, Indices: fx.Tensor, Out: fx.Tensor,
+    def launch_swa_prefill(
+        Q: fx.Tensor, KV_SWA: fx.Tensor, Out: fx.Tensor,
         M_Raw: fx.Tensor, L_Raw: fx.Tensor,
         total_tokens: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
@@ -430,7 +378,7 @@ def build_nsa_prefill_kernel(
 
         tokens_idx = fx.Index(total_tokens)
         grid_m     = (tokens_idx + TILE_M - 1) // TILE_M
-        launcher   = nsa_prefill_kernel(Q, KV, Indices, Out, M_Raw, L_Raw, total_tokens)
+        launcher   = swa_prefill_kernel(Q, KV_SWA, Out, M_Raw, L_Raw, total_tokens)
 
         passthrough = []
         for pair in [
@@ -460,125 +408,35 @@ def build_nsa_prefill_kernel(
 
     def _launch(*args, **kwargs):
         with CompilationContext.compile_hints(_hints):
-            return launch_nsa_prefill(*args, **kwargs)
+            return launch_swa_prefill(*args, **kwargs)
 
     return _launch
 
 
-def flydsl_nsa_prefill(
-    q:       "torch.Tensor",
-    kv:      "torch.Tensor",
-    indices: "torch.Tensor",
+def flydsl_swa_prefill(
+    q: "torch.Tensor",           # [T, H, 512] fp8
+    kv_swa_flat: "torch.Tensor", # [T_pad * max_swa_tiles * BLOCK_N, 512] fp8
+    max_swa_tiles: int,
     sm_scale: float,
-) -> "torch.Tensor":
-    """FlyDSL sparse NSA prefill for gfx950.
-    q:       [total_tokens, h_q, 512] float8_e4m3fn
-    kv:      [num_pages, 512]          float8_e4m3fn
-    indices: [total_tokens, topk]      int32
-    Returns: [total_tokens, h_q, 512] bfloat16
-    """
+) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
+    """Returns (out [T_pad, H, 512] bf16, m_raw [T_pad, H] f32, l_raw [T_pad, H] f32)"""
     import torch
-
     total_tokens, h_q, head_dim = q.shape
-    topk = indices.shape[1]
-    _fp8_types = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-    assert q.dtype in _fp8_types, f"q must be fp8, got {q.dtype}"
-    assert kv.dtype == q.dtype, f"kv dtype {kv.dtype} != q dtype {q.dtype}"
-    assert indices.dtype == torch.int32
-
-    # Pad all token-indexed tensors to TILE_M=16 multiples so that every CTA can
-    # safely read/write its full 16-row tile without going OOB.
-    _pad    = ((total_tokens + 15) // 16) * 16
-    q_pad   = torch.zeros((_pad, h_q, head_dim), dtype=q.dtype, device=q.device)
-    q_pad[:total_tokens] = q
-    idx_pad = torch.zeros((_pad, topk), dtype=indices.dtype, device=indices.device)
-    idx_pad[:total_tokens] = indices
-    out    = torch.empty((_pad, h_q, head_dim), dtype=torch.bfloat16, device=q.device)
-    out_m  = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
-    out_l  = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
-    kernel = build_nsa_prefill_kernel(h_q=h_q, head_dim=head_dim, topk=topk, sm_scale=sm_scale)
+    _pad = (total_tokens + 15) // 16 * 16
+    fp8_t = q.dtype
+    out   = torch.zeros(_pad, h_q, head_dim, dtype=torch.bfloat16, device=q.device)
+    m_raw = torch.full((_pad, h_q), float("-inf"), dtype=torch.float32, device=q.device)
+    l_raw = torch.zeros(_pad, h_q, dtype=torch.float32, device=q.device)
+    if _pad > total_tokens:
+        q_pad = torch.nn.functional.pad(
+            q.view(total_tokens, -1), (0, 0, 0, _pad - total_tokens)
+        ).view(_pad, h_q, head_dim)
+    else:
+        q_pad = q
+    kernel = build_swa_prefill_kernel(
+        h_q=h_q, head_dim=head_dim, max_swa_tiles=max_swa_tiles, sm_scale=sm_scale
+    )
     stream = torch.cuda.current_stream()
-    kernel(q_pad, kv, idx_pad, out, out_m, out_l, total_tokens=total_tokens,
+    kernel(q_pad, kv_swa_flat, out, m_raw, l_raw, total_tokens,
            stream=fx.Stream(stream.cuda_stream))
-    return out[:total_tokens]
-
-
-def flydsl_nsa_prefill_with_lse(
-    q:        "torch.Tensor",
-    kv:       "torch.Tensor",
-    indices:  "torch.Tensor",
-    sm_scale: float,
-) -> "tuple":
-    """Same as flydsl_nsa_prefill but also returns natural-log LSE.
-
-    Returns:
-        out: [total_tokens, h_q, 512]  bfloat16
-        lse: [total_tokens, h_q]       float32  (log of softmax denominator)
-    """
-    import torch
-
-    total_tokens, h_q, head_dim = q.shape
-    topk = indices.shape[1]
-    _fp8_types = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-    assert q.dtype in _fp8_types, f"q must be fp8, got {q.dtype}"
-    assert kv.dtype == q.dtype,   f"kv dtype {kv.dtype} != q dtype {q.dtype}"
-    assert indices.dtype == torch.int32
-
-    # Pad all token-indexed tensors to TILE_M=16 multiples so that every CTA can
-    # safely read/write its full 16-row tile without going OOB.
-    _pad    = ((total_tokens + 15) // 16) * 16
-    q_pad   = torch.zeros((_pad, h_q, head_dim), dtype=q.dtype, device=q.device)
-    q_pad[:total_tokens] = q
-    idx_pad = torch.zeros((_pad, topk), dtype=indices.dtype, device=indices.device)
-    idx_pad[:total_tokens] = indices
-    out    = torch.empty((_pad, h_q, head_dim), dtype=torch.bfloat16, device=q.device)
-    out_m  = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
-    out_l  = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
-    kernel = build_nsa_prefill_kernel(h_q=h_q, head_dim=head_dim, topk=topk, sm_scale=sm_scale)
-    stream = torch.cuda.current_stream()
-    kernel(q_pad, kv, idx_pad, out, out_m, out_l, total_tokens=total_tokens,
-           stream=fx.Stream(stream.cuda_stream))
-
-    # m is the running max in log2 space; l is sum of exp2 values.
-    # Natural-log LSE = m * ln(2) + ln(l)
-    m   = out_m[:total_tokens]          # [T, H]
-    l   = out_l[:total_tokens]          # [T, H]
-    lse = m * _LN2 + torch.log(l)      # [T, H] float32
-    return out[:total_tokens], lse
-
-
-def flydsl_nsa_prefill_with_m_l(
-    q:        "torch.Tensor",
-    kv:       "torch.Tensor",
-    indices:  "torch.Tensor",
-    sm_scale: float,
-) -> "tuple":
-    """Same as flydsl_nsa_prefill but returns raw online-softmax statistics.
-
-    Returns:
-        out:   [total_tokens, h_q, 512]  bfloat16
-        m_raw: [total_tokens, h_q]       float32  (running max, log2 space)
-        l_raw: [total_tokens, h_q]       float32  (sum of exp2 values)
-    """
-    import torch
-
-    total_tokens, h_q, head_dim = q.shape
-    topk = indices.shape[1]
-    _fp8_types = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-    assert q.dtype in _fp8_types, f"q must be fp8, got {q.dtype}"
-    assert kv.dtype == q.dtype,   f"kv dtype {kv.dtype} != q dtype {q.dtype}"
-    assert indices.dtype == torch.int32
-
-    _pad    = ((total_tokens + 15) // 16) * 16
-    q_pad   = torch.zeros((_pad, h_q, head_dim), dtype=q.dtype, device=q.device)
-    q_pad[:total_tokens] = q
-    idx_pad = torch.zeros((_pad, topk), dtype=indices.dtype, device=indices.device)
-    idx_pad[:total_tokens] = indices
-    out    = torch.empty((_pad, h_q, head_dim), dtype=torch.bfloat16, device=q.device)
-    out_m  = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
-    out_l  = torch.empty((_pad, h_q), dtype=torch.float32, device=q.device)
-    kernel = build_nsa_prefill_kernel(h_q=h_q, head_dim=head_dim, topk=topk, sm_scale=sm_scale)
-    stream = torch.cuda.current_stream()
-    kernel(q_pad, kv, idx_pad, out, out_m, out_l, total_tokens=total_tokens,
-           stream=fx.Stream(stream.cuda_stream))
-    return out[:total_tokens], out_m[:total_tokens], out_l[:total_tokens]
+    return out[:total_tokens], m_raw[:total_tokens], l_raw[:total_tokens]
