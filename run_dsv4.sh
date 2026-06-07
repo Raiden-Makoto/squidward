@@ -31,8 +31,6 @@ sglang serve \
     --model-path ${MODEL} \
     --trust-remote-code \
     --tp 8 \
-    # --dp 8 \
-    # --enable-dp-attention \
     --disable-radix-cache \
     --attention-backend dsv4 \
     --max-running-requests 256 \
