@@ -20,8 +20,12 @@ export SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=false
 export SGLANG_ROCM_USE_MULTI_STREAM=false
 
 export AITER_BF16_FP8_MOE_BOUND=0
+export SGLANG_UNIFIED_KV_PREFILL_IMPL=triton
+#flydsl  (correct + fault-free, but loses on TTFT vs triton -> kept opt-in only)
 
 
+# --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-num-draft-tokens 4 --speculative-eagle-topk 1
+# --disable-cuda-graph \
 MODEL=/root/hf_home/hub/models--deepseek-ai--DeepSeek-V4-Pro/snapshots/89d501aed998d33fa4f4702102ec1bb2331e10f6
 
 sglang serve \
