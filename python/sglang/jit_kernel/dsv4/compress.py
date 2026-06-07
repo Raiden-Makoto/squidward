@@ -7,6 +7,7 @@ import torch
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
+    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -23,10 +24,13 @@ def _jit_compress_norm_rope_module(
     head_dim: int,
     rope_dim: int,
     page_size: int,
+    bf16_store: bool = False,
 ) -> Module:
-    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
+    args = make_cpp_args(
+        dtype, head_dim, rope_dim, page_size, is_arch_support_pdl(), bf16_store
+    )
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
-    if head_dim == 128:
+    if head_dim == 128 and not is_hip_runtime():
         cuda_wrappers.append(
             ("forward_fp4", f"FusedNormRopeKernel<{args}>::forward_fp4")
         )
@@ -339,12 +343,13 @@ def compress_norm_rope_store(
     kvcache: torch.Tensor,
     page_size: int,
     use_fp4: bool = False,
+    bf16_store: bool = False,
 ) -> None:
     if use_fp4:
         assert kv.shape[-1] == 128
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_compress_norm_rope_module(
-        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size
+        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
     )
     fn = module.forward_fp4 if use_fp4 else module.forward
     fn(
