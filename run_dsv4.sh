@@ -1,3 +1,4 @@
+export PYTHONPATH=/sgl-workspace/squidward/python:${PYTHONPATH}
 export SGLANG_DEFAULT_THINKING=1
 export SGLANG_DSV4_REASONING_EFFORT=max
 export SGLANG_OPT_DEEPGEMM_HC_PRENORM=false
