@@ -24,7 +24,7 @@ export AITER_BF16_FP8_MOE_BOUND=0
 
 # --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-num-draft-tokens 4 --speculative-eagle-topk 1
 # --disable-cuda-graph \
-MODEL=/root/hf_home/hub/models--deepseek-ai--DeepSeek-V4-Pro/snapshots/89d501aed998d33fa4f4702102ec1bb2331e10f6
+MODEL=${HF_HOME:-/root/hf_home}/hub/models--deepseek-ai--DeepSeek-V4-Pro/snapshots/89d501aed998d33fa4f4702102ec1bb2331e10f6
 
 sglang serve \
     --model-path ${MODEL} \
