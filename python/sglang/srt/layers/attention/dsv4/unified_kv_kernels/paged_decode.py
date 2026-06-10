@@ -722,11 +722,16 @@ def _sparse_attn_v4_paged_decode_triton(
     qk_scale = float(softmax_scale) * LOG2E
     _bk, num_warps, num_stages = _kernel_config(block_h)
     if block_k is None:
-        # fp8 dequant inflates per-tile ALU work ~4×; a wider K tile amortizes
-        # the per-tile dequant cost (scale load + cast + multiply) over more
-        # MFMA work. Empirically BLOCK_K=32 wins ~20% over BLOCK_K=16 on fp8
-        # (bs=512 ctx=4096: 3000µs → 2300µs) without hurting bf16.
-        block_k = 32 if quant_kv else _bk
+        # fp8 dequant inflates per-tile ALU work ~4×; a wider K tile would
+        # amortize the per-tile dequant cost (scale load + cast + multiply)
+        # over more MFMA work, and BLOCK_K=32 was reported ~20% faster than 16
+        # on fp8 (bs=512 ctx=4096: 3000µs → 2300µs). BUT on gfx950 (MI350X,
+        # 160KB LDS) BLOCK_K=32 + the inner-loop num_stages=3 pipeline overflows
+        # shared memory at D=512 (needs 167936 B > 163840 B limit) and the
+        # kernel fails to launch (triton OutOfResources). Use BLOCK_K=16, which
+        # fits and is numerically correct; revisit a wider tile (e.g. paired
+        # with num_stages=2, or an LDS-budgeted choice) once validated at e2e.
+        block_k = 16 if quant_kv else _bk
 
     # Kernel reads (kv_scales_ptr, ks_stride_n) only when QUANT_KV — supply a
     # dummy 1-element fp32 tensor on the bf16 path so the launch signature
