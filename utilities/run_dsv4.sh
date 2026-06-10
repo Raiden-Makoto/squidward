@@ -7,8 +7,22 @@ export SGLANG_USE_ROCM700A=1
 export SGLANG_OPT_USE_FUSED_COMPRESS=true
 # for SGLANG vs ATOM, "unified_kv_triton" is the ATOM baseline. "triton" is the SGLANG baseline.
 # for production vs B200, use the "unified_kv_triton" backend.
-# export SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton
-export SGLANG_HACK_FLASHMLA_BACKEND=triton
+# Default backend is "unified_kv_triton"
+SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton
+
+# Parse command line argument for backend selection
+for arg in "$@"; do
+    case "$arg" in
+        --triton)
+            SGLANG_HACK_FLASHMLA_BACKEND=triton
+            ;;
+        --unified)
+            SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton
+            ;;
+    esac
+done
+
+export SGLANG_HACK_FLASHMLA_BACKEND
 export SGLANG_OPT_FP8_WO_A_GEMM=false
 export SGLANG_OPT_USE_JIT_INDEXER_METADATA=false
 export SGLANG_OPT_USE_TOPK_V2=false
@@ -34,6 +48,7 @@ sglang serve \
     --model-path ${MODEL} \
     --trust-remote-code \
     --tp 8 \
+    $( [[ " $@ " =~ " --hc " ]] && echo "--dp 8 --enable-dp-attention" ) \
     --disable-radix-cache \
     --attention-backend dsv4 \
     --max-running-requests 256 \

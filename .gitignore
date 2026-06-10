@@ -283,3 +283,7 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
+
+# Utilities — local watchdog/guard artifacts (basenames contain watchdog, or dsv4_guard*)
+utilities/**/*watchdog*
+utilities/dsv4_guard*
