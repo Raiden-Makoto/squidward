@@ -63,9 +63,9 @@ _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
 
 # FP8 KV cache (1xGROUP_SIZE block-scale quantization).
 #
-# Storage: unified_kv[total_pages, D] in e4m3fnuz + kv_scales[total_pages,
-# D // GROUP_SIZE] in fp32. Per-slot, D is split into NUM_GROUPS chunks of
-# GROUP_SIZE elements; each chunk shares one fp32 scale.
+# Storage: unified_kv[total_pages, D] in fp8 (_FP8_DTYPE) + kv_scales[
+# total_pages, D // GROUP_SIZE] in fp32. Per-slot, D is split into NUM_GROUPS
+# chunks of GROUP_SIZE elements; each chunk shares one fp32 scale.
 # Dequant in-kernel: kv_bf16 = kv_fp8.to(fp32) * scale[d // GROUP_SIZE], cast
 # back to q.dtype before the second dot.
 #
@@ -73,7 +73,30 @@ _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
 # per slot, 4 bytes each → +6.25% storage on top of the fp8 pool (vs the
 # halving from bf16→fp8 = 2× saving — net ~46% read bandwidth reduction).
 _FP8_GROUP_SIZE = 64
-_FP8_DTYPE = torch.float8_e4m3fnuz
+
+
+@functools.lru_cache(maxsize=1)
+def _select_fp8_dtype() -> torch.dtype:
+    """Arch-gated fp8 storage format for the KV cache.
+
+    gfx942 (CDNA3 / MI300) uses the AMD "fnuz" format e4m3fnuz (max normal
+    240.0); gfx950 (CDNA4 / MI350) and everything else use OCP e4m3fn (max
+    normal 448.0). Picking the wrong one silently misreads the stored bytes
+    (wrong exponent bias) — e.g. fnuz on gfx950 saturates values >240 to NaN.
+
+    Mirrors ``is_fp8_fnuz()`` in fp8_kernel.py (``"gfx94"`` ⇒ fnuz). Inlined
+    here to keep this kernel module's import surface to just torch. Dequant is
+    a storage->bf16 conversion (``.to(q.dtype)``, no native fp8 MFMA), so the
+    only thing that matters is decoding the bytes with the right HW format.
+    """
+    if torch.version.hip and "gfx94" in torch.cuda.get_device_properties(
+        0
+    ).gcnArchName:
+        return torch.float8_e4m3fnuz
+    return torch.float8_e4m3fn
+
+
+_FP8_DTYPE = _select_fp8_dtype()
 
 
 @functools.lru_cache(maxsize=1)
@@ -638,10 +661,10 @@ def _sparse_attn_v4_paged_decode_triton(
     exp2 softmax, CG-safe heuristic. ``block_h`` and ``kv_splits`` are
     escape hatches for benchmarks; production callers pass neither.
 
-    When ``kv_scales`` is provided, ``unified_kv`` must be e4m3fnuz and
-    ``kv_scales`` must be ``[total_pages, D // GROUP_SIZE]`` fp32 — 1xGROUP_SIZE
-    block-scale quantization. Dequant happens in-kernel; the dot still runs
-    in q.dtype.
+    When ``kv_scales`` is provided, ``unified_kv`` must be the arch fp8 format
+    ``_FP8_DTYPE`` (e4m3fn on gfx950 / e4m3fnuz on gfx942) and ``kv_scales``
+    must be ``[total_pages, D // GROUP_SIZE]`` fp32 — 1xGROUP_SIZE block-scale
+    quantization. Dequant happens in-kernel; the dot still runs in q.dtype.
     """
     if not q.is_cuda:
         raise RuntimeError(
@@ -870,8 +893,9 @@ def sparse_attn_v4_paged_decode(
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
-    When ``kv_scales`` is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and
-    will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
+    When ``kv_scales`` is provided, ``unified_kv`` must be the arch fp8 format
+    ``_FP8_DTYPE`` (e4m3fn on gfx950 / e4m3fnuz on gfx942) and will be
+    dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
     """
     return _sparse_attn_v4_paged_decode_triton(
         q,
