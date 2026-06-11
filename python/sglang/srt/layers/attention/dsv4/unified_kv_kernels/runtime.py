@@ -175,14 +175,15 @@ def _lengths_to_indptr(lengths: torch.Tensor) -> torch.Tensor:
 def decode(
     *,
     q: torch.Tensor,  # [T, H, D] (local heads)
-    unified_kv: torch.Tensor,  # [pages, D] bf16
+    unified_kv: torch.Tensor,  # [pages, D] bf16 (or fp8 when kv_scales given)
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,  # [H] fp32
     softmax_scale: float,
+    kv_scales: Optional[torch.Tensor] = None,  # [pages, D//64] fp32 (fp8 KV)
 ) -> torch.Tensor:
     return sparse_attn_v4_paged_decode(
-        q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale
+        q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale, kv_scales
     )
 
 

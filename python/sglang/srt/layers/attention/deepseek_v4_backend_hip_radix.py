@@ -1185,6 +1185,7 @@ class DeepseekV4HipRadixBackend(
                 kv_indptr=kv_indptr,
                 attn_sink=attn_sink,
                 softmax_scale=self.softmax_scale,
+                kv_scales=unified_scales,
             )
 
         # prefill / extend
