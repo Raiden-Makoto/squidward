@@ -499,13 +499,6 @@ class CompressorBackendMixin:
         from sglang.srt.layers.deepseek_v4_rope import (
             fused_norm_rope_inplace_triton,
         )
-        from sglang.srt.layers.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
-        )
-
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
-            _FP8_GROUP_SIZE,
-        )
 
         assert compress_ratio in (4, 128)
         plan = self._get_paged_compress_metadata(compress_ratio)
@@ -557,13 +550,19 @@ class CompressorBackendMixin:
         if kv_compressed.shape[0] == 0:
             return
 
-        # Step 4: 1x64 group quant (amax/fp8_max) + scatter.
-        kv_q, kv_s = sglang_per_token_group_quant_fp8(
-            kv_compressed.bfloat16().contiguous(), group_size=_FP8_GROUP_SIZE
+        # Step 4: HIP-safe 1x64 group quant (amax/fp8_max) + scatter. Shares the
+        # exact contract with the decode (path 1) and prefill SWA (path 2)
+        # stores and the read kernels (no CUDA-only sgl_kernel symbol).
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.runtime import (
+            store_quant_fp8_by_loc,
         )
-        loc = out_loc_to_store.to(torch.int64)
-        kv_buffer[loc] = kv_q
-        kv_scale_buffer[loc] = kv_s
+
+        store_quant_fp8_by_loc(
+            kv=kv_compressed.bfloat16(),
+            loc=out_loc_to_store,
+            unified_kv=kv_buffer,
+            unified_kv_scales=kv_scale_buffer,
+        )
 
     def forward_unified(
         self,

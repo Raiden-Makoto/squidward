@@ -434,18 +434,18 @@ def fused_qk_norm_rope_swa_store(
         assert swa_scale_cache is not None, (
             "fp8_unified_store requires swa_scale_cache"
         )
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
-            _FP8_GROUP_SIZE,
-        )
-        from sglang.srt.layers.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
+        # HIP-safe 1x64 group quant + scatter (no CUDA-only sgl_kernel symbol).
+        # Shares the exact amax/fp8_max contract with the prefill SWA store
+        # (path 2) and the decode/prefill read kernels.
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.runtime import (
+            store_quant_fp8_by_loc,
         )
 
-        kv_q, kv_s = sglang_per_token_group_quant_fp8(
-            kv.contiguous(), group_size=_FP8_GROUP_SIZE
+        store_quant_fp8_by_loc(
+            kv=kv,
+            loc=swa_loc,
+            unified_kv=swa_cache,
+            unified_kv_scales=swa_scale_cache,
         )
-        loc = swa_loc.to(torch.int64)
-        swa_cache[loc] = kv_q
-        swa_scale_cache[loc] = kv_s
 
     return q_out

@@ -165,6 +165,97 @@ def store_swa_into_unified(
 
 
 # ---------------------------------------------------------------------------
+# HIP-safe 1x64 block-scale fp8 quant + scatter by explicit destination row.
+#
+# Shared by the decode store (fused_qk_norm_rope_swa_store) and the
+# compressed-K store (compressor_v2). Mirrors the ``_swa_scatter_kernel`` QUANT
+# branch above byte-for-byte (scale_g = amax(|group_g|)/FP8_MAX, fp8 =
+# clamp(elem / scale_g), dequant = fp8 * scale) so all three unified-KV write
+# paths produce an identical fp8 + per-64-group fp32 scale layout. Unlike
+# ``sglang_per_token_group_quant_fp8`` (CUDA/MUSA-only) this references no
+# CUDA-only sgl_kernel symbol, so it is safe on ROCm/HIP.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _quant_scatter_by_loc_kernel(
+    kv_ptr,  # [T, D] float (norm+rope'd)
+    loc_ptr,  # [T] int64 destination rows
+    unified_ptr,  # [pages, D] fp8 (_FP8_DTYPE)
+    scale_ptr,  # [pages, NUM_GROUPS] fp32
+    n_rows,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if row >= n_rows:
+        return
+    loc = tl.load(loc_ptr + row).to(tl.int64)
+    offs = tl.arange(0, BLOCK_D)
+    mask = offs < D
+    vals = tl.load(kv_ptr + row * D + offs, mask=mask, other=0.0)
+    # BLOCK_D == D so the reshape is exact (no padded lanes).
+    EPS: tl.constexpr = 1e-10
+    vals_g = tl.reshape(vals.to(tl.float32), (NUM_GROUPS, GROUP_SIZE))
+    amax = tl.max(tl.abs(vals_g), axis=1)
+    scale = tl.maximum(amax, EPS) / FP8_MAX
+    q = vals_g / scale[:, None]
+    q = tl.clamp(q, -FP8_MAX, FP8_MAX)
+    q = tl.reshape(q, (BLOCK_D,)).to(unified_ptr.dtype.element_ty)
+    tl.store(unified_ptr + loc * D + offs, q, mask=mask)
+    g_offs = tl.arange(0, NUM_GROUPS)
+    tl.store(scale_ptr + loc * NUM_GROUPS + g_offs, scale)
+
+
+def store_quant_fp8_by_loc(
+    *,
+    kv: torch.Tensor,  # [T, D] norm+rope'd (any float dtype)
+    loc: torch.Tensor,  # [T] int destination rows in the unified pool
+    unified_kv: torch.Tensor,  # [pages, D] fp8 (_FP8_DTYPE)
+    unified_kv_scales: torch.Tensor,  # [pages, D // 64] fp32
+) -> None:
+    """HIP-safe 1x64 block-scale fp8 quant + scatter to explicit pool rows.
+
+    Identical on-disk contract to the ``_swa_scatter_kernel`` QUANT branch
+    (path 2) and the decode/prefill dequant (``fp8 * scale``):
+    ``scale_g = amax(|group_g|)/fp8_max``, ``fp8 = clamp(elem / scale_g)``.
+    Used by the decode store (path 1) and compressed-K store (path 3) so all
+    three paths emit byte-identical layout without any CUDA-only symbol.
+    """
+    n_rows, D = kv.shape
+    if n_rows == 0:
+        return
+
+    from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
+        _FP8_DTYPE,
+        _FP8_GROUP_SIZE,
+    )
+    from sglang.srt.layers.quantization.fp8_kernel import fp8_max
+
+    assert unified_kv.dtype == _FP8_DTYPE
+    assert D % _FP8_GROUP_SIZE == 0
+    num_groups = D // _FP8_GROUP_SIZE
+    assert unified_kv_scales.shape[1] == num_groups
+
+    kv = kv.contiguous()
+    loc = loc.to(torch.int64).contiguous()
+    _quant_scatter_by_loc_kernel[(n_rows,)](
+        kv,
+        loc,
+        unified_kv,
+        unified_kv_scales,
+        n_rows,
+        D=D,
+        BLOCK_D=D,  # exact reshape requires BLOCK_D == D
+        GROUP_SIZE=_FP8_GROUP_SIZE,
+        NUM_GROUPS=num_groups,
+        FP8_MAX=fp8_max,
+        num_warps=8,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Ragged indptr helper (shared by the decode streams + prefill builders)
 # ---------------------------------------------------------------------------
 def _lengths_to_indptr(lengths: torch.Tensor) -> torch.Tensor:
