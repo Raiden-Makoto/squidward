@@ -472,6 +472,99 @@ class CompressorBackendMixin:
             bf16_store=bf16_store,
         )
 
+    def _store_compress_unified_fp8(
+        self,
+        *,
+        kv_score_buffer: torch.Tensor,
+        kv_score_input: torch.Tensor,
+        ape: torch.Tensor,
+        head_dim: int,
+        norm: RMSNorm,
+        freqs_cis_cache: torch.Tensor,
+        compress_ratio: int,
+        out_loc: torch.Tensor,  # already offset by swa_pages
+        kv_buffer: torch.Tensor,  # [pages, head_dim] fp8
+        kv_scale_buffer: torch.Tensor,  # [pages, head_dim // 64] fp32
+    ) -> None:
+        """fp8 unified compressed-K store (Triton fallback for the JIT path).
+
+        Mirrors the compress_forward + Triton norm/rope used by
+        ``_forward_unified_hip`` (precision parity with the JIT
+        ``compress_norm_rope_store``), then applies the same 1x64
+        ``amax/fp8_max`` block-scale quant as the other two store paths and
+        scatters fp8 rows + fp32 scale rows into the unified pool. The per-token
+        write-loc selection (decode: direct; prefill: ``out_loc[ragged_id]``)
+        replicates the JIT kernel's contract exactly.
+        """
+        from sglang.srt.layers.deepseek_v4_rope import (
+            fused_norm_rope_inplace_triton,
+        )
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
+            _FP8_GROUP_SIZE,
+        )
+
+        assert compress_ratio in (4, 128)
+        plan = self._get_paged_compress_metadata(compress_ratio)
+
+        # Step 1: compress_forward (same as the JIT / _forward_unified_hip path).
+        coff = 2 if is_overlap_compress(compress_ratio) else 1
+        last_dim = 2 * head_dim * coff
+        ksb = kv_score_buffer.view(-1, compress_ratio, last_dim)
+        kv_compressed = compress_forward(
+            kv_score_buffer=ksb,
+            kv_score_input=kv_score_input,
+            ape=ape.view(-1, head_dim),
+            plan=plan,
+            compress_ratio=compress_ratio,
+            head_dim=head_dim,
+            is_online=False,
+        )
+        if kv_compressed.shape[0] == 0:
+            return
+
+        # Decode: zero non-boundary tokens so they don't corrupt loc 0.
+        if plan.is_decode:
+            plan_raw = plan[1].view(torch.int32)
+            seq_lens_plan = plan_raw[:, 0].to(torch.int32)
+            is_boundary = (seq_lens_plan % compress_ratio == 0).unsqueeze(-1)
+            kv_compressed = torch.where(
+                is_boundary, kv_compressed, torch.zeros_like(kv_compressed)
+            )
+
+        # Step 2: norm + rope (Triton fallback, precision parity with the JIT).
+        positions = _extract_positions_from_plan(plan, compress_ratio)
+        positions_safe = positions.clamp(min=0)
+        fused_norm_rope_inplace_triton(
+            kv_compressed,
+            norm.weight,
+            norm.variance_epsilon,
+            freqs_cis_cache,
+            positions=positions_safe,
+        )
+
+        # Step 3: resolve per-token write locations (matches the JIT kernel).
+        if plan.is_decode:
+            out_loc_to_store = out_loc
+        else:
+            plan_raw = plan[1].view(torch.int32)
+            ragged_ids = plan_raw[:, 1].to(torch.int32) & 0xFFFF
+            out_loc_to_store = out_loc[ragged_ids.long()]
+
+        if kv_compressed.shape[0] == 0:
+            return
+
+        # Step 4: 1x64 group quant (amax/fp8_max) + scatter.
+        kv_q, kv_s = sglang_per_token_group_quant_fp8(
+            kv_compressed.bfloat16().contiguous(), group_size=_FP8_GROUP_SIZE
+        )
+        loc = out_loc_to_store.to(torch.int64)
+        kv_buffer[loc] = kv_q
+        kv_scale_buffer[loc] = kv_s
+
     def forward_unified(
         self,
         x: torch.Tensor,
@@ -509,12 +602,33 @@ class CompressorBackendMixin:
                 kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
                 page_size = token_to_kv_pool.get_index_k_page_size()
             elif is_unified_kv_triton():
-                kv_cache = token_to_kv_pool.get_unified_kv(layer_id)
-                page_size = 1
                 out_loc = getattr(
                     self.forward_metadata.core_metadata.unified,
                     f"c{compressor.ratio}_out_loc",
                 )
+                if token_to_kv_pool.unified_kv_pool.use_fp8:
+                    # fp8 unified pool: the JIT compress_norm_rope_store only
+                    # emits bf16 (or FlashMLA-pow2) rows, so use a Triton
+                    # norm+rope + validated 1x64 group-quant + scatter fallback
+                    # that produces the exact fp8 + per-64-group fp32 scale
+                    # layout the decode/prefill kernels read.
+                    self._store_compress_unified_fp8(
+                        kv_score_buffer=state_pool.kv_score_buffer.kv_score,
+                        kv_score_input=kv_score_input,
+                        ape=compressor.ape,
+                        head_dim=compressor.head_dim,
+                        norm=compressor.norm,
+                        freqs_cis_cache=compressor.freqs_cis,
+                        compress_ratio=compressor.ratio,
+                        out_loc=out_loc,
+                        kv_buffer=token_to_kv_pool.get_unified_kv(layer_id),
+                        kv_scale_buffer=token_to_kv_pool.get_unified_kv_scales(
+                            layer_id
+                        ),
+                    )
+                    return
+                kv_cache = token_to_kv_pool.get_unified_kv(layer_id)
+                page_size = 1
                 bf16_store = True
             else:
                 _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]

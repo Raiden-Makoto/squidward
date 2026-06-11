@@ -1124,6 +1124,11 @@ class DeepseekV4HipRadixBackend(
         pool = self.token_to_kv_pool
         layer_id = layer.layer_id
         unified = pool.get_unified_kv(layer_id)
+        unified_scales = (
+            pool.get_unified_kv_scales(layer_id)
+            if pool.unified_kv_pool is not None and pool.unified_kv_pool.use_fp8
+            else None
+        )
         win = pool.unified_swa_window
         ring_stride = pool.unified_swa_ring_size
         swa_pages = pool.unified_swa_pages
@@ -1151,6 +1156,7 @@ class DeepseekV4HipRadixBackend(
                     win=win,
                     ring_stride=ring_stride,
                     final_pos=positions,
+                    unified_kv_scales=unified_scales,
                 )
             unified_metadata = core_attn_metadata.unified
             if compress_ratio == 0:
@@ -1277,6 +1283,7 @@ class DeepseekV4HipRadixBackend(
                 win=win,
                 ring_stride=ring_stride,
                 final_pos=_ring_final_pos,
+                unified_kv_scales=unified_scales,
             )
         return o
 

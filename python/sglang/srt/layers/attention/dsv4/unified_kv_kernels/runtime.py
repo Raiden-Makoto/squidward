@@ -51,13 +51,18 @@ def _swa_scatter_kernel(
     state_slot_ptr,  # [T] int
     positions_ptr,  # [T] int
     final_pos_ptr,  # [T] int
-    unified_ptr,  # [pages, D] bf16
+    unified_ptr,  # [pages, D] bf16 (or fp8 when QUANT)
+    scale_ptr,  # [pages, NUM_GROUPS] fp32 (only read when QUANT)
     n_rows,
     ring_stride,  # SWA ring per-slot stride
     win: tl.constexpr,
     D: tl.constexpr,
     HAS_FINAL: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    QUANT: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    FP8_MAX: tl.constexpr,
 ):
     row = tl.program_id(0)
     if row >= n_rows:
@@ -72,7 +77,23 @@ def _swa_scatter_kernel(
     offs = tl.arange(0, BLOCK_D)
     mask = offs < D
     vals = tl.load(kv_ptr + row * D + offs, mask=mask, other=0.0)
-    tl.store(unified_ptr + loc * D + offs, vals, mask=mask)
+    if QUANT:
+        # 1xGROUP_SIZE block-scale quant: scale_g = amax(|group_g|) / FP8_MAX,
+        # fp8 = clamp(elem / scale_g). Matches sglang_per_token_group_quant_fp8
+        # and the kernel-side dequant (fp8 * scale). BLOCK_D == D here so the
+        # reshape is exact (no padded lanes).
+        EPS: tl.constexpr = 1e-10
+        vals_g = tl.reshape(vals.to(tl.float32), (NUM_GROUPS, GROUP_SIZE))
+        amax = tl.max(tl.abs(vals_g), axis=1)
+        scale = tl.maximum(amax, EPS) / FP8_MAX
+        q = vals_g / scale[:, None]
+        q = tl.clamp(q, -FP8_MAX, FP8_MAX)
+        q = tl.reshape(q, (BLOCK_D,)).to(unified_ptr.dtype.element_ty)
+        tl.store(unified_ptr + loc * D + offs, q, mask=mask)
+        g_offs = tl.arange(0, NUM_GROUPS)
+        tl.store(scale_ptr + loc * NUM_GROUPS + g_offs, scale)
+    else:
+        tl.store(unified_ptr + loc * D + offs, vals, mask=mask)
 
 
 def store_swa_into_unified(
@@ -80,10 +101,11 @@ def store_swa_into_unified(
     kv: torch.Tensor,  # [T, head_dim] bf16
     state_slot: torch.Tensor,  # [T] int
     positions: torch.Tensor,  # [T] int
-    unified_kv: torch.Tensor,  # [pages, head_dim] bf16
+    unified_kv: torch.Tensor,  # [pages, head_dim] bf16 (or fp8 when scales given)
     win: int,  # SWA attention window length
     ring_stride: int,  # SWA ring stride
     final_pos: Optional[torch.Tensor] = None,  # [T] req's last position
+    unified_kv_scales: Optional[torch.Tensor] = None,  # [pages, head_dim//64] fp32
 ) -> None:
     n_rows, D = kv.shape
     if n_rows == 0:
@@ -91,21 +113,53 @@ def store_swa_into_unified(
 
     has_final = final_pos is not None
     fp_arg = final_pos if has_final else positions
-    assert kv.is_contiguous() and kv.dtype == unified_kv.dtype
+    assert kv.is_contiguous()
     assert state_slot.is_contiguous() and positions.is_contiguous()
     assert fp_arg.is_contiguous()
+
+    # fp8 quant-on-store is gated purely on the caller passing a scales buffer
+    # (i.e. the unified pool is fp8). The bf16 path is strictly unchanged.
+    quant = unified_kv_scales is not None
+    if quant:
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
+            _FP8_DTYPE,
+            _FP8_GROUP_SIZE,
+        )
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_max
+
+        assert unified_kv.dtype == _FP8_DTYPE
+        assert D % _FP8_GROUP_SIZE == 0
+        num_groups = D // _FP8_GROUP_SIZE
+        assert unified_kv_scales.shape[1] == num_groups
+        group_size = _FP8_GROUP_SIZE
+        block_d = D  # exact reshape requires BLOCK_D == D
+        fp8_max_val = fp8_max
+        scale_arg = unified_kv_scales
+    else:
+        assert kv.dtype == unified_kv.dtype
+        num_groups = 1
+        group_size = 1
+        block_d = triton.next_power_of_2(D)
+        fp8_max_val = 1.0
+        scale_arg = unified_kv  # unused dummy ptr
+
     _swa_scatter_kernel[(n_rows,)](
         kv,
         state_slot,
         positions,
         fp_arg,
         unified_kv,
+        scale_arg,
         n_rows,
         ring_stride,
         win=win,
         D=D,
         HAS_FINAL=has_final,
-        BLOCK_D=triton.next_power_of_2(D),
+        BLOCK_D=block_d,
+        QUANT=quant,
+        GROUP_SIZE=group_size,
+        NUM_GROUPS=num_groups,
+        FP8_MAX=fp8_max_val,
         num_warps=8,
     )
 

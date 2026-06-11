@@ -797,7 +797,16 @@ class MQALayer(nn.Module):
                 # swa_loc is layer-independent; computed once per forward by the
                 # backend and cached on the metadata (read here by every layer).
                 swa_loc = attn_backend.get_unified_swa_loc(forward_batch)
-                swa_page_size, bf16_store = 1, True
+                swa_page_size = 1
+                # fp8 unified pool: quant-on-store (1x64) instead of bf16.
+                if token_to_kv_pool.unified_kv_pool.use_fp8:
+                    bf16_store, fp8_unified_store = False, True
+                    swa_scale_cache = token_to_kv_pool.get_unified_kv_scales(
+                        self.layer_id
+                    )
+                else:
+                    bf16_store, fp8_unified_store = True, False
+                    swa_scale_cache = None
             else:
                 swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
                 swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
@@ -805,6 +814,8 @@ class MQALayer(nn.Module):
                     token_to_kv_pool.swa_kv_pool.page_size,
                     False,
                 )
+                fp8_unified_store = False
+                swa_scale_cache = None
 
             from sglang.srt.layers.fused_qk_norm_rope_store import (
                 fused_qk_norm_rope_swa_store,
@@ -827,6 +838,8 @@ class MQALayer(nn.Module):
                 q_out=q_out,
                 dtype=x.dtype,
                 bf16_store=bf16_store,
+                fp8_unified_store=fp8_unified_store,
+                swa_scale_cache=swa_scale_cache,
             )
             kv = None
 

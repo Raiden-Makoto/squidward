@@ -315,6 +315,8 @@ def fused_qk_norm_rope_swa_store(
     q_out: Optional[torch.Tensor] = None,
     dtype: torch.dtype = torch.bfloat16,
     bf16_store: bool = False,
+    fp8_unified_store: bool = False,
+    swa_scale_cache: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused Q norm + KV norm + RoPE + optional SWA store.
 
@@ -325,6 +327,13 @@ def fused_qk_norm_rope_swa_store(
         swa_loc: [M] int32 pre-translated paged indices
         swa_page_size: tokens per SWA page (default 128)
         bf16_store: write the whole head_dim as plain bf16 at swa_cache[swa_loc]
+        fp8_unified_store: quant the (norm+rope'd) kv per 1x64 group and scatter
+            fp8 rows into ``swa_cache`` [num_slots, head_dim] (fp8) + fp32 scale
+            rows into ``swa_scale_cache`` [num_slots, head_dim // 64]. Mutually
+            exclusive with ``bf16_store``. The in-kernel SWA store is skipped in
+            this mode (it only emits bf16 / FlashMLA-pow2 layouts).
+        swa_scale_cache: [num_slots, head_dim // 64] fp32 scale buffer, required
+            when ``fp8_unified_store`` is set.
     """
     head_dim = kv.shape[1]
 
@@ -348,6 +357,15 @@ def fused_qk_norm_rope_swa_store(
         )
 
     HAS_SWA_STORE = swa_cache is not None and swa_loc is not None
+    # fp8 unified store: the in-kernel SWA store only emits bf16 / FlashMLA-pow2
+    # layouts, neither of which matches the fp8 1x64 linear-scale unified kv
+    # buffer. So run the kernel for norm+RoPE (it still writes the normed+roped
+    # row back into ``kv`` in-place) and do the validated 1x64 group quant +
+    # scatter in Python below. ``bf16_store`` is the strictly-unchanged default.
+    assert not (fp8_unified_store and bf16_store), (
+        "fp8_unified_store and bf16_store are mutually exclusive"
+    )
+    kernel_swa_store = HAS_SWA_STORE and not fp8_unified_store
 
     dim_nope = 448
     dim_rope = 64
@@ -374,8 +392,8 @@ def fused_qk_norm_rope_swa_store(
         positions,
         cos_cache,
         sin_cache,
-        swa_cache if HAS_SWA_STORE else None,
-        swa_loc if HAS_SWA_STORE else None,
+        swa_cache if kernel_swa_store else None,
+        swa_loc if kernel_swa_store else None,
         M,
         q_in_splitk_stride,
         q_in_m_stride,
@@ -387,7 +405,7 @@ def fused_qk_norm_rope_swa_store(
         kv.stride(1),
         cos_cache.stride(0),
         cos_cache.stride(-1),
-        swa_cache.stride(0) if HAS_SWA_STORE else 0,
+        swa_cache.stride(0) if kernel_swa_store else 0,
         q_rms_eps,
         kv_rms_eps,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
@@ -395,7 +413,7 @@ def fused_qk_norm_rope_swa_store(
         ROPE_DIM=rope_head_dim,
         NUM_LOCAL_HEADS=num_local_heads,
         NUM_SPLITK=num_splitk,
-        HAS_SWA_STORE=HAS_SWA_STORE,
+        HAS_SWA_STORE=kernel_swa_store,
         DIM_NOPE=dim_nope,
         TILE_SIZE=tile_size,
         NUM_NOPE_TILES=num_nope_tiles,
@@ -407,4 +425,27 @@ def fused_qk_norm_rope_swa_store(
         IS_FNUZ=_fp8_fnuz,
         num_warps=num_warps,
     )
+
+    if fp8_unified_store and HAS_SWA_STORE:
+        # ``kv`` now holds the norm+RoPE'd [M, head_dim] row (kernel writeback).
+        # Quant per 1x64 group with amax/fp8_max linear scales (the exact
+        # contract the decode/prefill kernels dequant against) and scatter the
+        # fp8 row + fp32 scale row into the unified pool at swa_loc.
+        assert swa_scale_cache is not None, (
+            "fp8_unified_store requires swa_scale_cache"
+        )
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
+            _FP8_GROUP_SIZE,
+        )
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        kv_q, kv_s = sglang_per_token_group_quant_fp8(
+            kv.contiguous(), group_size=_FP8_GROUP_SIZE
+        )
+        loc = swa_loc.to(torch.int64)
+        swa_cache[loc] = kv_q
+        swa_scale_cache[loc] = kv_s
+
     return q_out
