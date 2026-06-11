@@ -58,6 +58,9 @@ import triton
 import triton.language as tl
 from aiter.ops.triton.utils.device_info import get_num_sms
 
+from sglang.srt.utils import is_hip
+_is_hip = is_hip()
+
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
 _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
 
@@ -76,27 +79,13 @@ _FP8_GROUP_SIZE = 64
 
 
 @functools.lru_cache(maxsize=1)
-def _select_fp8_dtype() -> torch.dtype:
-    """Arch-gated fp8 storage format for the KV cache.
+def is_fp8_fnuz() -> bool:
+    if _is_hip:
+        # only device 0 is checked, this assumes MI300 platforms are homogeneous
+        return "gfx94" in torch.cuda.get_device_properties(0).gcnArchName
+    return False
 
-    gfx942 (CDNA3 / MI300) uses the AMD "fnuz" format e4m3fnuz (max normal
-    240.0); gfx950 (CDNA4 / MI350) and everything else use OCP e4m3fn (max
-    normal 448.0). Picking the wrong one silently misreads the stored bytes
-    (wrong exponent bias) — e.g. fnuz on gfx950 saturates values >240 to NaN.
-
-    Mirrors ``is_fp8_fnuz()`` in fp8_kernel.py (``"gfx94"`` ⇒ fnuz). Inlined
-    here to keep this kernel module's import surface to just torch. Dequant is
-    a storage->bf16 conversion (``.to(q.dtype)``, no native fp8 MFMA), so the
-    only thing that matters is decoding the bytes with the right HW format.
-    """
-    if torch.version.hip and "gfx94" in torch.cuda.get_device_properties(
-        0
-    ).gcnArchName:
-        return torch.float8_e4m3fnuz
-    return torch.float8_e4m3fn
-
-
-_FP8_DTYPE = _select_fp8_dtype()
+_FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 
 @functools.lru_cache(maxsize=1)
