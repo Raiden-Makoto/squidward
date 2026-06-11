@@ -1264,6 +1264,7 @@ class DeepseekV4HipRadixBackend(
             kv_indptr_extend=kext_p,
             attn_sink=attn_sink,
             softmax_scale=self.softmax_scale,
+            kv_scales=unified_scales,
         )
 
         # write this chunk's SWA K into the ring for future chunks / decode
