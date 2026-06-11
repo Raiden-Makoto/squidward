@@ -14,6 +14,10 @@ export SGLANG_USE_AITER=1
 export SGLANG_USE_ROCM700A=${SGLANG_USE_ROCM700A:-0}
 export SGLANG_OPT_USE_FUSED_COMPRESS=true
 export SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton
+# fp8 1x64 block-scale unified-KV attention pool (the point of this branch).
+# Strictly opt-in via this var (unified_kv_use_fp8()); --kv-cache-dtype fp8_e4m3
+# alone only fp8s the indexer pool. Default ON here; override with =0 for bf16.
+export SGLANG_UNIFIED_KV_FP8="${SGLANG_UNIFIED_KV_FP8:-1}"
 export SGLANG_OPT_FP8_WO_A_GEMM=false
 export SGLANG_OPT_USE_JIT_INDEXER_METADATA=false
 export SGLANG_OPT_USE_TOPK_V2=false
