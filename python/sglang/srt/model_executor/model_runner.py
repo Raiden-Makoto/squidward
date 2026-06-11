@@ -2379,6 +2379,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else:
                 self.kv_cache_dtype = torch.float8_e5m2
         elif self.server_args.kv_cache_dtype == "fp8_e4m3":
+            # NOTE: this resolves the dtype consumed by the indexer pool only.
+            # The DSV4 unified attention pool's fp8 path is separately gated by
+            # unified_kv_use_fp8() at the unified pool construction site
+            # (mem_cache/deepseek_v4_memory_pool.py), so this flag alone does NOT
+            # enable fp8 unified attention. Do not change this resolution.
             if _is_hip:  # Using natively supported format
                 self.kv_cache_dtype = fp8_dtype
             else:

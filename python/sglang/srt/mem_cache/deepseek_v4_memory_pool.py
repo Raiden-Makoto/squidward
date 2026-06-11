@@ -398,6 +398,7 @@ class DeepSeekV4UnifiedKVPool:
         memory_saver_adapter,
         custom_mem_pool,
         swa_ring_size: int,
+        dtype: torch.dtype = torch.bfloat16,
     ):
         self.swa_ring_size = swa_ring_size
         self.head_dim = qk_nope_head_dim + qk_rope_head_dim
@@ -406,7 +407,33 @@ class DeepSeekV4UnifiedKVPool:
         self.num_blocks = num_blocks
         self.k_per_block = dict(self.K_PER_BLOCK)
 
+        # fp8 1x64 block-scale storage is strictly opt-in via ``dtype``. The
+        # default (bf16) path is unchanged: a single bf16 ``kv_buffer`` per
+        # layer and no scale buffer.
+        self.dtype = dtype
+        self.use_fp8 = dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        if self.use_fp8:
+            # Match the kernel's arch-gated fp8 dtype + GROUP_SIZE exactly
+            # (see paged_decode.py); do NOT hardcode a single fp8 dtype.
+            from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
+                _FP8_DTYPE,
+                _FP8_GROUP_SIZE,
+            )
+
+            assert self.head_dim % _FP8_GROUP_SIZE == 0, (
+                f"head_dim={self.head_dim} must be divisible by "
+                f"GROUP_SIZE={_FP8_GROUP_SIZE} for fp8 unified KV"
+            )
+            self.fp8_dtype = _FP8_DTYPE
+            self.group_size = _FP8_GROUP_SIZE
+            self.num_groups = self.head_dim // _FP8_GROUP_SIZE
+        else:
+            self.fp8_dtype = None
+            self.group_size = None
+            self.num_groups = None
+
         bufs = []
+        scale_bufs = []
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(custom_mem_pool)
@@ -415,23 +442,57 @@ class DeepSeekV4UnifiedKVPool:
             ):
                 for ratio in stage_ratios:
                     compress_pages = self.num_blocks * self.k_per_block[ratio]
-                    bufs.append(
-                        torch.zeros(
-                            self.swa_pages + compress_pages,
-                            self.head_dim,
-                            dtype=torch.bfloat16,
-                            device=device,
+                    total_pages = self.swa_pages + compress_pages
+                    if self.use_fp8:
+                        bufs.append(
+                            torch.zeros(
+                                total_pages,
+                                self.head_dim,
+                                dtype=self.fp8_dtype,
+                                device=device,
+                            )
                         )
-                    )
+                        scale_bufs.append(
+                            torch.zeros(
+                                total_pages,
+                                self.num_groups,
+                                dtype=torch.float32,
+                                device=device,
+                            )
+                        )
+                    else:
+                        bufs.append(
+                            torch.zeros(
+                                total_pages,
+                                self.head_dim,
+                                dtype=torch.bfloat16,
+                                device=device,
+                            )
+                        )
         self.kv_buffer = bufs
+        # Parallel per-layer fp32 block-scale buffers, shape
+        # ``[total_pages, head_dim // GROUP_SIZE]``. ``None`` on the bf16 path.
+        self.kv_scale_buffer = scale_bufs if self.use_fp8 else None
 
     def get_unified_kv(self, local_layer_id: int) -> torch.Tensor:
         return self.kv_buffer[local_layer_id]
+
+    def get_unified_kv_scales(self, local_layer_id: int) -> torch.Tensor:
+        if self.kv_scale_buffer is None:
+            raise RuntimeError(
+                "get_unified_kv_scales called on a bf16 unified KV pool; "
+                "fp8 block scales are only allocated when the pool dtype is fp8"
+            )
+        return self.kv_scale_buffer[local_layer_id]
 
     def get_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs = [b.data_ptr() for b in self.kv_buffer]
         data_lens = [b.nbytes for b in self.kv_buffer]
         item_lens = [b[0].nbytes for b in self.kv_buffer]
+        if self.kv_scale_buffer is not None:
+            data_ptrs += [b.data_ptr() for b in self.kv_scale_buffer]
+            data_lens += [b.nbytes for b in self.kv_scale_buffer]
+            item_lens += [b[0].nbytes for b in self.kv_scale_buffer]
         return data_ptrs, data_lens, item_lens
 
 
@@ -537,6 +598,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
+            unified_kv_use_fp8,
         )
 
         self._unified_kv = is_unified_kv_triton()
@@ -551,6 +613,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 if server_args.speculative_algorithm is not None
                 else 0
             )
+            # The unified attention pool only goes fp8 when explicitly gated in.
+            # ``dtype`` here may already be an fp8 type because ``--kv-cache-dtype
+            # fp8_e4m3`` resolves to fp8 for the indexer pool, but that flag alone
+            # must NOT flip attention to fp8 (quant-on-store / read paths unwired).
+            # Require the explicit opt-in (SGLANG_UNIFIED_KV_FP8 + HIP +
+            # unified_kv_triton); otherwise keep the pool bf16. Even when opted in,
+            # only use ``dtype`` if it actually is an fp8 dtype.
+            _is_fp8_dtype = dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            unified_dtype = (
+                dtype if (unified_kv_use_fp8() and _is_fp8_dtype) else torch.bfloat16
+            )
             self.unified_kv_pool = DeepSeekV4UnifiedKVPool(
                 stage_ratios=stage_ratios,
                 num_slots=self.num_req_slots,
@@ -561,6 +634,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 memory_saver_adapter=self.memory_saver_adapter,
                 custom_mem_pool=self.custom_mem_pool,
                 swa_ring_size=self.sliding_window + spec_extra,
+                dtype=unified_dtype,
             )
 
             self.unified_swa_window = self.sliding_window
@@ -626,6 +700,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
         return self.unified_kv_pool.get_unified_kv(layer_id - self._stage_start)
+
+    def get_unified_kv_scales(self, layer_id: int) -> torch.Tensor:
+        return self.unified_kv_pool.get_unified_kv_scales(
+            layer_id - self._stage_start
+        )
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
