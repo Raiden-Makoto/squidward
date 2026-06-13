@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 export PYTHONPATH=/sgl-workspace/squidward/python:${PYTHONPATH}
 
-DP_MODE="${DP_MODE:-tp8dp8}"
+DP_MODE="${DP_MODE:-off}"
 MODEL=${HF_HOME:-/root/hf_home}/hub/models--deepseek-ai--DeepSeek-V4-Pro/snapshots/89d501aed998d33fa4f4702102ec1bb2331e10f6
 PORT="${PORT:-8000}"
 
