@@ -36,4 +36,7 @@ arch to the box (`mi30x` = gfx942 dsv4 box; `mi35x` = gfx950 gbt box — see `kn
 5. **Verify**: `docker ps --filter name=dsv4` shows the new image and `Up`. Confirm the fork at
    `/sgl-workspace/squidward` is present (re-mount/clone if the box mounts it from host) and at
    the expected commit.
-6. **Do not start the server.** Report the new image tag and container status.
+6. **Mark the fork as a git safe directory inside the container** (the bind-mount is owned by a
+   different uid, so git refuses to operate on it otherwise):
+   `docker exec dsv4 git config --global --add safe.directory /sgl-workspace/squidward`
+7. **Do not start the server.** Report the new image tag and container status.
