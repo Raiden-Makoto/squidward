@@ -1,0 +1,12 @@
+---
+description: 
+alwaysApply: true
+---
+# Result/Benchmark Markdown: Clean Numbers Only
+
+When writing or editing any results, benchmark, or comparison markdown file:
+
+- Lead with the numbers. A short header (branch/commit, image, command) plus the comparison table(s) is the whole file.
+- NO prose verdicts, NO "Notes/caveats" sections, NO interpretation paragraphs, NO emojis, NO motivational filler.
+- Put deltas in the table itself if useful, not in sentences.
+- If the user wants analysis, they will ask. Default to numbers only.
