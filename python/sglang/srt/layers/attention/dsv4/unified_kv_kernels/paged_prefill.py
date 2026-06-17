@@ -307,10 +307,7 @@ def _sparse_attn_v4_paged_prefill_triton(
 
     block_h = 16  # AMD MFMA min tile
     block_d = triton.next_power_of_2(D)
-    # Force BLOCK_K=16 on the fp8 path (matches the decode kernel): BLOCK_K=32
-    # + the dequant tiles overflow gfx950 LDS at D=512. For D>=256 the bf16
-    # path already picks 16, so this is a no-op for the real workload.
-    block_k = 16 if (quant_kv or D >= 256) else 32
+    block_k = 32 if quant_kv else (16 if D >= 256 else 32)
 
     # Kernel reads (kv_scales_ptr, ks_stride_n) only when QUANT_KV — supply a
     # dummy 1-element fp32 tensor on the bf16 path so the launch signature stays
