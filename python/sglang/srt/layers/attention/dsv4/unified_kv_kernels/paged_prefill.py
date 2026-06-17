@@ -52,6 +52,7 @@ import triton.language as tl
 from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
     _FP8_DTYPE,
     _FP8_GROUP_SIZE,
+    LOG2E,
 )
 from sglang.srt.utils.common import is_gfx95_supported
 
@@ -91,13 +92,15 @@ def _sparse_attn_v4_paged_prefill_kernel(
     out_stride_d: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
-    softmax_scale: tl.constexpr,
+    qk_scale,  # = softmax_scale * LOG2E (online softmax runs in log2 domain)
+    log2e,  # = LOG2E, lifts the natural-log attn_sink into the log2 domain
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
     QUANT_KV: tl.constexpr,  # True → dequant fp8 unified_kv prefix via kv_scales
     GROUP_SIZE: tl.constexpr,  # scale block width along D (e.g. 64)
     NUM_GROUPS: tl.constexpr,  # D // GROUP_SIZE (constexpr; D % GROUP_SIZE == 0)
+    NUM_STAGES: tl.constexpr,  # SW-pipeline depth on the K loops (hide KV-gather latency)
 ):
     t = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -132,7 +135,12 @@ def _sparse_attn_v4_paged_prefill_kernel(
     p_end = tl.load(kv_indptr_prefix_ptr + t + 1)
     p_len = p_end - p_start
 
-    for k_start in tl.range(0, p_len, BLOCK_K):
+    # num_stages SW-pipelines the scattered D=512 KV gather against the MFMA
+    # (mirrors the decode kernel): without it the loop stalls on every tile's
+    # HBM gather. Invalid k positions get neg_large scores → exp2 ≈ 0, so the
+    # explicit per-iter p-mask is unnecessary; h-rows past H are gated by the
+    # masked final store (h_mask), so the per-iter h_mask is dropped too.
+    for k_start in tl.range(0, p_len, BLOCK_K, num_stages=NUM_STAGES):
         k_pos = k_start + k_offs
         in_range = k_pos < p_len
         slot = tl.load(
@@ -164,14 +172,13 @@ def _sparse_attn_v4_paged_prefill_kernel(
             ).to(q.dtype)
             kv = kv.to(q.dtype) * scales_full
 
-        scores = tl.dot(q, tl.trans(kv)) * softmax_scale
-        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
+        scores = tl.dot(q, tl.trans(kv)) * qk_scale
+        scores = tl.where(valid[None, :], scores, neg_large)
 
         m_block = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_block)
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(scores - m_new[:, None])
-        p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
+        alpha = tl.exp2(m_i - m_new)
+        p = tl.exp2(scores - m_new[:, None])
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
         acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
@@ -183,7 +190,7 @@ def _sparse_attn_v4_paged_prefill_kernel(
     e_end = tl.load(kv_indptr_extend_ptr + t + 1)
     e_len = e_end - e_start
 
-    for k_start in tl.range(0, e_len, BLOCK_K):
+    for k_start in tl.range(0, e_len, BLOCK_K, num_stages=NUM_STAGES):
         k_pos = k_start + k_offs
         in_range = k_pos < e_len
         slot = tl.load(
@@ -202,14 +209,13 @@ def _sparse_attn_v4_paged_prefill_kernel(
             other=0.0,
         )
 
-        scores = tl.dot(q, tl.trans(kv)) * softmax_scale
-        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
+        scores = tl.dot(q, tl.trans(kv)) * qk_scale
+        scores = tl.where(valid[None, :], scores, neg_large)
 
         m_block = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_block)
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(scores - m_new[:, None])
-        p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
+        alpha = tl.exp2(m_i - m_new)
+        p = tl.exp2(scores - m_new[:, None])
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
         acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
@@ -223,10 +229,13 @@ def _sparse_attn_v4_paged_prefill_kernel(
     # rescale BOTH l_i (for denom) AND acc (for numerator) by alpha to switch
     # to m_final frame. The sink itself adds exp(sink - m_final) to l_final
     # but contributes 0 to acc since V_sink = 0.
-    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
+    sink_raw = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(
+        tl.float32
+    )
+    sink = sink_raw * log2e
     m_final = tl.maximum(m_i, sink)
-    alpha = tl.exp(m_i - m_final)
-    l_final = l_i * alpha + tl.exp(sink - m_final)
+    alpha = tl.exp2(m_i - m_final)
+    l_final = l_i * alpha + tl.exp2(sink - m_final)
 
     denom = tl.maximum(l_final, 1.0e-30)
     out = tl.where(l_final[:, None] > 0.0, (acc * alpha[:, None]) / denom[:, None], 0.0)
@@ -311,6 +320,12 @@ def _sparse_attn_v4_paged_prefill_triton(
     # + the dequant tiles overflow gfx950 LDS at D=512. For D>=256 the bf16
     # path already picks 16, so this is a no-op for the real workload.
     block_k = 16 if (quant_kv or D >= 256) else 32
+    # SW-pipeline depth for the K loops. The grid is (T, ceil(H/block_h)); in
+    # prefill T (query tokens) already saturates the GPU, so the only headroom
+    # is hiding the scattered D=512 KV-gather latency under the MFMA — exactly
+    # what num_stages buys. 2 stages keep the next tile's gather in flight at
+    # BLOCK_K=16/D=512 without overflowing gfx950 LDS.
+    num_stages = 2
 
     # Kernel reads (kv_scales_ptr, ks_stride_n) only when QUANT_KV — supply a
     # dummy 1-element fp32 tensor on the bf16 path so the launch signature stays
@@ -348,14 +363,17 @@ def _sparse_attn_v4_paged_prefill_triton(
         out.stride(2),
         H,
         D,
-        float(softmax_scale),
+        float(softmax_scale) * LOG2E,
+        LOG2E,
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
         QUANT_KV=quant_kv,
         GROUP_SIZE=_FP8_GROUP_SIZE,
         NUM_GROUPS=num_groups_arg,
+        NUM_STAGES=num_stages,
         num_warps=8,
+        num_stages=num_stages,
     )
     return out
 
