@@ -394,9 +394,11 @@ def sparse_attn_v4_paged_prefill(
     Returns:
       out: [T, H, D] same dtype as q.
     """
-    # fp8 prefix requires in-kernel dequant, which only the Triton path
-    # implements; the OPUS fast path is bf16-only. Force Triton when fp8.
-    if _HAS_OPUS and kv_scales is None:
+    # OPUS fast path. It handles both the bf16 prefix (kv_scales is None) and the
+    # fp8 unified-KV prefix (kv_scales given → in-kernel 1xGROUP_SIZE dequant). The
+    # fp8 OPUS prefix is implemented only for the H<=32 (16mx1_16nx4) variant DSV4
+    # hits at TP8; fall back to Triton for fp8 with H>32.
+    if _HAS_OPUS and (kv_scales is None or q.shape[1] <= 32):
         # OPUS contract differs from the Triton kernel in two ways the Triton
         # path tolerates implicitly:
         #  - it requires a FULLY-contiguous q (it only asserts stride(2)==1 but
@@ -425,6 +427,7 @@ def sparse_attn_v4_paged_prefill(
             kv_indptr_extend,
             attn_sink,
             softmax_scale,
+            kv_scales=kv_scales,
         )
     return _sparse_attn_v4_paged_prefill_triton(
         q,
