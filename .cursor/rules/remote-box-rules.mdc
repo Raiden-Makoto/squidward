@@ -15,6 +15,11 @@ alwaysApply: true
 - Make code changes locally → commit → push to `origin` (GitHub)
 - The user or an explicitly authorized agent pulls on the box
 
+## Box repo layout — DO NOT get this wrong:
+- Our fork lives at `/sgl-workspace/squidward` on the box (checked out on our working branch). This is the ONLY repo our code runs from.
+- The server is ALWAYS launched with `PYTHONPATH` pointing at `/sgl-workspace/squidward/python` so it imports our branch code.
+- `/sgl-workspace/sglang` is the stock upstream repo (usually on `main`) and is the pip editable install location. We NEVER touch it and it is irrelevant — do not point at it, do not reset it, and do not infer the server is running stock code just because the editable install resolves there. PYTHONPATH overrides it.
+
 ## HEAD ordering invariant — NEVER violate:
 - **The box must NEVER be ahead of local.** Local and box must be at the same commit at minimum.
 - `local ahead of box` = OK (local has commits not yet pulled on the box).
