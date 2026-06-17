@@ -307,10 +307,10 @@ def _sparse_attn_v4_paged_prefill_triton(
 
     block_h = 16  # AMD MFMA min tile
     block_d = triton.next_power_of_2(D)
-    # fp8 is 1 byte/elem so a 32-wide K tile (~16KB at D=512) fits gfx950 LDS
-    # where bf16's 32KB overflowed; use BLOCK_K=32 on the quant path to amortize
-    # the dequant over more MFMA. bf16 path unchanged (16 for D>=256, else 32).
-    block_k = 32 if quant_kv else (16 if D >= 256 else 32)
+    # Force BLOCK_K=16 on the fp8 path (matches the decode kernel): BLOCK_K=32
+    # + the dequant tiles overflow gfx950 LDS at D=512. For D>=256 the bf16
+    # path already picks 16, so this is a no-op for the real workload.
+    block_k = 16 if (quant_kv or D >= 256) else 32
 
     # Kernel reads (kv_scales_ptr, ks_stride_n) only when QUANT_KV — supply a
     # dummy 1-element fp32 tensor on the bf16 path so the launch signature stays
@@ -355,7 +355,7 @@ def _sparse_attn_v4_paged_prefill_triton(
         QUANT_KV=quant_kv,
         GROUP_SIZE=_FP8_GROUP_SIZE,
         NUM_GROUPS=num_groups_arg,
-        num_warps=8,
+        num_warps=4,
     )
     return out
 
