@@ -146,6 +146,48 @@ def run_point(T, H, D, kv_len, n_pages, iters, warmup, do_check):
     return res
 
 
+def run_store_point(T, D, iters, warmup):
+    """Time the per-layer decode KV-store (``store_swa_into_unified``) for the
+    bf16 (plain masked copy) vs fp8 (per-token amax reduction + scale write)
+    paths at decode batch sizes. This kernel runs every layer / every step and
+    is NOT covered by the attention microbench above; at decode batch (T rows,
+    few CTAs) it is latency-bound, so its bf16->fp8 delta is a roughly fixed
+    per-layer tax on the decode step."""
+    from sglang.srt.layers.attention.dsv4.unified_kv_kernels import runtime
+
+    dev = "cuda"
+    g = torch.Generator(device=dev).manual_seed(0)
+    win = 4096
+    ring_stride = win
+    n_pages = T * ring_stride + ring_stride
+    kv = torch.randn(T, D, device=dev, dtype=torch.bfloat16, generator=g) * 0.1
+    state_slot = torch.arange(T, device=dev, dtype=torch.int32)
+    positions = torch.randint(0, ring_stride, (T,), device=dev, dtype=torch.int32, generator=g)
+
+    pool_bf16 = torch.zeros(n_pages, D, device=dev, dtype=torch.bfloat16)
+    pool_fp8 = torch.zeros(n_pages, D, device=dev, dtype=_FP8_DTYPE)
+    scales = torch.zeros(n_pages, D // _FP8_GROUP_SIZE, device=dev, dtype=torch.float32)
+
+    def f_bf16():
+        runtime.store_swa_into_unified(
+            kv=kv, state_slot=state_slot, positions=positions,
+            unified_kv=pool_bf16, win=win, ring_stride=ring_stride,
+        )
+
+    def f_fp8():
+        runtime.store_swa_into_unified(
+            kv=kv, state_slot=state_slot, positions=positions,
+            unified_kv=pool_fp8, win=win, ring_stride=ring_stride,
+            unified_kv_scales=scales,
+        )
+
+    return {
+        "T": T,
+        "bf16_us": _bench(f_bf16, iters, warmup),
+        "fp8_us": _bench(f_fp8, iters, warmup),
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--H", type=int, default=16)
@@ -154,6 +196,7 @@ def main():
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--store", action="store_true", help="bench the KV-store kernel (bf16 copy vs fp8 quant) instead of attention")
     ap.add_argument(
         "--shapes",
         type=str,
@@ -170,6 +213,21 @@ def main():
         f"_FP8_DTYPE={_FP8_DTYPE}  "
         f"arch={torch.cuda.get_device_properties(0).gcnArchName}"
     )
+
+    if args.store:
+        srows = [
+            run_store_point(T, args.D, args.iters, args.warmup)
+            for T in (1, 2, 4, 8, 16, 32, 64, 128)
+        ]
+        print(f"{'T':>6} {'bf16_us':>10} {'fp8_us':>10} {'fp8-bf16_us':>12} {'fp8/bf16':>9}")
+        for r in srows:
+            d = r["fp8_us"] - r["bf16_us"]
+            print(
+                f"{r['T']:>6} {r['bf16_us']:>10.2f} {r['fp8_us']:>10.2f} "
+                f"{d:>12.2f} {r['fp8_us']/r['bf16_us']:>9.2f}"
+            )
+        return
+
     rows = []
     if args.check:
         rows.append(run_point(8, args.H, args.D, 512, 4096, args.iters, args.warmup, True))
