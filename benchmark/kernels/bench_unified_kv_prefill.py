@@ -173,20 +173,18 @@ def run_point(T, H, D, p_len, e_len, n_pages, iters, warmup, do_check):
 
         res["opus_us"] = _bench(f_opus, iters, warmup)
 
-        # OPUS fp8: the PRODUCTION fp8 prefill path at H<=32 — dispatcher routes
-        # the fp8 unified pool (kv_scales given) into the OPUS fp8 variant, NOT
-        # Triton. This is the real bf16↔fp8 prefill tax (vs tri_fp8 which is the
-        # unused Triton fallback). H>32 has no fp8 OPUS → stays NaN.
-        if H <= 32:
-            def f_opus_fp8():
-                return sparse_attn_v4_paged_prefill(
-                    q, kv_fp8, ipre, ppre, kv_ext, iext, pext, sink, scale,
-                    kv_scales=kv_scales,
-                )
+        # OPUS fp8: the PRODUCTION fp8 prefill path — dispatcher routes the fp8
+        # unified pool (kv_scales given) into the OPUS fp8 variant, NOT Triton.
+        # This is the real bf16↔fp8 prefill tax (vs tri_fp8 which is the unused
+        # Triton fallback). For H>32 (DP attention carries all heads per rank) the
+        # dispatcher head-blocks the call into <=32-head OPUS launches.
+        def f_opus_fp8():
+            return sparse_attn_v4_paged_prefill(
+                q, kv_fp8, ipre, ppre, kv_ext, iext, pext, sink, scale,
+                kv_scales=kv_scales,
+            )
 
-            res["opus_fp8_us"] = _bench(f_opus_fp8, iters, warmup)
-        else:
-            res["opus_fp8_us"] = float("nan")
+        res["opus_fp8_us"] = _bench(f_opus_fp8, iters, warmup)
     else:
         res["opus_us"] = float("nan")
         res["opus_fp8_us"] = float("nan")
@@ -200,6 +198,14 @@ def run_point(T, H, D, p_len, e_len, n_pages, iters, warmup, do_check):
             q, dequant_fp8_1xg(kv_fp8, kv_scales), ipre, ppre, kv_ext, iext, pext, sink, scale
         )
         res["fp8_max_abs"] = (o_fp8 - ref_fp8).abs().max().item()
+        # Validate the production OPUS fp8 dispatcher path (head-blocked for
+        # H>32) against the same fp8 reference.
+        if _HAS_OPUS:
+            o_opus_fp8 = sparse_attn_v4_paged_prefill(
+                q, kv_fp8, ipre, ppre, kv_ext, iext, pext, sink, scale,
+                kv_scales=kv_scales,
+            ).float()
+            res["opus_fp8_max_abs"] = (o_opus_fp8 - ref_fp8).abs().max().item()
     return res
 
 
@@ -248,6 +254,8 @@ def main():
         )
         if "fp8_max_abs" in r:
             line += f"   bf16_err={r['bf16_max_abs']:.4e} fp8_err={r['fp8_max_abs']:.4e}"
+            if "opus_fp8_max_abs" in r:
+                line += f" opus_fp8_err={r['opus_fp8_max_abs']:.4e}"
         print(line)
 
 
