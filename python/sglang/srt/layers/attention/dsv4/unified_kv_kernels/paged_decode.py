@@ -220,6 +220,7 @@ def _paged_decode_fused_kernel(
     QUANT_KV: tl.constexpr,  # True → dequant fp8 KV via kv_scales
     GROUP_SIZE: tl.constexpr,  # scale block width along D (e.g. 64)
     NUM_GROUPS: tl.constexpr,  # D // GROUP_SIZE (constexpr; D % GROUP_SIZE == 0)
+    NUM_K_STAGES: tl.constexpr,  # SW-pipeline depth of the inner K loop
 ):
     """Single-pass online-softmax with sink folded inline — fast path for
     cases where ``kv_splits = 1`` (base grid already saturates the GPU). Skips
@@ -261,12 +262,12 @@ def _paged_decode_fused_kernel(
         # NUM_GROUPS distinct values; redundant scale loads at the same
         # address are coalesced through L1, no per-element scalar issue.
         g_idx_per_d = d_offs // GROUP_SIZE
-    # num_stages=3 on the inner K loop overrides the launch-time default
-    # (2) for this loop only. Deeper SW pipeline keeps 2 in-flight KV
-    # gathers (vs 1 with stages=2) while the current MFMA runs — better
-    # hides AMD HBM gather latency on D=512. Cost: ~1 extra KV tile
-    # (BLOCK_K*BLOCK_D*2 = 16KB at bf16) staged in regs/LDS per CTA.
-    for j in tl.range(0, num_tiles, num_stages=3):
+    # NUM_K_STAGES sets the inner K loop's SW-pipeline depth (3 for bf16, 2
+    # for fp8). Deeper pipeline keeps more in-flight KV gathers while the
+    # current MFMA runs — better hides AMD HBM gather latency on D=512. Cost:
+    # ~1 extra staged KV tile (+ fp32 scales tile when QUANT_KV) per stage in
+    # regs/LDS, which is why fp8 (with its wide fp32 scales tile) uses 2.
+    for j in tl.range(0, num_tiles, num_stages=NUM_K_STAGES):
         k_start = j * BLOCK_K
         k_pos = k_start + k_offs
         valid = k_pos < kv_len  # in_range; no sentinel check (see contract)
@@ -380,6 +381,7 @@ def _paged_decode_split_kernel(
     QUANT_KV: tl.constexpr,  # True → dequant fp8 KV via kv_scales
     GROUP_SIZE: tl.constexpr,  # scale block width along D (e.g. 64)
     NUM_GROUPS: tl.constexpr,  # D // GROUP_SIZE
+    NUM_K_STAGES: tl.constexpr,  # SW-pipeline depth of the inner K loop
 ):
     """3D split-K + exp2-softmax sparse paged-decode. Grid: (N, ceil(H/BLOCK_H), KV_SPLITS).
 
@@ -431,8 +433,8 @@ def _paged_decode_split_kernel(
     k_offs = tl.arange(0, BLOCK_K)
     if QUANT_KV:
         g_idx_per_d = d_offs // GROUP_SIZE
-    # num_stages=3 (see fused kernel comment for rationale).
-    for j in tl.range(tile_start, tile_end, num_stages=3):
+    # NUM_K_STAGES (see fused kernel comment for rationale).
+    for j in tl.range(tile_start, tile_end, num_stages=NUM_K_STAGES):
         k_start = j * BLOCK_K
         k_pos = k_start + k_offs
         valid = k_pos < kv_len  # in_range; no sentinel check (see contract)
@@ -711,16 +713,16 @@ def _sparse_attn_v4_paged_decode_triton(
     qk_scale = float(softmax_scale) * LOG2E
     _bk, num_warps, num_stages = _kernel_config(block_h)
     if block_k is None:
-        # fp8 dequant inflates per-tile ALU work ~4×; a wider K tile would
-        # amortize the per-tile dequant cost (scale load + cast + multiply)
-        # over more MFMA work, and BLOCK_K=32 was reported ~20% faster than 16
-        # on fp8 (bs=512 ctx=4096: 3000µs → 2300µs). BUT on gfx950 (MI350X,
-        # 160KB LDS) BLOCK_K=32 + the inner-loop num_stages=3 pipeline overflows
-        # shared memory at D=512 (needs 167936 B > 163840 B limit) and the
-        # kernel fails to launch (triton OutOfResources). Use BLOCK_K=16, which
-        # fits and is numerically correct; revisit a wider tile (e.g. paired
-        # with num_stages=2, or an LDS-budgeted choice) once validated at e2e.
-        block_k = 16 if quant_kv else _bk
+        # fp8 dequant inflates per-tile ALU work ~4×; a wider K tile amortizes
+        # the per-tile dequant cost (scale load + cast + multiply) over more
+        # MFMA work (BLOCK_K=32 reported ~20% faster than 16 on fp8). BLOCK_K=32
+        # + the inner-loop num_stages=3 pipeline overflowed gfx950's 160KB LDS
+        # at D=512; pairing BLOCK_K=32 with NUM_K_STAGES=2 drops a staged
+        # (KV+fp32 scales) tile to fit. Experiment: confirm this launches.
+        block_k = 32 if quant_kv else _bk
+    # Inner K-loop SW-pipeline depth: bf16 keeps 3; fp8 uses 2 to stay within
+    # LDS once BLOCK_K widens to 32 (the wide fp32 scales tile is the LDS hog).
+    num_k_stages = 2 if quant_kv else 3
 
     # Kernel reads (kv_scales_ptr, ks_stride_n) only when QUANT_KV — supply a
     # dummy 1-element fp32 tensor on the bf16 path so the launch signature
@@ -768,6 +770,7 @@ def _sparse_attn_v4_paged_decode_triton(
             QUANT_KV=quant_kv,
             GROUP_SIZE=_FP8_GROUP_SIZE,
             NUM_GROUPS=num_groups_arg,
+            NUM_K_STAGES=num_k_stages,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -821,6 +824,7 @@ def _sparse_attn_v4_paged_decode_triton(
         QUANT_KV=quant_kv,
         GROUP_SIZE=_FP8_GROUP_SIZE,
         NUM_GROUPS=num_groups_arg,
+        NUM_K_STAGES=num_k_stages,
         num_warps=num_warps,
         num_stages=num_stages,
     )
