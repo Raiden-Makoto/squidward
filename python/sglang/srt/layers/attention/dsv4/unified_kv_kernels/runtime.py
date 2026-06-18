@@ -182,11 +182,13 @@ def store_swa_into_unified(
 # ---------------------------------------------------------------------------
 @triton.jit
 def _quant_scatter_by_loc_kernel(
-    kv_ptr,  # [T, D] float (norm+rope'd)
-    loc_ptr,  # [T] int64 destination rows
+    kv_ptr,  # [T, D] float (norm+rope'd), arbitrary row/col stride
+    loc_ptr,  # [T] int32/int64 destination rows
     unified_ptr,  # [pages, D] fp8 (_FP8_DTYPE)
     scale_ptr,  # [pages, NUM_GROUPS] fp32
     n_rows,
+    kv_row_stride,
+    kv_col_stride,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
@@ -199,7 +201,9 @@ def _quant_scatter_by_loc_kernel(
     loc = tl.load(loc_ptr + row).to(tl.int64)
     offs = tl.arange(0, BLOCK_D)
     mask = offs < D
-    vals = tl.load(kv_ptr + row * D + offs, mask=mask, other=0.0)
+    vals = tl.load(
+        kv_ptr + row * kv_row_stride + offs * kv_col_stride, mask=mask, other=0.0
+    )
     # Per-token (1x512) block-scale quant: ONE scale over the whole slot (see
     # _swa_scatter_kernel for rationale). Bytes are per-token quantized; the
     # per-group scale slots are all written with this same value so prefill/OPUS
@@ -248,14 +252,21 @@ def store_quant_fp8_by_loc(
     num_groups = D // _FP8_GROUP_SIZE
     assert unified_kv_scales.shape[1] == num_groups
 
-    kv = kv.contiguous()
-    loc = loc.to(torch.int64).contiguous()
+    # The kernel reads ``kv`` with explicit row/col strides and casts ``loc`` to
+    # int64 in-kernel, so we avoid a ``.contiguous()`` copy and an int64 cast
+    # (each was a separate per-call elementwise launch on the decode hot path).
+    # ``loc`` is required contiguous (1-D dst rows); this is a no-op when it
+    # already is, so no kernel is launched.
+    if not loc.is_contiguous():
+        loc = loc.contiguous()
     _quant_scatter_by_loc_kernel[(n_rows,)](
         kv,
         loc,
         unified_kv,
         unified_kv_scales,
         n_rows,
+        kv.stride(0),
+        kv.stride(1),
         D=D,
         BLOCK_D=D,  # exact reshape requires BLOCK_D == D
         GROUP_SIZE=_FP8_GROUP_SIZE,

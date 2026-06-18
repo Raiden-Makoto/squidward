@@ -188,6 +188,45 @@ def run_store_point(T, D, iters, warmup):
     }
 
 
+def check_store_quant_strided(D=576):
+    """Prove ``store_quant_fp8_by_loc`` is byte-identical when fed a
+    non-contiguous ``kv`` + int32 ``loc`` (the decode hot-path inputs, no
+    ``.contiguous()`` / int64 cast) vs a contiguous clone + int64 loc."""
+    from sglang.srt.layers.attention.dsv4.unified_kv_kernels import runtime
+
+    dev = "cuda"
+    g = torch.Generator(device=dev).manual_seed(0)
+    T = 13
+    ng = D // _FP8_GROUP_SIZE
+    n_pages = 256
+    # Non-contiguous kv: slice a wider row-major buffer so stride(0) > D.
+    kv_big = torch.randn(T, D + 32, device=dev, dtype=torch.bfloat16, generator=g) * 0.1
+    kv_strided = kv_big[:, :D]
+    assert not kv_strided.is_contiguous()
+    loc_i32 = torch.randperm(n_pages, device=dev, generator=g)[:T].to(torch.int32)
+
+    pool_a = torch.zeros(n_pages, D, device=dev, dtype=_FP8_DTYPE)
+    sc_a = torch.zeros(n_pages, ng, device=dev, dtype=torch.float32)
+    runtime.store_quant_fp8_by_loc(
+        kv=kv_strided, loc=loc_i32, unified_kv=pool_a, unified_kv_scales=sc_a
+    )
+
+    pool_b = torch.zeros(n_pages, D, device=dev, dtype=_FP8_DTYPE)
+    sc_b = torch.zeros(n_pages, ng, device=dev, dtype=torch.float32)
+    runtime.store_quant_fp8_by_loc(
+        kv=kv_strided.contiguous(),
+        loc=loc_i32.to(torch.int64),
+        unified_kv=pool_b,
+        unified_kv_scales=sc_b,
+    )
+
+    fp8_eq = torch.equal(pool_a.view(torch.uint8), pool_b.view(torch.uint8))
+    sc_eq = torch.equal(sc_a, sc_b)
+    print(f"store_quant_strided check: fp8_bytes_eq={fp8_eq} scale_eq={sc_eq}")
+    assert fp8_eq and sc_eq, "strided/int32 path diverged from contiguous/int64"
+    print("PASS")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--H", type=int, default=16)
@@ -197,6 +236,7 @@ def main():
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--store", action="store_true", help="bench the KV-store kernel (bf16 copy vs fp8 quant) instead of attention")
+    ap.add_argument("--store-check", action="store_true", help="correctness: strided/int32 store_quant_fp8_by_loc == contiguous/int64")
     ap.add_argument(
         "--shapes",
         type=str,
@@ -213,6 +253,10 @@ def main():
         f"_FP8_DTYPE={_FP8_DTYPE}  "
         f"arch={torch.cuda.get_device_properties(0).gcnArchName}"
     )
+
+    if args.store_check:
+        check_store_quant_strided(args.D if args.D % _FP8_GROUP_SIZE == 0 else 576)
+        return
 
     if args.store:
         srows = [
