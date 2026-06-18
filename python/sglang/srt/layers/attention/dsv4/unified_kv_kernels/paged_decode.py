@@ -258,15 +258,18 @@ def _paged_decode_fused_kernel(
 
     k_offs = tl.arange(0, BLOCK_K)
     if QUANT_KV:
-        # Compile-time per-D-element group index: d_offs // GROUP_SIZE has
-        # NUM_GROUPS distinct values; redundant scale loads at the same
-        # address are coalesced through L1, no per-element scalar issue.
-        g_idx_per_d = d_offs // GROUP_SIZE
+        # Load only the NUM_GROUPS distinct 1xGROUP_SIZE block-scales per page;
+        # the ×GROUP_SIZE broadcast is deferred into the multiply (see loop) so
+        # the wide fp32 scales tile is never materialized.
+        tl.static_assert(
+            BLOCK_D == NUM_GROUPS * GROUP_SIZE,
+            "fp8 dequant reshape needs BLOCK_D == NUM_GROUPS * GROUP_SIZE",
+        )
+        g_offs = tl.arange(0, NUM_GROUPS)
     # NUM_K_STAGES sets the inner K loop's SW-pipeline depth (3 for bf16, 2
     # for fp8). Deeper pipeline keeps more in-flight KV gathers while the
     # current MFMA runs — better hides AMD HBM gather latency on D=512. Cost:
-    # ~1 extra staged KV tile (+ fp32 scales tile when QUANT_KV) per stage in
-    # regs/LDS, which is why fp8 (with its wide fp32 scales tile) uses 2.
+    # ~1 extra staged KV tile per stage in regs/LDS.
     for j in tl.range(0, num_tiles, num_stages=NUM_K_STAGES):
         k_start = j * BLOCK_K
         k_pos = k_start + k_offs
@@ -285,18 +288,20 @@ def _paged_decode_fused_kernel(
             other=0.0,
         )
         if QUANT_KV:
-            # 1xGROUP_SIZE block-scale dequant via direct broadcast load —
-            # avoids the explicit reshape + 3D intermediate that pinned
-            # too many bf16 tiles in flight at once. The masked load with
-            # d_offs // GROUP_SIZE as the column index produces a virtual
-            # [BLOCK_K, BLOCK_D] scales tile but in IR is a coalesced
-            # NUM_GROUPS-wide load per row.
-            scales_full = tl.load(
-                kv_scales_ptr + slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
-                mask=valid[:, None] & d_mask[None, :],
+            # 1xGROUP_SIZE block-scale dequant. Load only the NUM_GROUPS
+            # distinct scales per row ([BLOCK_K, NUM_GROUPS]), then broadcast
+            # over GROUP_SIZE *inside* the multiply via reshape. The wide
+            # [BLOCK_K, BLOCK_D] fp32 scales tile is never named, cutting the
+            # live fp32 footprint ~GROUP_SIZE× — this was the dominant reg/LDS
+            # pressure on the fp8 path. Row-major reshape maps column d to
+            # group d // GROUP_SIZE, matching the original per-element index.
+            scales = tl.load(
+                kv_scales_ptr + slot[:, None] * ks_stride_n + g_offs[None, :],
+                mask=valid[:, None],
                 other=0.0,
             ).to(q.dtype)
-            kv = kv_raw.to(q.dtype) * scales_full
+            kv = tl.reshape(kv_raw.to(q.dtype), (BLOCK_K, NUM_GROUPS, GROUP_SIZE))
+            kv = tl.reshape(kv * scales[:, :, None], (BLOCK_K, BLOCK_D))
         else:
             kv = kv_raw
 
@@ -432,7 +437,12 @@ def _paged_decode_split_kernel(
 
     k_offs = tl.arange(0, BLOCK_K)
     if QUANT_KV:
-        g_idx_per_d = d_offs // GROUP_SIZE
+        # See fused kernel: skinny per-group scale load, broadcast deferred.
+        tl.static_assert(
+            BLOCK_D == NUM_GROUPS * GROUP_SIZE,
+            "fp8 dequant reshape needs BLOCK_D == NUM_GROUPS * GROUP_SIZE",
+        )
+        g_offs = tl.arange(0, NUM_GROUPS)
     # NUM_K_STAGES (see fused kernel comment for rationale).
     for j in tl.range(tile_start, tile_end, num_stages=NUM_K_STAGES):
         k_start = j * BLOCK_K
@@ -452,12 +462,15 @@ def _paged_decode_split_kernel(
             other=0.0,
         )
         if QUANT_KV:
-            scales_full = tl.load(
-                kv_scales_ptr + slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
-                mask=valid[:, None] & d_mask[None, :],
+            # See fused kernel: skinny [BLOCK_K, NUM_GROUPS] scale load, defer
+            # the GROUP_SIZE broadcast to the multiply via reshape.
+            scales = tl.load(
+                kv_scales_ptr + slot[:, None] * ks_stride_n + g_offs[None, :],
+                mask=valid[:, None],
                 other=0.0,
             ).to(q.dtype)
-            kv = kv_raw.to(q.dtype) * scales_full
+            kv = tl.reshape(kv_raw.to(q.dtype), (BLOCK_K, NUM_GROUPS, GROUP_SIZE))
+            kv = tl.reshape(kv * scales[:, :, None], (BLOCK_K, BLOCK_D))
         else:
             kv = kv_raw
 
@@ -647,6 +660,7 @@ def _sparse_attn_v4_paged_decode_triton(
     block_h: int | None = None,
     kv_splits: int | None = None,
     block_k: int | None = None,
+    num_k_stages: int | None = None,
 ) -> torch.Tensor:
     """V4 sparse decode Triton implementation: split-K with FUSED fast path,
     exp2 softmax, CG-safe heuristic. ``block_h`` and ``kv_splits`` are
@@ -720,9 +734,10 @@ def _sparse_attn_v4_paged_decode_triton(
         # at D=512; pairing BLOCK_K=32 with NUM_K_STAGES=2 drops a staged
         # (KV+fp32 scales) tile to fit. Experiment: confirm this launches.
         block_k = 32 if quant_kv else _bk
-    # Inner K-loop SW-pipeline depth: bf16 keeps 3; fp8 uses 2 to stay within
-    # LDS once BLOCK_K widens to 32 (the wide fp32 scales tile is the LDS hog).
-    num_k_stages = 2 if quant_kv else 3
+    # Inner K-loop SW-pipeline depth (escape hatch for benchmarks): default
+    # bf16 keeps 3; fp8 uses 2.
+    if num_k_stages is None:
+        num_k_stages = 2 if quant_kv else 3
 
     # Kernel reads (kv_scales_ptr, ks_stride_n) only when QUANT_KV — supply a
     # dummy 1-element fp32 tensor on the bf16 path so the launch signature
