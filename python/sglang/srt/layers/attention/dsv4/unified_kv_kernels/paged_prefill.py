@@ -65,11 +65,6 @@ except ImportError:
     pa_sparse_prefill_opus = None
     _HAS_OPUS = False
 
-# Max query-head count the fp8 OPUS prefix variant (16mx1_16nx4) supports per
-# call. Larger head counts (e.g. DP attention carrying all heads per rank) are
-# served by splitting the query heads into blocks of this size.
-_OPUS_FP8_MAX_H = 32
-
 
 @triton.jit
 def _sparse_attn_v4_paged_prefill_kernel(
@@ -400,23 +395,20 @@ def sparse_attn_v4_paged_prefill(
       out: [T, H, D] same dtype as q.
     """
     # OPUS fast path. It handles both the bf16 prefix (kv_scales is None) and the
-    # fp8 unified-KV prefix (kv_scales given → in-kernel 1xGROUP_SIZE dequant). The
-    # fp8 OPUS prefix is implemented only for the H<=32 (16mx1_16nx4) variant; for
-    # larger H (DP attention does NOT TP-shard the attention heads, so each rank
-    # carries the full head count) we split the query heads into <=32-head blocks
-    # and call OPUS per block instead of falling back to the (much slower) Triton
-    # fp8 kernel. KV is shared across all query heads (MLA: a single latent KV,
-    # D=512), so the head split is numerically exact — each head's online softmax
-    # is independent.
+    # fp8 unified-KV prefix (kv_scales given → in-kernel 1xGROUP_SIZE dequant) for
+    # any head count: the aiter kernel dispatches H<=32 to the 16mx1_16nx4 variant
+    # and H>32 (DP attention carries all heads per rank) to the 16mx8_32nx1 variant
+    # — both support fp8, so a single call reads the KV prefix once.
     if _HAS_OPUS:
         # OPUS contract differs from the Triton kernel in two ways the Triton
         # path tolerates implicitly:
         #  - it requires a FULLY-contiguous q (it only asserts stride(2)==1 but
         #    indexes assuming [T,H,D] contiguous); a non-contiguous head stride
         #    silently reads wrong/out-of-bounds addresses. q from the model is
-        #    often a view, so force contiguity (done per OPUS call below).
+        #    often a view, so force contiguity.
         #  - it requires ``attn_sink.size(0) == H``; attn_sink is the full
         #    per-head Parameter, so slice to the H query heads.
+        q = q.contiguous()
         H = q.shape[1]
         if attn_sink.shape[0] != H:
             attn_sink = attn_sink[:H].contiguous()
@@ -426,32 +418,17 @@ def sparse_attn_v4_paged_prefill(
             and kv.stride(1) == 1
         ):
             kv = kv.as_strided(kv.shape, (kv.shape[1], 1))
-
-        def _opus(q_heads: torch.Tensor, sink_heads: torch.Tensor) -> torch.Tensor:
-            return pa_sparse_prefill_opus(
-                q_heads.contiguous(),
-                unified_kv,
-                kv_indices_prefix,
-                kv_indptr_prefix,
-                kv,
-                kv_indices_extend,
-                kv_indptr_extend,
-                sink_heads.contiguous(),
-                softmax_scale,
-                kv_scales=kv_scales,
-            )
-
-        if kv_scales is None or H <= _OPUS_FP8_MAX_H:
-            return _opus(q, attn_sink)
-        return torch.cat(
-            [
-                _opus(
-                    q[:, h0 : h0 + _OPUS_FP8_MAX_H, :],
-                    attn_sink[h0 : h0 + _OPUS_FP8_MAX_H],
-                )
-                for h0 in range(0, H, _OPUS_FP8_MAX_H)
-            ],
-            dim=1,
+        return pa_sparse_prefill_opus(
+            q,
+            unified_kv,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            softmax_scale,
+            kv_scales=kv_scales,
         )
     return _sparse_attn_v4_paged_prefill_triton(
         q,

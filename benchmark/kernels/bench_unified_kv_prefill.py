@@ -176,8 +176,8 @@ def run_point(T, H, D, p_len, e_len, n_pages, iters, warmup, do_check):
         # OPUS fp8: the PRODUCTION fp8 prefill path — dispatcher routes the fp8
         # unified pool (kv_scales given) into the OPUS fp8 variant, NOT Triton.
         # This is the real bf16↔fp8 prefill tax (vs tri_fp8 which is the unused
-        # Triton fallback). For H>32 (DP attention carries all heads per rank) the
-        # dispatcher head-blocks the call into <=32-head OPUS launches.
+        # Triton fallback). Both head counts are supported in one call: H<=32 ->
+        # 16mx1_16nx4, H>32 (DP attention) -> 16mx8_32nx1.
         def f_opus_fp8():
             return sparse_attn_v4_paged_prefill(
                 q, kv_fp8, ipre, ppre, kv_ext, iext, pext, sink, scale,
