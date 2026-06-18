@@ -32,7 +32,9 @@ echo "OUT_DIR=${OUT_DIR}"
 [ "${ENABLE_PROFILE}" -eq 1 ] && echo "PROFILER_DIR=${SGLANG_TORCH_PROFILER_DIR}"
 
 echo "TP,DP must be 8,1. Check the server startup flags."
-for concurrency in 2 4 8 16 
+# c=2 is run twice: the first pass warms JIT/caches/autotune so the recorded
+# c-2 log (overwritten by the second pass) reflects steady-state, not cold start.
+for concurrency in 2 2 4 8 16
 do
     prompt=$((concurrency * 4))
 
