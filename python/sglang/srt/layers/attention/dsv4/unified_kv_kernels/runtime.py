@@ -181,12 +181,15 @@ def _quant_scatter_by_loc_kernel(
     loc_ptr,  # [T] int64 destination rows
     unified_ptr,  # [pages, D] fp8 (_FP8_DTYPE)
     scale_ptr,  # [pages, NUM_GROUPS] fp32
+    seq_lens_ptr,  # [T] int32, only read when MASK_NONBOUNDARY
     n_rows,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    MASK_NONBOUNDARY: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
 ):
     row = tl.program_id(0)
     if row >= n_rows:
@@ -195,6 +198,14 @@ def _quant_scatter_by_loc_kernel(
     offs = tl.arange(0, BLOCK_D)
     mask = offs < D
     vals = tl.load(kv_ptr + row * D + offs, mask=mask, other=0.0)
+    if MASK_NONBOUNDARY:
+        # Decode: non-boundary tokens (seq_len % ratio != 0) must store zeros to
+        # their (sink) loc, matching the old Python torch.where(is_boundary, kv,
+        # zeros). Zeroing vals here makes amax=0 -> scale=EPS/FP8_MAX, fp8=0, i.e.
+        # byte-identical to feeding a pre-zeroed row through this same kernel.
+        seq_len = tl.load(seq_lens_ptr + row)
+        is_boundary = (seq_len % COMPRESS_RATIO) == 0
+        vals = tl.where(is_boundary, vals, 0.0)
     # BLOCK_D == D so the reshape is exact (no padded lanes).
     EPS: tl.constexpr = 1e-10
     vals_g = tl.reshape(vals.to(tl.float32), (NUM_GROUPS, GROUP_SIZE))
@@ -214,6 +225,8 @@ def store_quant_fp8_by_loc(
     loc: torch.Tensor,  # [T] int destination rows in the unified pool
     unified_kv: torch.Tensor,  # [pages, D] fp8 (_FP8_DTYPE)
     unified_kv_scales: torch.Tensor,  # [pages, D // 64] fp32
+    seq_lens: Optional[torch.Tensor] = None,  # [T] int, decode boundary masking
+    compress_ratio: int = 0,
 ) -> None:
     """HIP-safe 1x64 block-scale fp8 quant + scatter to explicit pool rows.
 
@@ -222,6 +235,11 @@ def store_quant_fp8_by_loc(
     ``scale_g = amax(|group_g|)/fp8_max``, ``fp8 = clamp(elem / scale_g)``.
     Used by the decode store (path 1) and compressed-K store (path 3) so all
     three paths emit byte-identical layout without any CUDA-only symbol.
+
+    When ``seq_lens`` is given (decode compressed-K store), non-boundary tokens
+    (``seq_len % compress_ratio != 0``) are zeroed in-kernel instead of via a
+    Python ``torch.where`` + ``zeros_like`` pair, saving two per-layer launches
+    while producing byte-identical fp8/scale output.
     """
     n_rows, D = kv.shape
     if n_rows == 0:
@@ -238,6 +256,13 @@ def store_quant_fp8_by_loc(
     num_groups = D // _FP8_GROUP_SIZE
     assert unified_kv_scales.shape[1] == num_groups
 
+    mask_nonboundary = seq_lens is not None
+    if mask_nonboundary:
+        assert compress_ratio > 0
+        seq_lens_arg = seq_lens.to(torch.int32).contiguous()
+    else:
+        seq_lens_arg = loc  # unused dummy ptr
+
     kv = kv.contiguous()
     loc = loc.to(torch.int64).contiguous()
     _quant_scatter_by_loc_kernel[(n_rows,)](
@@ -245,12 +270,15 @@ def store_quant_fp8_by_loc(
         loc,
         unified_kv,
         unified_kv_scales,
+        seq_lens_arg,
         n_rows,
         D=D,
         BLOCK_D=D,  # exact reshape requires BLOCK_D == D
         GROUP_SIZE=_FP8_GROUP_SIZE,
         NUM_GROUPS=num_groups,
         FP8_MAX=fp8_max,
+        MASK_NONBOUNDARY=mask_nonboundary,
+        COMPRESS_RATIO=compress_ratio,
         num_warps=8,
     )
 

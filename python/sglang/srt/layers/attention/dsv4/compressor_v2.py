@@ -519,14 +519,17 @@ class CompressorBackendMixin:
         if kv_compressed.shape[0] == 0:
             return
 
-        # Decode: zero non-boundary tokens so they don't corrupt loc 0.
+        # Decode: non-boundary tokens (seq_len % ratio != 0) must not corrupt
+        # loc 0. The old path zeroed their data here via a torch.where +
+        # zeros_like (two per-layer launches) before norm+rope. We now defer
+        # the zeroing into the quant-scatter kernel (store_quant_fp8_by_loc with
+        # seq_lens), which is byte-identical: those rows still emit fp8 zeros at
+        # their sink loc. norm+rope on the un-zeroed rows is harmless since their
+        # output is discarded by the in-kernel mask.
+        seq_lens_for_mask = None
         if plan.is_decode:
             plan_raw = plan[1].view(torch.int32)
-            seq_lens_plan = plan_raw[:, 0].to(torch.int32)
-            is_boundary = (seq_lens_plan % compress_ratio == 0).unsqueeze(-1)
-            kv_compressed = torch.where(
-                is_boundary, kv_compressed, torch.zeros_like(kv_compressed)
-            )
+            seq_lens_for_mask = plan_raw[:, 0].to(torch.int32)
 
         # Step 2: norm + rope (Triton fallback, precision parity with the JIT).
         positions = _extract_positions_from_plan(plan, compress_ratio)
@@ -562,6 +565,8 @@ class CompressorBackendMixin:
             loc=out_loc_to_store,
             unified_kv=kv_buffer,
             unified_kv_scales=kv_scale_buffer,
+            seq_lens=seq_lens_for_mask,
+            compress_ratio=compress_ratio,
         )
 
     def forward_unified(
