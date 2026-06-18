@@ -487,14 +487,26 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
     }
     const auto x = cast<float>(cast<bf16_t>(d[0]));
     const auto y = cast<float>(cast<bf16_t>(d[1]));
-    const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
-    const auto scale = fmaxf(1e-10f, abs_max) / math::FP8_E4M3_MAX;
+    // Per-token (1x512) scale: reduce abs_max across ALL kNumWarps groups so the
+    // whole slot shares ONE fp8 scale. The stored bytes are then per-token
+    // quantized, which lets the decode kernel apply a single scalar scale that
+    // factors out of the fp8 MFMA dot (no per-group dequant). Every per-group
+    // scale slot is written with this same per-token value, so prefill/OPUS --
+    // which read the [num_slots, kNumWarps] 1x64 layout unchanged -- still dequant
+    // correctly (each group scale == the token scale). Cross-warp reduce mirrors
+    // the norm partial-sum pattern above.
+    const auto warp_abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
+    __shared__ float warp_amax[kNumWarps];
+    if (lane_id == 0) warp_amax[warp_id] = warp_abs_max;
+    __syncthreads();
+    const auto token_abs_max = warp::reduce_max<kNumWarps>(warp_amax[lane_id % kNumWarps]);
+    const auto scale = fmaxf(1e-10f, token_abs_max) / math::FP8_E4M3_MAX;
     const auto inv_scale = 1.0f / scale;
     const auto qx = fminf(fmaxf(x * inv_scale, -math::FP8_E4M3_MAX), math::FP8_E4M3_MAX);
     const auto qy = fminf(fmaxf(y * inv_scale, -math::FP8_E4M3_MAX), math::FP8_E4M3_MAX);
     reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = pack_fp8(qx, qy);
-    // Parallel scale buffer is [num_slots, kNumWarps] fp32, page_size==1 so the
-    // slot row == out_loc. One scale per warp/group; lane 0 publishes.
+    // Publish the per-token scale into this warp's group slot. All kNumWarps slots
+    // end up equal (== the per-token scale); decode reads slot [,0], prefill all.
     if (lane_id == 0) params.scale_out[out_loc * kNumWarps + warp_id] = scale;
   } else if constexpr (kBf16Store) {
     Float2 d = data;

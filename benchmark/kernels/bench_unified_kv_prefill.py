@@ -172,8 +172,24 @@ def run_point(T, H, D, p_len, e_len, n_pages, iters, warmup, do_check):
             )
 
         res["opus_us"] = _bench(f_opus, iters, warmup)
+
+        # OPUS fp8: the PRODUCTION fp8 prefill path at H<=32 — dispatcher routes
+        # the fp8 unified pool (kv_scales given) into the OPUS fp8 variant, NOT
+        # Triton. This is the real bf16↔fp8 prefill tax (vs tri_fp8 which is the
+        # unused Triton fallback). H>32 has no fp8 OPUS → stays NaN.
+        if H <= 32:
+            def f_opus_fp8():
+                return sparse_attn_v4_paged_prefill(
+                    q, kv_fp8, ipre, ppre, kv_ext, iext, pext, sink, scale,
+                    kv_scales=kv_scales,
+                )
+
+            res["opus_fp8_us"] = _bench(f_opus_fp8, iters, warmup)
+        else:
+            res["opus_fp8_us"] = float("nan")
     else:
         res["opus_us"] = float("nan")
+        res["opus_fp8_us"] = float("nan")
 
     if do_check:
         ref = ref_prefill(q, kv_pool, ipre, ppre, kv_ext, iext, pext, sink, scale)
@@ -213,15 +229,22 @@ def main():
             run_point(T, args.H, args.D, p_len, e_len, args.n_pages, args.iters, args.warmup, args.check)
         )
 
-    hdr = f"{'T':>6} {'p_len':>6} {'e_len':>5} {'opus_us':>10} {'tri_bf16_us':>12} {'tri_fp8_us':>11} {'fp8/opus':>9} {'fp8/tri':>8}"
+    hdr = (
+        f"{'T':>6} {'p_len':>6} {'e_len':>5} {'opus_bf16':>10} {'opus_fp8':>10} "
+        f"{'ofp8/obf16':>10} {'tri_bf16':>10} {'tri_fp8':>10} {'tfp8/obf16':>10}"
+    )
     print(hdr)
     for r in rows:
-        ratio_opus = r["tri_fp8_us"] / r["opus_us"] if r["opus_us"] == r["opus_us"] else float("nan")
-        ratio_tri = r["tri_fp8_us"] / r["tri_bf16_us"]
+        def _safe_ratio(num, den):
+            return num / den if den == den and den != 0 else float("nan")
+
+        r_opus_fp8 = _safe_ratio(r.get("opus_fp8_us", float("nan")), r["opus_us"])
+        r_tri_fp8 = _safe_ratio(r["tri_fp8_us"], r["opus_us"])
         line = (
             f"{r['T']:>6} {r['p_len']:>6} {r['e_len']:>5} "
-            f"{r['opus_us']:>10.1f} {r['tri_bf16_us']:>12.1f} {r['tri_fp8_us']:>11.1f} "
-            f"{ratio_opus:>9.2f} {ratio_tri:>8.2f}"
+            f"{r['opus_us']:>10.1f} {r.get('opus_fp8_us', float('nan')):>10.1f} "
+            f"{r_opus_fp8:>10.2f} {r['tri_bf16_us']:>10.1f} {r['tri_fp8_us']:>10.1f} "
+            f"{r_tri_fp8:>10.2f}"
         )
         if "fp8_max_abs" in r:
             line += f"   bf16_err={r['bf16_max_abs']:.4e} fp8_err={r['fp8_max_abs']:.4e}"

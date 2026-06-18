@@ -52,6 +52,7 @@ the captured launch sequence.
 from __future__ import annotations
 
 import functools
+import os
 
 import torch
 import triton
@@ -76,6 +77,12 @@ _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
 # per slot, 4 bytes each → +6.25% storage on top of the fp8 pool (vs the
 # halving from bf16→fp8 = 2× saving — net ~46% read bandwidth reduction).
 _FP8_GROUP_SIZE = 64
+
+# fp8 decode path: native fp8-MFMA (per-token 1xD scale) vs the legacy bf16
+# dequant-materialize path. Default on. The store kernels write a per-token
+# scale replicated across all NUM_GROUPS scale columns, so the legacy dequant
+# path stays bit-correct when this is disabled (each group scale == token scale).
+_DECODE_FP8_MFMA = os.environ.get("SGLANG_DSV4_DECODE_FP8_MFMA", "1") == "1"
 
 
 @functools.lru_cache(maxsize=1)
@@ -645,6 +652,256 @@ def _paged_decode_reduce_kernel(
 
 
 # ---------------------------------------------------------------------------
+# FP8 native-MFMA decode (per-token 1xD scale).
+#
+# The fp8 dequant path above materializes a bf16 KV tile (cast + per-group scale
+# multiply) to feed a bf16 MFMA — VALU-bound, ~2-4x slower than bf16 at decode
+# shapes. These kernels instead feed fp8 DIRECTLY to tl.dot (native fp8 MFMA, 2x
+# throughput, no bf16 materialize). q is quantized per-row to fp8 once; p is
+# quantized per-row to fp8 each tile. The KV cache is per-TOKEN quantized (one
+# scale per slot, replicated across the NUM_GROUPS scale columns by the store
+# kernels), so the scale is a scalar per slot that factors out of the dot:
+#   QK:  scores[h,k] = q_scale[h] * kv_scale[k] * dot(q_fp8, kv_fp8)[h,k]
+#   PV:  acc[h,:]    = sum_k (p[h,k]*kv_scale[k]) * kv_fp8[k,:]
+# kv_scale[k] is read from scale column 0 (all columns are equal). Measured
+# ~0.79-0.92x bf16 (vs ~2.4-3.8x for the dequant path) across decode shapes.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _paged_decode_fp8mfma_fused_kernel(
+    q_ptr,  # [N, H, D]
+    unified_kv_ptr,  # [total_pages, D] fp8 (_FP8_DTYPE)
+    kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 (per-token: all cols equal)
+    kv_indices_ptr,  # [total_indices] int32
+    kv_indptr_ptr,  # [N+1] int32
+    attn_sink_ptr,  # [H]
+    out_ptr,  # [N, H, D]
+    q_stride_t,
+    q_stride_h,
+    q_stride_d,
+    kv_stride_n,
+    kv_stride_d,
+    ks_stride_n,  # row stride of kv_scales (read column 0 == per-token scale)
+    out_stride_t,
+    out_stride_h,
+    out_stride_d,
+    qk_scale,  # = softmax_scale * LOG2E
+    log2e,  # = LOG2E
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    FP8_MAX: tl.constexpr,  # arch fp8 e4m3 max (448 fn / 240 fnuz)
+    NUM_K_STAGES: tl.constexpr,
+):
+    """Single-pass per-token fp8-MFMA decode (kv_splits == 1 fast path)."""
+    t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    d_offs = tl.arange(0, BLOCK_D)
+    h_mask = h_offs < H
+    d_mask = d_offs < D
+
+    q = tl.load(
+        q_ptr
+        + t * q_stride_t
+        + h_offs[:, None] * q_stride_h
+        + d_offs[None, :] * q_stride_d,
+        mask=h_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+    # Per-row q quant to fp8 (loop-invariant). Scale folded back post-dot.
+    sq = tl.max(tl.abs(q), axis=1) / FP8_MAX + 1e-20
+    qf = (q / sq[:, None]).to(unified_kv_ptr.dtype.element_ty)
+
+    kv_start = tl.load(kv_indptr_ptr + t)
+    kv_end = tl.load(kv_indptr_ptr + t + 1)
+    kv_len = kv_end - kv_start
+    num_tiles = tl.cdiv(kv_len, BLOCK_K)
+
+    neg = -3.4028234663852886e38
+    m_i = tl.full((BLOCK_H,), neg, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
+
+    k_offs = tl.arange(0, BLOCK_K)
+    for j in tl.range(0, num_tiles, num_stages=NUM_K_STAGES):
+        k_pos = j * BLOCK_K + k_offs
+        valid = k_pos < kv_len
+        slot = tl.load(kv_indices_ptr + kv_start + k_pos, mask=valid, other=0)
+        kv = tl.load(
+            unified_kv_ptr
+            + slot[:, None] * kv_stride_n
+            + d_offs[None, :] * kv_stride_d,
+            mask=valid[:, None] & d_mask[None, :],
+            other=0.0,
+        )  # [BLOCK_K, D] fp8
+        skv = tl.load(kv_scales_ptr + slot * ks_stride_n, mask=valid, other=0.0)
+
+        # QK: single full-D fp8 dot; per-token scales factor out post-dot.
+        raw = tl.dot(qf, tl.trans(kv))
+        scores = raw * sq[:, None] * skv[None, :] * qk_scale
+        scores = tl.where(valid[None, :], scores, neg)
+
+        m_block = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_block)
+        alpha = tl.exp2(m_i - m_new)
+        p = tl.exp2(scores - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+
+        # PV: fold per-token kv scale into p, one fp8 quant, one full-D dot.
+        pp = p * skv[None, :]
+        sp = tl.max(tl.abs(pp), axis=1) / FP8_MAX + 1e-20
+        ppf = (pp / sp[:, None]).to(unified_kv_ptr.dtype.element_ty)
+        acc = acc * alpha[:, None] + tl.dot(ppf, kv) * sp[:, None]
+        m_i = m_new
+
+    sink_raw = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg).to(tl.float32)
+    sink = sink_raw * log2e
+    m_final = tl.maximum(m_i, sink)
+    alpha_kv = tl.exp2(m_i - m_final)
+    alpha_sink = tl.exp2(sink - m_final)
+    l_final = l_i * alpha_kv + alpha_sink
+    denom = tl.maximum(l_final, 1.0e-30)
+    out = tl.where(
+        l_final[:, None] > 0.0, (acc * alpha_kv[:, None]) / denom[:, None], 0.0
+    )
+    tl.store(
+        out_ptr
+        + t * out_stride_t
+        + h_offs[:, None] * out_stride_h
+        + d_offs[None, :] * out_stride_d,
+        out.to(out_ptr.dtype.element_ty),
+        mask=h_mask[:, None] & d_mask[None, :],
+    )
+
+
+@triton.jit
+def _paged_decode_fp8mfma_split_kernel(
+    q_ptr,  # [N, H, D]
+    unified_kv_ptr,  # [total_pages, D] fp8
+    kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 (per-token: all cols equal)
+    kv_indices_ptr,  # [total_indices] int32
+    kv_indptr_ptr,  # [N+1] int32
+    m_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
+    l_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
+    acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32
+    q_stride_t,
+    q_stride_h,
+    q_stride_d,
+    kv_stride_n,
+    kv_stride_d,
+    ks_stride_n,
+    mp_stride_t,
+    mp_stride_k,
+    mp_stride_h,
+    lp_stride_t,
+    lp_stride_k,
+    lp_stride_h,
+    ap_stride_t,
+    ap_stride_k,
+    ap_stride_h,
+    ap_stride_d,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+    qk_scale,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    NUM_K_STAGES: tl.constexpr,
+):
+    """Split-K per-token fp8-MFMA decode. Grid: (N, ceil(H/BLOCK_H), KV_SPLITS).
+
+    Mirrors ``_paged_decode_split_kernel`` control flow (tiles_per_segment
+    early-return + pre-sink (m, l, acc) fp32 partials); the existing reduce
+    kernel folds the sink and combines splits.
+    """
+    t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    d_offs = tl.arange(0, BLOCK_D)
+    h_mask = h_offs < H
+    d_mask = d_offs < D
+
+    q = tl.load(
+        q_ptr
+        + t * q_stride_t
+        + h_offs[:, None] * q_stride_h
+        + d_offs[None, :] * q_stride_d,
+        mask=h_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+    sq = tl.max(tl.abs(q), axis=1) / FP8_MAX + 1e-20
+    qf = (q / sq[:, None]).to(unified_kv_ptr.dtype.element_ty)
+
+    kv_start = tl.load(kv_indptr_ptr + t)
+    kv_end = tl.load(kv_indptr_ptr + t + 1)
+    kv_len = kv_end - kv_start
+
+    tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
+    if pid_k * tiles_per_segment * BLOCK_K >= kv_len:
+        return
+    num_tiles = tl.cdiv(kv_len, BLOCK_K)
+    tile_start = pid_k * tiles_per_segment
+    tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
+
+    neg = -3.4028234663852886e38
+    m_i = tl.full((BLOCK_H,), neg, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
+
+    k_offs = tl.arange(0, BLOCK_K)
+    for j in tl.range(tile_start, tile_end, num_stages=NUM_K_STAGES):
+        k_pos = j * BLOCK_K + k_offs
+        valid = k_pos < kv_len
+        slot = tl.load(kv_indices_ptr + kv_start + k_pos, mask=valid, other=0)
+        kv = tl.load(
+            unified_kv_ptr
+            + slot[:, None] * kv_stride_n
+            + d_offs[None, :] * kv_stride_d,
+            mask=valid[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        skv = tl.load(kv_scales_ptr + slot * ks_stride_n, mask=valid, other=0.0)
+
+        raw = tl.dot(qf, tl.trans(kv))
+        scores = raw * sq[:, None] * skv[None, :] * qk_scale
+        scores = tl.where(valid[None, :], scores, neg)
+
+        m_block = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_block)
+        alpha = tl.exp2(m_i - m_new)
+        p = tl.exp2(scores - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+
+        pp = p * skv[None, :]
+        sp = tl.max(tl.abs(pp), axis=1) / FP8_MAX + 1e-20
+        ppf = (pp / sp[:, None]).to(unified_kv_ptr.dtype.element_ty)
+        acc = acc * alpha[:, None] + tl.dot(ppf, kv) * sp[:, None]
+        m_i = m_new
+
+    m_base = t * mp_stride_t + pid_k * mp_stride_k
+    tl.store(m_partial_ptr + m_base + h_offs * mp_stride_h, m_i, mask=h_mask)
+    l_base = t * lp_stride_t + pid_k * lp_stride_k
+    tl.store(l_partial_ptr + l_base + h_offs * lp_stride_h, l_i, mask=h_mask)
+    a_base = t * ap_stride_t + pid_k * ap_stride_k
+    tl.store(
+        acc_partial_ptr
+        + a_base
+        + h_offs[:, None] * ap_stride_h
+        + d_offs[None, :] * ap_stride_d,
+        acc,
+        mask=h_mask[:, None] & d_mask[None, :],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Wrapper.
 # ---------------------------------------------------------------------------
 
@@ -739,6 +996,11 @@ def _sparse_attn_v4_paged_decode_triton(
     if num_k_stages is None:
         num_k_stages = 2 if quant_kv else 3
 
+    # Native fp8-MFMA decode (per-token 1xD scale): feeds fp8 directly to tl.dot
+    # instead of materializing a bf16 KV tile. Gated on the fp8 pool + env flag.
+    use_fp8_mfma = quant_kv and _DECODE_FP8_MFMA
+    fp8_max_val = float(torch.finfo(_FP8_DTYPE).max)
+
     # Kernel reads (kv_scales_ptr, ks_stride_n) only when QUANT_KV — supply a
     # dummy 1-element fp32 tensor on the bf16 path so the launch signature
     # stays uniform (avoids a separate JIT specialization per call).
@@ -758,6 +1020,37 @@ def _sparse_attn_v4_paged_decode_triton(
     # skipping the partial-buffer alloc and the second kernel launch.
     if kv_splits == 1:
         grid_fused = (T, n_head_blocks)
+        if use_fp8_mfma:
+            _paged_decode_fp8mfma_fused_kernel[grid_fused](
+                q,
+                unified_kv,
+                kv_scales_arg,
+                kv_indices,
+                kv_indptr,
+                attn_sink,
+                out,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                unified_kv.stride(0),
+                unified_kv.stride(1),
+                ks_stride_n_arg,
+                out.stride(0),
+                out.stride(1),
+                out.stride(2),
+                qk_scale,
+                LOG2E,
+                H,
+                D,
+                BLOCK_H=block_h,
+                BLOCK_D=block_d,
+                BLOCK_K=block_k,
+                FP8_MAX=fp8_max_val,
+                NUM_K_STAGES=num_k_stages,
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
+            return out
         _paged_decode_fused_kernel[grid_fused](
             q,
             unified_kv,
@@ -804,45 +1097,84 @@ def _sparse_attn_v4_paged_decode_triton(
     )
 
     grid_split = (T, n_head_blocks, kv_splits)
-    _paged_decode_split_kernel[grid_split](
-        q,
-        unified_kv,
-        kv_scales_arg,
-        kv_indices,
-        kv_indptr,
-        m_partial,
-        l_partial,
-        acc_partial,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        unified_kv.stride(0),
-        unified_kv.stride(1),
-        ks_stride_n_arg,
-        m_partial.stride(0),
-        m_partial.stride(1),
-        m_partial.stride(2),
-        l_partial.stride(0),
-        l_partial.stride(1),
-        l_partial.stride(2),
-        acc_partial.stride(0),
-        acc_partial.stride(1),
-        acc_partial.stride(2),
-        acc_partial.stride(3),
-        H,
-        D,
-        kv_splits,
-        qk_scale,
-        BLOCK_H=block_h,
-        BLOCK_D=block_d,
-        BLOCK_K=block_k,
-        QUANT_KV=quant_kv,
-        GROUP_SIZE=_FP8_GROUP_SIZE,
-        NUM_GROUPS=num_groups_arg,
-        NUM_K_STAGES=num_k_stages,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
+    if use_fp8_mfma:
+        _paged_decode_fp8mfma_split_kernel[grid_split](
+            q,
+            unified_kv,
+            kv_scales_arg,
+            kv_indices,
+            kv_indptr,
+            m_partial,
+            l_partial,
+            acc_partial,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            unified_kv.stride(0),
+            unified_kv.stride(1),
+            ks_stride_n_arg,
+            m_partial.stride(0),
+            m_partial.stride(1),
+            m_partial.stride(2),
+            l_partial.stride(0),
+            l_partial.stride(1),
+            l_partial.stride(2),
+            acc_partial.stride(0),
+            acc_partial.stride(1),
+            acc_partial.stride(2),
+            acc_partial.stride(3),
+            H,
+            D,
+            kv_splits,
+            qk_scale,
+            BLOCK_H=block_h,
+            BLOCK_D=block_d,
+            BLOCK_K=block_k,
+            FP8_MAX=fp8_max_val,
+            NUM_K_STAGES=num_k_stages,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+    else:
+        _paged_decode_split_kernel[grid_split](
+            q,
+            unified_kv,
+            kv_scales_arg,
+            kv_indices,
+            kv_indptr,
+            m_partial,
+            l_partial,
+            acc_partial,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            unified_kv.stride(0),
+            unified_kv.stride(1),
+            ks_stride_n_arg,
+            m_partial.stride(0),
+            m_partial.stride(1),
+            m_partial.stride(2),
+            l_partial.stride(0),
+            l_partial.stride(1),
+            l_partial.stride(2),
+            acc_partial.stride(0),
+            acc_partial.stride(1),
+            acc_partial.stride(2),
+            acc_partial.stride(3),
+            H,
+            D,
+            kv_splits,
+            qk_scale,
+            BLOCK_H=block_h,
+            BLOCK_D=block_d,
+            BLOCK_K=block_k,
+            QUANT_KV=quant_kv,
+            GROUP_SIZE=_FP8_GROUP_SIZE,
+            NUM_GROUPS=num_groups_arg,
+            NUM_K_STAGES=num_k_stages,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
 
     # 2D-tile reduce: grid = (T, H, ceil(D/D_CHUNK)). One CTA per
     # (token, single-head, D-chunk). Adaptive D_CHUNK based on whether the

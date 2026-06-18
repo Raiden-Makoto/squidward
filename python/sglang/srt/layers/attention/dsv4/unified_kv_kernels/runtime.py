@@ -78,20 +78,25 @@ def _swa_scatter_kernel(
     mask = offs < D
     vals = tl.load(kv_ptr + row * D + offs, mask=mask, other=0.0)
     if QUANT:
-        # 1xGROUP_SIZE block-scale quant: scale_g = amax(|group_g|) / FP8_MAX,
-        # fp8 = clamp(elem / scale_g). Matches sglang_per_token_group_quant_fp8
-        # and the kernel-side dequant (fp8 * scale). BLOCK_D == D here so the
-        # reshape is exact (no padded lanes).
+        # Per-token (1x512) block-scale quant: ONE scale = amax(|whole slot|) /
+        # FP8_MAX, fp8 = clamp(elem / scale). The stored bytes are per-token
+        # quantized so the decode kernel can apply a single scalar scale that
+        # factors out of the fp8 MFMA dot. The per-group scale slots are all
+        # written with this same per-token value, so prefill/OPUS (which read the
+        # [pages, NUM_GROUPS] 1x64 layout + dequant = fp8 * scale[group]) stay
+        # correct (each group scale == the token scale). BLOCK_D == D here.
         EPS: tl.constexpr = 1e-10
-        vals_g = tl.reshape(vals.to(tl.float32), (NUM_GROUPS, GROUP_SIZE))
-        amax = tl.max(tl.abs(vals_g), axis=1)
-        scale = tl.maximum(amax, EPS) / FP8_MAX
-        q = vals_g / scale[:, None]
-        q = tl.clamp(q, -FP8_MAX, FP8_MAX)
-        q = tl.reshape(q, (BLOCK_D,)).to(unified_ptr.dtype.element_ty)
+        valsf = vals.to(tl.float32)
+        token_amax = tl.max(tl.where(mask, tl.abs(valsf), 0.0))
+        scale = tl.maximum(token_amax, EPS) / FP8_MAX
+        q = tl.clamp(valsf / scale, -FP8_MAX, FP8_MAX)
+        q = q.to(unified_ptr.dtype.element_ty)
         tl.store(unified_ptr + loc * D + offs, q, mask=mask)
         g_offs = tl.arange(0, NUM_GROUPS)
-        tl.store(scale_ptr + loc * NUM_GROUPS + g_offs, scale)
+        tl.store(
+            scale_ptr + loc * NUM_GROUPS + g_offs,
+            tl.zeros((NUM_GROUPS,), tl.float32) + scale,
+        )
     else:
         tl.store(unified_ptr + loc * D + offs, vals, mask=mask)
 
@@ -195,17 +200,22 @@ def _quant_scatter_by_loc_kernel(
     offs = tl.arange(0, BLOCK_D)
     mask = offs < D
     vals = tl.load(kv_ptr + row * D + offs, mask=mask, other=0.0)
-    # BLOCK_D == D so the reshape is exact (no padded lanes).
+    # Per-token (1x512) block-scale quant: ONE scale over the whole slot (see
+    # _swa_scatter_kernel for rationale). Bytes are per-token quantized; the
+    # per-group scale slots are all written with this same value so prefill/OPUS
+    # (1x64 dequant) stay correct. BLOCK_D == D here.
     EPS: tl.constexpr = 1e-10
-    vals_g = tl.reshape(vals.to(tl.float32), (NUM_GROUPS, GROUP_SIZE))
-    amax = tl.max(tl.abs(vals_g), axis=1)
-    scale = tl.maximum(amax, EPS) / FP8_MAX
-    q = vals_g / scale[:, None]
-    q = tl.clamp(q, -FP8_MAX, FP8_MAX)
-    q = tl.reshape(q, (BLOCK_D,)).to(unified_ptr.dtype.element_ty)
+    valsf = vals.to(tl.float32)
+    token_amax = tl.max(tl.where(mask, tl.abs(valsf), 0.0))
+    scale = tl.maximum(token_amax, EPS) / FP8_MAX
+    q = tl.clamp(valsf / scale, -FP8_MAX, FP8_MAX)
+    q = q.to(unified_ptr.dtype.element_ty)
     tl.store(unified_ptr + loc * D + offs, q, mask=mask)
     g_offs = tl.arange(0, NUM_GROUPS)
-    tl.store(scale_ptr + loc * NUM_GROUPS + g_offs, scale)
+    tl.store(
+        scale_ptr + loc * NUM_GROUPS + g_offs,
+        tl.zeros((NUM_GROUPS,), tl.float32) + scale,
+    )
 
 
 def store_quant_fp8_by_loc(
