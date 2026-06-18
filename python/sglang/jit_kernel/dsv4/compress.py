@@ -24,15 +24,29 @@ def _jit_compress_norm_rope_module(
     rope_dim: int,
     page_size: int,
     bf16_store: bool = False,
+    unified_fp8_store: bool = False,
 ) -> Module:
+    assert not (bf16_store and unified_fp8_store)
     args = make_cpp_args(
-        dtype, head_dim, rope_dim, page_size, is_arch_support_pdl(), bf16_store
+        dtype,
+        head_dim,
+        rope_dim,
+        page_size,
+        is_arch_support_pdl(),
+        bf16_store,
+        unified_fp8_store,
     )
-    cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
-    if head_dim == 128:
-        cuda_wrappers.append(
-            ("forward_fp4", f"FusedNormRopeKernel<{args}>::forward_fp4")
-        )
+    if unified_fp8_store:
+        # head_dim==512 flashmla path only; emits e4m3 fp8 + fp32 1x64 scale.
+        cuda_wrappers = [
+            ("forward_unified_fp8", f"FusedNormRopeKernel<{args}>::forward_unified_fp8")
+        ]
+    else:
+        cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
+        if head_dim == 128:
+            cuda_wrappers.append(
+                ("forward_fp4", f"FusedNormRopeKernel<{args}>::forward_fp4")
+            )
     return load_jit(
         make_name(f"fused_norm_rope_v2"),
         *args,
@@ -359,13 +373,35 @@ def compress_norm_rope_store(
     page_size: int,
     use_fp4: bool = False,
     bf16_store: bool = False,
+    unified_fp8_scale: Optional[torch.Tensor] = None,
 ) -> None:
     if use_fp4:
         assert kv.shape[-1] == 128
+    unified_fp8 = unified_fp8_scale is not None
+    assert not (unified_fp8 and (use_fp4 or bf16_store))
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_compress_norm_rope_module(
-        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
+        kv.dtype,
+        kv.shape[-1],
+        freq_cis.shape[-1],
+        page_size,
+        bf16_store,
+        unified_fp8,
     )
+    if unified_fp8:
+        module.forward_unified_fp8(
+            kv,
+            plan[1],
+            norm_weight,
+            norm_eps,
+            freq_cis,
+            out_loc,
+            kvcache,
+            unified_fp8_scale,
+            plan.is_decode,
+            plan.compress_ratio,
+        )
+        return
     fn = module.forward_fp4 if use_fp4 else module.forward
     fn(
         kv,

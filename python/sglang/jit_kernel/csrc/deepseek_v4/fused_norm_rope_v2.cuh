@@ -46,6 +46,9 @@ struct FusedNormRopeStoreParams {
   const float* __restrict__ freqs_cis;
   const int64_t* __restrict__ out_loc;
   uint8_t* __restrict__ kvcache;
+  // Unified-fp8 store only: parallel [num_slots, num_groups] fp32 block-scale
+  // buffer (page_size==1). nullptr for all other store modes.
+  float* __restrict__ scale_out;
   float eps;
   uint32_t compress_ratio;
   uint32_t num_tokens;
@@ -368,10 +371,13 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
 // Each thread loads kVecSize=2 BF16, so 256 threads cover the full 512 elems.
 // Cache layout: 584 bytes/token = 448 fp8 nope + 64 (=32 bf16x2) rope + 8 scale.
 // ----------------------------------------------------------------------------
-template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL, bool kBf16Store = false>
+template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL, bool kBf16Store = false,
+          bool kUnifiedFp8Store = false>
 FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormRopeStoreParams params) {
   using namespace device;
   using enum ForwardMode;
+
+  static_assert(!(kBf16Store && kUnifiedFp8Store), "bf16 and unified-fp8 store are mutually exclusive");
 
   constexpr int64_t kHeadDim = 512;
   constexpr int64_t kRopeDim = 64;
@@ -380,9 +386,15 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   // 64-element fp8 group (own UE8M0 scale).
   constexpr uint32_t kRopeWarp = kNumWarps - 1;
   // kBf16Store: write the whole head_dim as plain BF16 (no fp8 / no scale) into a
-  // [num_slots, head_dim] bf16 cache (page_size==1) at row out_loc
+  //   [num_slots, head_dim] bf16 cache (page_size==1) at row out_loc.
+  // kUnifiedFp8Store: write the whole head_dim as e4m3 fp8 into a [num_slots,
+  //   head_dim] fp8 cache (page_size==1) + a parallel [num_slots, kNumWarps]
+  //   fp32 1x64-group scale buffer (scale_g = amax(|group|)/FP8_MAX). Matches
+  //   the Triton `_quant_scatter_by_loc_kernel` unified-KV contract exactly.
   constexpr int64_t kPageBytes =
-      kBf16Store ? ((kHeadDim * 2ll) << kPageBits) : host::div_ceil(584ll << kPageBits, 576) * 576;
+      kUnifiedFp8Store ? ((kHeadDim * 1ll) << kPageBits)
+                       : (kBf16Store ? ((kHeadDim * 2ll) << kPageBits)
+                                     : host::div_ceil(584ll << kPageBits, 576) * 576);
   static_assert(kHeadDim == kBlockSize * kVecSize);
   static_assert(kRopeDim == kWarpThreads * kVecSize);
   static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
@@ -453,12 +465,38 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   const int64_t page = out_loc >> kPageBits;
   const int64_t offset = out_loc & ((1 << kPageBits) - 1);
   const auto page_ptr = params.kvcache + page * kPageBytes;
-  const auto value_ptr = page_ptr + offset * (kBf16Store ? (kHeadDim * 2) : 576);
+  const auto value_ptr = page_ptr + offset * (kUnifiedFp8Store ? kHeadDim : (kBf16Store ? (kHeadDim * 2) : 576));
 
   PDLTriggerSecondary<kUsePDL>();
 
   // part 2: rope on the rope warp (BF16 store), or per-warp FP8 quant + store.
-  if constexpr (kBf16Store) {
+  if constexpr (kUnifiedFp8Store) {
+    // Unified-KV fp8: every warp owns exactly one 64-elem group (32 lanes x
+    // kVecSize=2). The rope warp first rotates its pair, then ALL warps quant
+    // their group to e4m3 fp8 with a per-group fp32 scale = amax/FP8_MAX, and
+    // write fp8 values + the fp32 scale. bf16 round-trip before quant matches
+    // the precision of the Triton fallback (whose input is bf16).
+    Float2 d = data;
+    if (warp_id == kRopeWarp) {
+      const auto x_real = data[0];
+      const auto x_imag = data[1];
+      const auto freq_real = freq[0];
+      const auto freq_imag = freq[1];
+      d[0] = x_real * freq_real - x_imag * freq_imag;
+      d[1] = x_real * freq_imag + x_imag * freq_real;
+    }
+    const auto x = cast<float>(cast<bf16_t>(d[0]));
+    const auto y = cast<float>(cast<bf16_t>(d[1]));
+    const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
+    const auto scale = fmaxf(1e-10f, abs_max) / math::FP8_E4M3_MAX;
+    const auto inv_scale = 1.0f / scale;
+    const auto qx = fminf(fmaxf(x * inv_scale, -math::FP8_E4M3_MAX), math::FP8_E4M3_MAX);
+    const auto qy = fminf(fmaxf(y * inv_scale, -math::FP8_E4M3_MAX), math::FP8_E4M3_MAX);
+    reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = pack_fp8(qx, qy);
+    // Parallel scale buffer is [num_slots, kNumWarps] fp32, page_size==1 so the
+    // slot row == out_loc. One scale per warp/group; lane 0 publishes.
+    if (lane_id == 0) params.scale_out[out_loc * kNumWarps + warp_id] = scale;
+  } else if constexpr (kBf16Store) {
     Float2 d = data;
     if (warp_id == kRopeWarp) {
       const auto x_real = data[0];
@@ -499,15 +537,22 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   }
 }
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL, bool kBf16Store = false>
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL, bool kBf16Store = false,
+          bool kUnifiedFp8Store = false>
 struct FusedNormRopeKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
   static constexpr bool kIsIndexer = (kHeadDim == 128);
   static_assert(!(kIsIndexer && kBf16Store), "bf16 store only for flashmla head_dim=512");
+  static_assert(!(kIsIndexer && kUnifiedFp8Store), "unified-fp8 store only for flashmla head_dim=512");
+  static_assert(!(kBf16Store && kUnifiedFp8Store), "bf16 and unified-fp8 store are mutually exclusive");
   static constexpr int64_t kIndexerBytes = 132 * kPageSize;
   static constexpr int64_t kFlashMLABytes = host::div_ceil(584 * kPageSize, 576) * 576;
   static constexpr int64_t kBf16Bytes = kHeadDim * 2 * kPageSize;  // plain bf16 cache
-  static constexpr int64_t kPageBytes = kBf16Store ? kBf16Bytes : (kIsIndexer ? kIndexerBytes : kFlashMLABytes);
+  static constexpr int64_t kUnifiedFp8Bytes = kHeadDim * 1 * kPageSize;  // plain e4m3 fp8 cache
+  static constexpr int64_t kPageBytes = kUnifiedFp8Store ? kUnifiedFp8Bytes
+                                        : kBf16Store      ? kBf16Bytes
+                                        : kIsIndexer      ? kIndexerBytes
+                                                          : kFlashMLABytes;
 
   /// TODO: Let's fix the config for now.
   static_assert(kRopeDim == 64 && (kHeadDim == 128 || kHeadDim == 512));
@@ -518,7 +563,7 @@ struct FusedNormRopeKernel {
     if constexpr (kIsIndexer) {
       return fused_norm_rope_indexer<DType, kMode, kLogPageSize, kUsePDL>;
     } else {
-      return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, kUsePDL, kBf16Store>;
+      return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, kUsePDL, kBf16Store, kUnifiedFp8Store>;
     }
   }
 
@@ -599,6 +644,74 @@ struct FusedNormRopeKernel {
     const auto device = device_.unwrap();
     const auto kernel = mode == CompressExtend ? select_kernel<CompressExtend>() : select_kernel<CompressDecode>();
     LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+  }
+
+  // Unified-KV fp8 store: same norm+rope as `forward`, but quantizes the whole
+  // head_dim to e4m3 fp8 and writes a parallel [num_slots, kNumWarps] fp32
+  // 1x64-group scale buffer. Only valid for the flashmla (head_dim=512) path.
+  static void forward_unified_fp8(
+      const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView plan,
+      const tvm::ffi::TensorView weight,
+      const float eps,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView out_loc,
+      const tvm::ffi::TensorView kvcache,
+      const tvm::ffi::TensorView kv_scale,
+      const bool is_decode,
+      const uint32_t compress_ratio) {
+    using namespace host;
+    using enum ForwardMode;
+
+    static_assert(kUnifiedFp8Store, "forward_unified_fp8 requires the unified-fp8 store template");
+    static_assert(!kIsIndexer, "unified-fp8 store only for flashmla head_dim=512");
+
+    const auto mode = static_cast<ForwardMode>(is_decode);
+
+    auto N = SymbolicSize{"num_tokens"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
+
+    TensorMatcher({N, kHeadDim}).with_dtype<DType>().with_device(device_).verify(input);
+    TensorMatcher({kHeadDim}).with_dtype<DType>().with_device(device_).verify(weight);
+    TensorMatcher({-1, kRopeDim}).with_dtype<float>().with_device(device_).verify(freqs_cis);
+    TensorMatcher({-1}).with_dtype<int64_t>().with_device(device_).verify(out_loc);
+    // fp8 value cache: [num_slots, head_dim] viewed as uint8, row stride == head_dim.
+    TensorMatcher({-1, -1}).with_strides({kPageBytes, 1}).with_dtype<uint8_t>().with_device(device_).verify(kvcache);
+    // fp32 scale cache: [num_slots, kNumWarps].
+    TensorMatcher({-1, static_cast<int64_t>(kNumWarps)})
+        .with_dtype<float>()
+        .with_device(device_)
+        .verify(kv_scale);
+
+    switch (mode) {
+      case CompressExtend:
+        compress::verify_plan_c(plan, N, device_);
+        RuntimeCheck(out_loc.size(0) >= N.unwrap());
+        break;
+      case CompressDecode:
+        compress::verify_plan_d(plan, N, device_);
+        RuntimeCheck(out_loc.size(0) == N.unwrap());
+        break;
+    }
+
+    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    if (num_tokens == 0) return;
+    const auto params = FusedNormRopeStoreParams{
+        .input = input.data_ptr(),
+        .handle = plan.data_ptr(),
+        .weight = weight.data_ptr(),
+        .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
+        .out_loc = static_cast<const int64_t*>(out_loc.data_ptr()),
+        .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
+        .scale_out = static_cast<float*>(kv_scale.data_ptr()),
+        .eps = eps,
+        .compress_ratio = compress_ratio,
+        .num_tokens = num_tokens,
+    };
+    const auto device = device_.unwrap();
+    const auto kernel = mode == CompressExtend ? select_kernel<CompressExtend>() : select_kernel<CompressDecode>();
+    LaunchKernel(num_tokens, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
   }
 
   static void forward_fp4(

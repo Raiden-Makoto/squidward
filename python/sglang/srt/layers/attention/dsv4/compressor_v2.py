@@ -429,6 +429,7 @@ class CompressorBackendMixin:
         out_loc: torch.Tensor,
         use_fp4_indexer: bool = False,
         bf16_store: bool = False,
+        unified_fp8_scale: Optional[torch.Tensor] = None,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -458,7 +459,9 @@ class CompressorBackendMixin:
             is_online=is_online,
         )
 
-        # Step 2: norm + rope + store
+        # Step 2: norm + rope + store (fused). For the unified fp8 pool this
+        # quantizes the whole head_dim to e4m3 + a parallel fp32 1x64-group
+        # scale buffer inside the single JIT kernel (no Triton quant detour).
         compress_norm_rope_store(
             kv_compressed,
             plan,
@@ -470,6 +473,7 @@ class CompressorBackendMixin:
             page_size=page_size,
             use_fp4=use_fp4_indexer,
             bf16_store=bf16_store,
+            unified_fp8_scale=unified_fp8_scale,
         )
 
     def _store_compress_unified_fp8(
@@ -597,6 +601,7 @@ class CompressorBackendMixin:
                 compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
             )
             bf16_store = False
+            unified_fp8_scale = None
             if compressor.is_in_indexer:
                 kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
                 page_size = token_to_kv_pool.get_index_k_page_size()
@@ -605,30 +610,18 @@ class CompressorBackendMixin:
                     self.forward_metadata.core_metadata.unified,
                     f"c{compressor.ratio}_out_loc",
                 )
-                if token_to_kv_pool.unified_kv_pool.use_fp8:
-                    # fp8 unified pool: the JIT compress_norm_rope_store only
-                    # emits bf16 (or FlashMLA-pow2) rows, so use a Triton
-                    # norm+rope + validated 1x64 group-quant + scatter fallback
-                    # that produces the exact fp8 + per-64-group fp32 scale
-                    # layout the decode/prefill kernels read.
-                    self._store_compress_unified_fp8(
-                        kv_score_buffer=state_pool.kv_score_buffer.kv_score,
-                        kv_score_input=kv_score_input,
-                        ape=compressor.ape,
-                        head_dim=compressor.head_dim,
-                        norm=compressor.norm,
-                        freqs_cis_cache=compressor.freqs_cis,
-                        compress_ratio=compressor.ratio,
-                        out_loc=out_loc,
-                        kv_buffer=token_to_kv_pool.get_unified_kv(layer_id),
-                        kv_scale_buffer=token_to_kv_pool.get_unified_kv_scales(
-                            layer_id
-                        ),
-                    )
-                    return
                 kv_cache = token_to_kv_pool.get_unified_kv(layer_id)
                 page_size = 1
-                bf16_store = True
+                if token_to_kv_pool.unified_kv_pool.use_fp8:
+                    # fp8 unified pool: fuse norm+rope+1x64 group-quant+scatter
+                    # into the single JIT kernel (forward_unified_fp8), writing
+                    # e4m3 fp8 rows + a parallel fp32 scale buffer. Byte-compatible
+                    # with the decode/prefill dequant contract.
+                    unified_fp8_scale = token_to_kv_pool.get_unified_kv_scales(
+                        layer_id
+                    )
+                else:
+                    bf16_store = True
             else:
                 _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
                 assert compress_kv_pool is not None
@@ -653,6 +646,7 @@ class CompressorBackendMixin:
                 out_loc=out_loc,
                 use_fp4_indexer=use_fp4_indexer,
                 bf16_store=bf16_store,
+                unified_fp8_scale=unified_fp8_scale,
             )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:
