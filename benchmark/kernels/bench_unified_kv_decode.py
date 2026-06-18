@@ -43,23 +43,26 @@ from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
 NEG = -3.4028234663852886e38
 
 
-def quantize_fp8_1xg(kv_bf16: torch.Tensor, group: int = _FP8_GROUP_SIZE):
-    """1xGROUP block-scale quant matching the kernel's dequant contract."""
+def quantize_fp8_pertoken(kv_bf16: torch.Tensor, num_groups: int | None = None):
+    """Per-token (1xD) fp8 quant matching the store-kernel contract: ONE scale
+    per slot (= amax(|slot|)/fp8_max), replicated across ``num_groups`` scale
+    columns. Prefill/OPUS read all columns (1x64 dequant); the native fp8-MFMA
+    decode kernel reads column 0 as the per-token scale."""
     P, D = kv_bf16.shape
-    g = D // group
-    x = kv_bf16.float().reshape(P, g, group)
-    amax = x.abs().amax(dim=-1).clamp(min=1e-8)
+    if num_groups is None:
+        num_groups = D // _FP8_GROUP_SIZE
+    x = kv_bf16.float()
+    amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)  # [P, 1]
     fmax = torch.finfo(_FP8_DTYPE).max
-    scale = (amax / fmax).clamp(min=1e-12)
-    q = (x / scale[..., None]).clamp(-fmax, fmax).to(_FP8_DTYPE)
-    return q.reshape(P, D).contiguous(), scale.to(torch.float32).contiguous()
+    scale = (amax / fmax).clamp(min=1e-12)  # [P, 1]
+    q = (x / scale).clamp(-fmax, fmax).to(_FP8_DTYPE)
+    scales = scale.repeat(1, num_groups).to(torch.float32).contiguous()  # [P, num_groups]
+    return q.contiguous(), scales
 
 
-def dequant_fp8_1xg(kv_fp8: torch.Tensor, scale: torch.Tensor, group: int = _FP8_GROUP_SIZE):
-    P, D = kv_fp8.shape
-    g = D // group
-    x = kv_fp8.float().reshape(P, g, group)
-    return (x * scale[..., None]).reshape(P, D)
+def dequant_fp8_pertoken(kv_fp8: torch.Tensor, scales: torch.Tensor):
+    # All scale columns are equal (per-token); dequant with column 0.
+    return kv_fp8.float() * scales[:, :1]
 
 
 def make_inputs(T, H, D, kv_len, n_pages, device, seed=0):
@@ -113,7 +116,7 @@ def run_point(T, H, D, kv_len, n_pages, iters, warmup, do_check):
     dev = "cuda"
     q, kv_pool, kv_indices, kv_indptr, sink = make_inputs(T, H, D, kv_len, n_pages, dev)
     scale = float(D) ** -0.5
-    kv_fp8, kv_scales = quantize_fp8_1xg(kv_pool)
+    kv_fp8, kv_scales = quantize_fp8_pertoken(kv_pool)
 
     res = {"T": T, "kv_len": kv_len}
 
@@ -137,7 +140,7 @@ def run_point(T, H, D, kv_len, n_pages, iters, warmup, do_check):
         o_fp8 = f_fp8().float()
         res["bf16_max_abs"] = (o_bf16 - ref).abs().max().item()
         ref_fp8 = ref_decode(
-            q, dequant_fp8_1xg(kv_fp8, kv_scales), kv_indices, kv_indptr, sink, scale
+            q, dequant_fp8_pertoken(kv_fp8, kv_scales), kv_indices, kv_indptr, sink, scale
         )
         res["fp8_max_abs"] = (o_fp8 - ref_fp8).abs().max().item()
     return res
