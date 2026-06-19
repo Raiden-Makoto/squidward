@@ -295,3 +295,7 @@ utilities/dsv4_guard*
 # Local-only FP8 KV microbench harnesses (untracked, not shipped)
 benchmark/kernels/bench_unified_kv_decode.py
 benchmark/kernels/bench_unified_kv_prefill.py
+
+# Cursor MCP config holds a (read-only) GitHub PAT - never commit
+.cursor/mcp.json
+**/.cursor/mcp.json
