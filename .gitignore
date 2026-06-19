@@ -287,3 +287,7 @@ artifacts/
 # Utilities — local watchdog/guard artifacts (basenames contain watchdog, or dsv4_guard*)
 utilities/**/*watchdog*
 utilities/dsv4_guard*
+
+# Cursor MCP config holds a (read-only) GitHub PAT - never commit
+.cursor/mcp.json
+**/.cursor/mcp.json
