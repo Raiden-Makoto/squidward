@@ -1,0 +1,75 @@
+---
+description: GLM-5.1-MXFP4 prefill optimization log on gfx950 (MI350/MI355) — what shipped, dead ends to NOT re-investigate, and profiling gotchas. Read before profiling or optimizing GLM5/DSA prefill performance.
+alwaysApply: false
+---
+
+# GLM-5.1-MXFP4 prefill optimization log (gfx950 / DSA path)
+
+Read this before re-profiling or proposing prefill optimizations for GLM5 (or
+any DSA / DeepSeek-sparse-attention model) on gfx950. It records what already
+shipped and — more importantly — what has already been tried and rejected, so we
+do not go in circles.
+
+## Shipped (validated wins)
+
+- **Tier 1 — skip redundant `-inf` indexer fill**: `SGLANG_DSA_SKIP_LOGITS_CLEAN`
+  passes `clean_logits=False` on the HIP `fp8_mqa_logits` path (mirrors CUDA).
+  ~2-3% median TTFT. (upstream PR sgl-project/sglang#28757)
+- **Tier 3 — Triton fp8 sparse-MLA prefill kernel**: `triton_sparse_mla.py`,
+  gated in `tilelang_sparse_fwd` behind `SGLANG_DSA_TRITON_PREFILL` (opt-in,
+  default off), shape-restricted (`num_heads==16, d_v==512, tail==64`),
+  prefill-only. ~1.6x isolated kernel / ~8-12% median TTFT, GSM8K neutral.
+  (branch `RM/dsa-triton-prefill`, draft PR sgl-project/sglang#28961)
+
+## Dead ends — DO NOT re-investigate without new evidence
+
+- **AllReduce / TP communication.** In **graphs-off** profiles
+  (`--disable-cuda-graph`, which is how we profile) the `cross_device_reduce` /
+  `quickreduce twoshot` kernels measure **spin-wait idle time** (a rank arrives
+  early and busy-waits for the slowest rank), NOT real comm cost. It looks like
+  16-21% of prefill but is a profiling artifact. rocprof cannot trace it
+  graphs-on (graph replay segfaults), so **ignore AllReduce for kernel
+  optimization** and never cite a graphs-off AllReduce % as a lever. A fused
+  allreduce+residual+norm path exists in aiter (`fused_allreduce_rmsnorm_quant`)
+  and was prototyped, but it is complex framework/kernel work and was explicitly
+  deprioritized ("complex bullshit, low-priority"). Do not resurface it from a
+  graphs-off profile number.
+- **Tier 2 — sgl-kernel `topk_transform_prefill`**: already an efficient
+  two-stage radix partial top-k; no clean win available.
+- **`block_I` tuning of the TileLang sparse kernel**: 64 is optimal. 128 = ~-19%
+  prefill (occupancy loss), 32 fails to compile (MFMA warp partition). Knob
+  exhausted.
+- **Two-pass softmax rewrite of the TileLang sparse kernel**: -18% prefill. The
+  second QK+KV-load pass costs more than the per-iteration `acc_o` rescale it
+  removes; low MFMA% is dependency-stall, not spare throughput.
+- **`aiter` prefill backend (`--dsa-prefill-backend aiter`)**: incompatible with
+  the fp8 KV-cache layout (`kv.view(-1,1,1,576)` fails; our store is
+  divisible-by-512, not 576). Would need a dequant/layout shim (bf16, slower).
+  `flashmla_*` / `trtllm` / `fa3` are CUDA-only (import fail on ROCm). On gfx950,
+  **TileLang is the only working fp8 DSA attention backend** besides our Triton
+  kernel.
+
+## Profiling gotchas (gfx950)
+
+- **`bench_one_batch` monolithic prefill crashes on current upstream**: a single
+  un-chunked extend > ~16384 tokens overflows the new `eager_runner` /
+  `cuda_graph_buffer_registry` buffer (`_foreach_copy_`: 16384 vs 131072). This
+  is upstream, not our code, and fails with our kernels off too. For profiling
+  use `batch*input <= 16384` (kernel fractions are token-count-invariant), or the
+  server + `bench_serving` (chunked prefill stays within the buffer).
+- **Triton autotune pollutes rocprof kernel-trace**: the first-call autotune
+  benchmarks ~18 configs, inflating `_sparse_mla_fwd_kernel` call count
+  (e.g. 746 vs ~78/forward) and its GPU-time share to a bogus ~56%. Time-windowing
+  does not separate it (all forwards bunch at trace end). For a clean per-kernel
+  prefill breakdown use the **torch profiler on one post-warmup step**
+  (`--profile --profile-stage prefill --profile-steps 1`) + `glm5_prof_csv.py`,
+  not rocprof whole-trace.
+
+## Hardware / config facts
+
+- Only **TP4** is sensible for GLM5-MXFP4 on 270GB gfx950: weights are 396GB, so
+  TP1 is impossible (>1 GPU of weights), TP2 is impractical (~198GB/GPU leaves
+  ~16GB KV at mem-fraction 0.85), TP8 is wasteful. TP4 → **16 heads/rank** (why
+  the Triton kernel is shape-gated to `num_heads==16`).
+- gfx950 uses fp8 **e4m3fn** (not fnuz); gfx942 uses e4m3fnuz. Use
+  `is_fp8_fnuz()`, not `torch.version.hip`.
