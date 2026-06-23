@@ -1,5 +1,5 @@
 ---
-description: GLM-5.1-MXFP4 prefill optimization log on gfx950 (MI350/MI355) — what shipped, dead ends to NOT re-investigate, and profiling gotchas. Read before profiling or optimizing GLM5/DSA prefill performance.
+description: GLM-5.1-MXFP4 prefill optimization log on gfx950 (MI350X) — what shipped, dead ends to NOT re-investigate, and profiling gotchas. Read before profiling or optimizing GLM5/DSA prefill performance.
 alwaysApply: false
 ---
 
