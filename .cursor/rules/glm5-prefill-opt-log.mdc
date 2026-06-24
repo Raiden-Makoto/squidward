@@ -36,10 +36,13 @@ do not go in circles.
   (one server flag, not the kernel-prototyping this entry originally assumed). It
   is **capture-safe on gfx950** and, graphs-on, the fused
   `allreduce_fusion_kernel_1stage` gives ~3% decode ITL / +3-7% throughput at
-  **low concurrency (2-8)**; neutral/within-noise at high concurrency (16-64,
-  where the tensor exceeds aiter's 64MB fusion cutoff and falls back). So this is
-  a low-concurrency-only win, not a dead end — but do NOT expect it to help the
-  high-concurrency regime.
+  **low concurrency (2-8)**. At high concurrency (16-64) it was +0.3-1.2% ITL in
+  one run — within the ~1% box noise band; whether that is noise or a small real
+  regression is unconfirmed (the fused kernel still fires at high conc — the
+  decode AR tensor [batch x hidden] is well under aiter's 64MB cutoff — so it is
+  NOT a fallback; the benefit just amortizes away as batch-bound compute grows).
+  Net: a low-concurrency-only win, not a dead end — but do NOT expect it to help
+  the high-concurrency regime, which is the regime of focus.
 - **Tier 2 — sgl-kernel `topk_transform_prefill`**: already an efficient
   two-stage radix partial top-k; no clean win available.
 - **`block_I` tuning of the TileLang sparse kernel**: 64 is optimal. 128 = ~-19%
