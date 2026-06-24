@@ -1,5 +1,5 @@
 ---
-description: GLM-5.1-MXFP4 prefill optimization log on gfx950 (MI350X) — what shipped, dead ends to NOT re-investigate, and profiling gotchas. Read before profiling or optimizing GLM5/DSA prefill performance.
+description: GLM-5.1-MXFP4 prefill AND decode optimization log on gfx950 (MI350X) — what shipped, dead ends to NOT re-investigate, profiling gotchas, and the graphs-on decode optimization methodology (why graphs-off kernel tuning backfires). Read before profiling or optimizing GLM5/DSA prefill OR decode performance.
 alwaysApply: false
 ---
 
@@ -20,8 +20,33 @@ do not go in circles.
   default off), shape-restricted (`num_heads==16, d_v==512, tail==64`),
   prefill-only. ~1.6x isolated kernel / ~8-12% median TTFT, GSM8K neutral.
   (branch `RM/dsa-triton-prefill`, draft PR sgl-project/sglang#28961)
+- **DECODE — EAGLE MTP speculative decoding (biggest decode win, NOT default).**
+  `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1
+  --speculative-num-draft-tokens 4`. Works on GLM-5.1-MXFP4 / **MI355X (gfx950)**
+  using the checkpoint's MTP/nextn head (no separate draft model). Graphs-on e2e
+  (`utilities/e2e_glm5.sh`, 8192/1024): **~2.6-3.3x median ITL** and **+27%
+  (conc 64) to +144% (conc 2) output throughput**, holding even at high
+  concurrency. Lossless (GSM8K 0.920, invalid 0.000); accept length ~3.4/4.
+  This is why it works when compute-kernel swaps didn't: decode is
+  collective-bound, and accepting ~3.4 tokens/step cuts forward steps (and thus
+  per-token all-reduces) by ~2.7x. **Opt-in, not enabled by default**
+  (`utilities/run_glm5.sh --speculative`). NOTE: the GLM-5.1 cookbook currently
+  (wrongly) says "EAGLE not supported on AMD" and gates it off in the deploy
+  generator — that is stale; EAGLE is validated on MI355X. gfx942 (MI300X/MI325X)
+  not yet tested.
 
 ## Dead ends — DO NOT re-investigate without new evidence
+
+- **DECODE compute-kernel swaps are a dead end on this config (collective-bound).**
+  Three graphs-on e2e A/Bs confirmed compute isn't the decode bottleneck, so
+  faster compute kernels don't help (or regress): (a) **split-KV / flash-decode
+  sparse-MLA Triton kernel** — ~2-5x in isolated/graphs-off microbench but
+  **+4-5% ITL regression** e2e graphs-on (added a split-K scratch round-trip on a
+  path graphs already make launch-cheap); (b) **aiter MoE tuning** for the GLM5
+  MXFP4 shape (untuned → fallback tile) — ~7-11% faster *isolated kernel* via
+  `gemm_moe_tune.py`, but **-1.5% to -4% throughput** e2e because the tuner picks
+  by graphs-off microbench, the wrong regime. Lesson: only trust graphs-on e2e
+  A/B (`e2e_glm5.sh`) for decode, never isolated kernel time.
 
 - **AllReduce / TP communication.** In **graphs-off** profiles
   (`--disable-cuda-graph`, which is how we profile) the `cross_device_reduce` /
@@ -82,6 +107,41 @@ do not go in circles.
   prefill breakdown use the **torch profiler on one post-warmup step**
   (`--profile --profile-stage prefill --profile-steps 1`) + `glm5_prof_csv.py`,
   not rocprof whole-trace.
+
+## Decode optimization methodology (graphs-on discipline) — READ BEFORE TOUCHING DECODE KERNELS
+
+The core trap: decode runs under HIP graphs (graphs-on), so you **profile in one
+regime (graphs-on, in-context) but optimize in another (graphs-off, in-isolation),
+and graphs-off's optimum is not graphs-on's optimum — it is often anti-correlated.**
+A kernel made faster standalone (bigger tiles, more work/block) raises register/LDS
+pressure, drops occupancy, and destroys the inter-kernel overlap that was hiding it
+graphs-on → faster alone, slower in the graph. Decode kernels are
+overlap/occupancy-bound, not throughput-bound. Also: a kernel reported at Y ms in the
+graphs-on trace is **not** its marginal cost (part of Y overlaps a neighbor), so
+halving it may not move step time at all. (See the `block_I=64` and two-pass softmax
+dead ends — both are this trap.)
+
+The discipline that actually holds for decode here:
+
+- **The only verdict is graphs-on end-to-end step time (or ITL).** The kernel trace
+  is a *hypothesis generator*, never a decision. Rank suspects from the graphs-on
+  `-DECODE` breakdown, but accept/reject changes only on the graphs-on step delta.
+- **A/B the whole graph, never the kernel.** Recapture the graph with the variant and
+  compare graphs-on decode step time side-by-side (`run_glm5_ab.sh`). The unit of
+  optimization is the recaptured graph, not the standalone kernel.
+- **If you must microbench, reproduce the adjacency**: real decode shapes (batch=C,
+  seqlen=1, real head/expert dims), warm L2 with the actual producer, and ideally
+  bench a *captured subgraph* of the kernel + its neighbors — NOT a bare
+  `for _ in range(N): kernel(same_buffers)` loop, which measures the one regime that
+  never occurs in production.
+- **Prefer optimization classes that survive graphs-on**: fusion / boundary removal
+  (kills a real dependency edge + a memory round-trip — helps *more* graphs-on),
+  reducing memory traffic, and reducing register/LDS pressure to *raise*
+  occupancy/overlap. "Tune tile/unroll for standalone GEMM throughput" is the class
+  that evaporates or inverts graphs-on. This is why every shipped win is a fusion and
+  every isolated-kernel-throughput attempt was rejected.
+- **Never compare a graphs-off microbench number to a graphs-on trace number.** They
+  are different physical regimes.
 
 ## Hardware / config facts
 
