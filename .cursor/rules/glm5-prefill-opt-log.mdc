@@ -27,13 +27,19 @@ do not go in circles.
   (`--disable-cuda-graph`, which is how we profile) the `cross_device_reduce` /
   `quickreduce twoshot` kernels measure **spin-wait idle time** (a rank arrives
   early and busy-waits for the slowest rank), NOT real comm cost. It looks like
-  16-21% of prefill but is a profiling artifact. rocprof cannot trace it
-  graphs-on (graph replay segfaults), so **ignore AllReduce for kernel
-  optimization** and never cite a graphs-off AllReduce % as a lever. A fused
-  allreduce+residual+norm path exists in aiter (`fused_allreduce_rmsnorm_quant`)
-  and was prototyped, but it is complex framework/kernel work and was explicitly
-  deprioritized ("complex bullshit, low-priority"). Do not resurface it from a
-  graphs-off profile number.
+  16-21% of prefill but is a profiling artifact in graphs-off traces.
+  **Never cite a graphs-off AllReduce % as a lever.** (Correction: rocprof
+  segfaults graphs-on, but the torch profiler via `send_one --profile` *does*
+  capture graphs-on traces — see Profiling gotchas. Graphs-on, the real decode
+  comm is ~7%, not the inflated graphs-off number.) A fused allreduce+residual+
+  norm path exists in aiter and is wired behind `--enable-aiter-allreduce-fusion`
+  (one server flag, not the kernel-prototyping this entry originally assumed). It
+  is **capture-safe on gfx950** and, graphs-on, the fused
+  `allreduce_fusion_kernel_1stage` gives ~3% decode ITL / +3-7% throughput at
+  **low concurrency (2-8)**; neutral/within-noise at high concurrency (16-64,
+  where the tensor exceeds aiter's 64MB fusion cutoff and falls back). So this is
+  a low-concurrency-only win, not a dead end — but do NOT expect it to help the
+  high-concurrency regime.
 - **Tier 2 — sgl-kernel `topk_transform_prefill`**: already an efficient
   two-stage radix partial top-k; no clean win available.
 - **`block_I` tuning of the TileLang sparse kernel**: 64 is optimal. 128 = ~-19%
@@ -51,6 +57,15 @@ do not go in circles.
 
 ## Profiling gotchas (gfx950)
 
+- **Graphs-on profiling IS possible via `send_one --profile` (corrects an earlier
+  wrong claim).** rocprof and `bench_one_batch --enable-profile-cuda-graph`
+  crash/segfault on graphs-on trace export in this image (ROCTracer
+  `corrupted size vs prev_size` heap abort). But the standard
+  `generate-profile` skill path — a normally-launched server (CUDA graphs ON) +
+  `python3 -m sglang.test.send_one --profile --profile-by-stage` — exports clean
+  per-stage `-DECODE` / `-EXTEND` traces. Graphs-off traces overstate launch
+  bubbles + AllReduce spin-wait; for any launch/occupancy/comm conclusion use the
+  graphs-on `send_one` trace, not a graphs-off one.
 - **`bench_one_batch` monolithic prefill crashes on current upstream**: a single
   un-chunked extend > ~16384 tokens overflows the new `eager_runner` /
   `cuda_graph_buffer_registry` buffer (`_foreach_copy_`: 16384 vs 131072). This
