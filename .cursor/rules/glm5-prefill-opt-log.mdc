@@ -10,6 +10,50 @@ any DSA / DeepSeek-sparse-attention model) on gfx950. It records what already
 shipped and — more importantly — what has already been tried and rejected, so we
 do not go in circles.
 
+## Methodology — read this FIRST (hard-won; ignore at your peril)
+
+The dominant failure mode this whole effort: **hunting the biggest kernel and
+blindly making it "faster" / tuning it.** Track record on this config — six
+narrow kernel-level fixes (K-fusion, decode split-KV kernel, decode MoE tuning,
+prefill MoE tuning, AllReduce fusion, query hadamard fusion) all either regressed
+e2e, were inert, or were marginal (~1%). The ONE big win (EAGLE spec decoding,
+2.6-3.3x ITL) was **structural**, not a kernel swap. Why the kernel-hunt keeps
+failing here:
+
+1. **This system is not compute-bound.** Decode is collective/latency-bound
+   (per-layer TP all-reduce on the critical path); prefill is comm + attention.
+   Speeding up a compute kernel that's behind a CUDA graph (which already hides
+   its launch cost) and is 10% of the time → ~0 e2e. A faster kernel only helps a
+   compute-bound phase.
+2. **Production has dynamic shapes; static gates miss.** Continuous batching +
+   chunked prefill produce a *distribution* of M/shapes. A kernel tuned/gated to
+   one shape (M=8192, 16 heads, …) frequently isn't even hit at runtime — exactly
+   why prefill MoE tuning gave a ~20% isolated win but 0% e2e TTFT.
+3. **Isolated/graphs-off microbench ≠ graphs-on production.** Three "wins"
+   inverted under the real regime.
+
+**The corrected method:**
+- **Bottleneck-first, not hot-kernel-first.** Identify what the system is *bound
+  on*, then pick a lever that attacks THAT. Prefer **structural levers** that
+  change the amount/pattern of work — spec decoding (fewer forward steps →
+  fewer collectives/token), quantization (less traffic), parallelism strategy
+  (DP-attn / EP / two-batch-overlap), caching, *removing* redundant work
+  (#28757) — over kernel micro-opts. They translate and aren't shape-brittle.
+- **Narrow kernel opt is justified ONLY when the phase is genuinely
+  compute-bound AND the shape is production-stable.** That niche is why #28975
+  (prefill attention, large-M, compute-bound, fixed 16-head shape) is the one
+  kernel opt that worked — and it is rare and mostly already taken by the vendor.
+- **When a kernel IS the right target, do not blindly rewrite/tune it — profile
+  the kernel itself with rocprof hardware counters to find what it actually
+  needs.** Is it VGPR-spilling (occupancy-limited)? Is VALU mostly idle
+  (memory/latency-bound, not ALU-bound)? Low MFMA utilization (dependency
+  stalls)? LDS-bound? Bad wave occupancy? The fix follows the diagnosis
+  (e.g. spilling → reduce live regs / smaller tile; idle VALU → it's
+  memory-bound, a faster ALU tile won't help; dep-stall → restructure the
+  pipeline). Use `utilities/rocprof_pmc_analyze.py` for the counter pass.
+- **Validate only with graphs-on e2e A/B** (`utilities/e2e_glm5.sh`). Kill the
+  isolated-kernel-time habit entirely.
+
 ## Shipped (validated wins)
 
 - **Tier 1 — skip redundant `-inf` indexer fill**: `SGLANG_DSA_SKIP_LOGITS_CLEAN`
@@ -54,13 +98,18 @@ num_prompts=64, isl 8192, Triton kernel firing), per-kernel GPU-time share:
 Two untested levers that do NOT hit the decode graphs-on translation trap
 (prefill is eager, so graphs-off tuning/measurement translates directly):
 
-1. **Prefill MoE tuning (different regime from the failed decode tuning).** MoE
-   is ~17% of prefill (`mfma_moe2` down ~13% ≫ `mfma_moe1` up 4% — suspicious
-   asymmetry, possible bad down-tile at M=8192). The decode MoE tuning regressed
-   ONLY because decode runs under CUDA graphs and the tuner's graphs-off pick
-   didn't translate. Prefill is eager → a graphs-off `gemm_moe_tune.py` pick for
-   the **M=8192 prefill shape** should translate. Validate with an eager e2e TTFT
-   A/B (default vs tuned-fmoe), not isolated kernel time.
+1. **Prefill MoE tuning — TESTED, did NOT translate (0% e2e TTFT).** Tuning the
+   M=8192/16384 prefill shape gave a clean **18-22% isolated MoE-kernel win**
+   (and explained the asymmetry: the fallback down-tile `moe_ck2stages_gemm2_
+   64x64x128x128_1x1` is under-occupied → moe2 −25-30% when retuned to
+   `flydsl_moe2_t64x256x256_reduce`; moe1's default was already fine; a residual
+   inherent asymmetry remains because the down output is model_dim-wide). But the
+   eager e2e TTFT A/B (`e2e_glm5.sh`, c=2/16/32) showed **0% change**. Cause:
+   continuous batching + chunked prefill make the runtime MoE M a *mixed
+   distribution* that rarely lands on the tuned 8192/16384 tiers, so the tuned
+   rows aren't engaged (fallback used in both arms). This is the dynamic-shape
+   failure mode from the Methodology section — even eager, a clean-M-tile tune
+   doesn't translate to a dynamic-M production workload.
 2. **Prefill AllReduce comm overlap (~21%, REAL not artifact).** For prefill the
    `quickreduce twoshot` is bandwidth-bound real comm on large messages (the
    spin-wait caveat is a DECODE thing). `--enable-two-batch-overlap` (hide comm
