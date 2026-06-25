@@ -35,6 +35,41 @@ do not go in circles.
   generator — that is stale; EAGLE is validated on MI355X. gfx942 (MI300X/MI325X)
   not yet tested.
 
+## Open prefill levers (current profile, NOT yet tried — promising)
+
+Representative prefill profile (graphs-off=eager=representative; c=16,
+num_prompts=64, isl 8192, Triton kernel firing), per-kernel GPU-time share:
+
+| kernel | category | share |
+|---|---|---|
+| `_sparse_mla_fwd_kernel` (our Triton attn, #28975) | attention | 25.1% |
+| `quickreduce allreduce_twoshot` | AllReduce | 20.8% |
+| `mfma_moe2_afp4_wfp4` (down, two tiles) | MoE | ~13% |
+| `topk_transform_prefill` | indexer | 6.3% |
+| `Cijk`/`bf16gemm` proj GEMMs (unquant.py:139) | gemm | ~12% |
+| `_gluon_fp8_mqa_logits` | indexer | 5.0% |
+| `mfma_moe1_silu_mul` (up/gate) | MoE | 4.2% |
+| `add_rmsnorm_quant` | norm | 2.2% |
+
+Two untested levers that do NOT hit the decode graphs-on translation trap
+(prefill is eager, so graphs-off tuning/measurement translates directly):
+
+1. **Prefill MoE tuning (different regime from the failed decode tuning).** MoE
+   is ~17% of prefill (`mfma_moe2` down ~13% ≫ `mfma_moe1` up 4% — suspicious
+   asymmetry, possible bad down-tile at M=8192). The decode MoE tuning regressed
+   ONLY because decode runs under CUDA graphs and the tuner's graphs-off pick
+   didn't translate. Prefill is eager → a graphs-off `gemm_moe_tune.py` pick for
+   the **M=8192 prefill shape** should translate. Validate with an eager e2e TTFT
+   A/B (default vs tuned-fmoe), not isolated kernel time.
+2. **Prefill AllReduce comm overlap (~21%, REAL not artifact).** For prefill the
+   `quickreduce twoshot` is bandwidth-bound real comm on large messages (the
+   spin-wait caveat is a DECODE thing). `--enable-two-batch-overlap` (hide comm
+   behind compute) or `--enable-aiter-allreduce-fusion` could move prefill TTFT;
+   prefill is eager so a straight e2e TTFT A/B is trustworthy.
+
+Attention is #1 at 25% but already the optimized #28975 Triton kernel (~1.6x);
+further gains there are MFMA-utilization work, not low-hanging.
+
 ## Dead ends — DO NOT re-investigate without new evidence
 
 - **DECODE compute-kernel swaps are a dead end on this config (collective-bound).**
@@ -94,6 +129,16 @@ do not go in circles.
   per-stage `-DECODE` / `-EXTEND` traces. Graphs-off traces overstate launch
   bubbles + AllReduce spin-wait; for any launch/occupancy/comm conclusion use the
   graphs-on `send_one` trace, not a graphs-off one.
+- **Profile prefill with a REAL workload, not a toy request.** A degenerate
+  capture (`bench_serving --num-prompts 2 --max-concurrency 1 --profile-num-steps 1`)
+  produced a prefill EXTEND trace where our Triton kernel showed **0 launches**
+  and TileLang `main_kernel` ran instead — the toy request never hit the
+  `q_nope.shape[0] >= 512` gate, so it was a capture artifact, NOT a regression
+  (the merged #28975 is byte-identical to the validated code). Profile prefill
+  via the `e2e_glm5.sh` per-point workload (e.g. c=16, num_prompts=64, isl 8192)
+  with `--profile --profile-by-stage`; under that, `_sparse_mla_fwd_kernel` fires
+  (312 launches, 25% of prefill) as expected. Prefill runs **eager** (only decode
+  is graph-captured), so a graphs-off prefill trace is representative.
 - **`bench_one_batch` monolithic prefill crashes on current upstream**: a single
   un-chunked extend > ~16384 tokens overflows the new `eager_runner` /
   `cuda_graph_buffer_registry` buffer (`_foreach_copy_`: 16384 vs 131072). This
