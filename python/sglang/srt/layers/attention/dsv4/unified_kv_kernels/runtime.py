@@ -138,6 +138,103 @@ def _mxfp8_pack_scatter_kernel(
     )
 
 
+@triton.jit
+def _mxfp8_pack_dense_kernel(
+    kv_ptr,  # [N, head_dim] norm+rope'd (any float dtype)
+    nope_u8_ptr,  # [N, NOPE_WIDTH] uint8 (dense fp8 NoPE out viewed as uint8)
+    rope_ptr,  # [N, DIM_ROPE] bf16 (dense RoPE out)
+    n_rows,
+    kv_row_stride,
+    kv_col_stride,
+    DIM_NOPE: tl.constexpr,  # 448
+    DIM_ROPE: tl.constexpr,  # 64
+    NUM_BLOCKS: tl.constexpr,  # 14
+    FP8_BLK: tl.constexpr,  # 32
+    NOPE_WIDTH: tl.constexpr,  # 512
+    SCALE_OFF: tl.constexpr,  # 448
+    FP8_MAX: tl.constexpr,  # 448.0
+):
+    """Dense (row i -> row i) variant of ``_mxfp8_pack_scatter_kernel``. Quant
+    math is identical bit-for-bit; only the destination addressing differs (no
+    ``loc`` indirection / no skip sentinel). Used by ``pack_mxfp8_dense`` to fuse
+    the per-step q / extend-kv pack chains in the fp8 prefill path."""
+    row = tl.program_id(0)
+    if row >= n_rows:
+        return
+    blk_offs = tl.arange(0, FP8_BLK)
+    for b in tl.static_range(NUM_BLOCKS):
+        start = b * FP8_BLK
+        vals = tl.load(
+            kv_ptr + row * kv_row_stride + (start + blk_offs) * kv_col_stride
+        ).to(tl.float32)
+        amax = tl.max(tl.abs(vals))
+        amax_c = tl.maximum(amax, 1e-30)
+        e_unb = tl.ceil(tl.log2(amax_c / FP8_MAX))
+        e_unb = tl.where(amax == 0.0, 0.0, e_unb)
+        scale = tl.exp2(e_unb)
+        q = (vals / scale).to(tl.float8e4nv)
+        qb = q.to(tl.uint8, bitcast=True)
+        tl.store(nope_u8_ptr + row * NOPE_WIDTH + start + blk_offs, qb)
+        e_byte = e_unb.to(tl.int32) + 127
+        e_byte = tl.minimum(tl.maximum(e_byte, 0), 255).to(tl.uint8)
+        tl.store(nope_u8_ptr + row * NOPE_WIDTH + SCALE_OFF + b, e_byte)
+    rope_offs = tl.arange(0, DIM_ROPE)
+    rvals = tl.load(
+        kv_ptr + row * kv_row_stride + (DIM_NOPE + rope_offs) * kv_col_stride
+    )
+    tl.store(
+        rope_ptr + row * DIM_ROPE + rope_offs,
+        rvals.to(rope_ptr.dtype.element_ty),
+    )
+
+
+def pack_mxfp8_dense(
+    x: torch.Tensor,  # [..., head_dim] norm+rope'd (any float dtype)
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused MXFP8 dense pack. A single Triton launch produces the packed
+    NoPE-fp8 ``[..., 512]`` buffer + its bf16 RoPE ``[..., 64]`` companion,
+    byte-identical to ``pack_nope_mxfp8(split_nope_rope(x)[0])`` plus
+    ``rope.to(bfloat16)``. Replaces the eager per-step q / extend-kv pack chains
+    in the fp8 prefill path (one launch instead of ~10 small eager kernels).
+
+    Arbitrary leading dims are flattened; the packed/rope outputs are fresh,
+    contiguous (width-equal row stride) tensors. NoPE pad bytes ``[462:512]`` are
+    zeroed via the zero-init alloc (the kernel only writes the 448 data + 14 E8M0
+    bytes), matching the reference packer."""
+    from sglang.srt.layers.attention.dsv4.unified_kv_kernels import mxfp8
+
+    assert x.shape[-1] == mxfp8.DIM_HEAD, (
+        f"pack_mxfp8_dense expects head_dim {mxfp8.DIM_HEAD}, got {x.shape[-1]}"
+    )
+    lead = x.shape[:-1]
+    flat = x.reshape(-1, mxfp8.DIM_HEAD)
+    n_rows = flat.shape[0]
+    nope = torch.zeros(
+        n_rows, mxfp8.NOPE_PACKED_WIDTH, dtype=torch.uint8, device=x.device
+    )
+    rope = torch.empty(n_rows, mxfp8.DIM_ROPE, dtype=torch.bfloat16, device=x.device)
+    if n_rows > 0:
+        _mxfp8_pack_dense_kernel[(n_rows,)](
+            flat,
+            nope,
+            rope,
+            n_rows,
+            flat.stride(0),
+            flat.stride(1),
+            DIM_NOPE=mxfp8.DIM_NOPE,
+            DIM_ROPE=mxfp8.DIM_ROPE,
+            NUM_BLOCKS=mxfp8.NUM_NOPE_BLOCKS,
+            FP8_BLK=mxfp8.FP8_BLOCK,
+            NOPE_WIDTH=mxfp8.NOPE_PACKED_WIDTH,
+            SCALE_OFF=mxfp8.SCALE_OFFSET,
+            FP8_MAX=mxfp8.FP8_MAX,
+            num_warps=4,
+        )
+    nope = nope.view(mxfp8.FP8_DTYPE).reshape(*lead, mxfp8.NOPE_PACKED_WIDTH)
+    rope = rope.reshape(*lead, mxfp8.DIM_ROPE)
+    return nope, rope
+
+
 def _launch_mxfp8_pack(
     *,
     kv: torch.Tensor,  # [T, head_dim]
@@ -173,6 +270,65 @@ def _launch_mxfp8_pack(
     )
 
 
+@triton.jit
+def _mxfp8_copy_scatter_kernel(
+    nope_src_u8_ptr,  # [N, NOPE_WIDTH] uint8 (pre-packed dense NoPE)
+    rope_src_ptr,  # [N, DIM_ROPE] bf16 (pre-packed dense RoPE)
+    loc_ptr,  # [N] int dest rows (<0 -> skip)
+    nope_dst_u8_ptr,  # [pages, NOPE_WIDTH] uint8 (pool NoPE viewed as uint8)
+    rope_dst_ptr,  # [pages, DIM_ROPE] bf16 (pool RoPE)
+    n_rows,
+    NOPE_WIDTH: tl.constexpr,  # 512
+    DIM_ROPE: tl.constexpr,  # 64
+):
+    """Copy a pre-packed MXFP8 row (512 fp8/u8 NoPE + 64 bf16 RoPE) into pool row
+    ``loc`` (skip when ``loc < 0``). No re-quantization: reuses the bytes already
+    produced by ``pack_mxfp8_dense`` for the prefill attention input."""
+    row = tl.program_id(0)
+    if row >= n_rows:
+        return
+    loc = tl.load(loc_ptr + row).to(tl.int64)
+    if loc < 0:
+        return
+    noff = tl.arange(0, NOPE_WIDTH)
+    nvals = tl.load(nope_src_u8_ptr + row * NOPE_WIDTH + noff)
+    tl.store(nope_dst_u8_ptr + loc * NOPE_WIDTH + noff, nvals)
+    roff = tl.arange(0, DIM_ROPE)
+    rvals = tl.load(rope_src_ptr + row * DIM_ROPE + roff)
+    tl.store(rope_dst_ptr + loc * DIM_ROPE + roff, rvals)
+
+
+def _launch_mxfp8_copy_scatter(
+    *,
+    nope_src: torch.Tensor,  # [N, 512] fp8 (pre-packed dense)
+    rope_src: torch.Tensor,  # [N, 64] bf16 (pre-packed dense)
+    loc: torch.Tensor,  # [N] int dest rows (<0 = skip)
+    unified_kv_nope: torch.Tensor,  # [pages, 512] fp8
+    unified_kv_rope: torch.Tensor,  # [pages, 64] bf16
+) -> None:
+    from sglang.srt.layers.attention.dsv4.unified_kv_kernels import mxfp8
+
+    n_rows = nope_src.shape[0]
+    if n_rows == 0:
+        return
+    assert unified_kv_nope.dtype == mxfp8.FP8_DTYPE
+    assert nope_src.dtype == mxfp8.FP8_DTYPE
+    assert nope_src.is_contiguous() and rope_src.is_contiguous()
+    if not loc.is_contiguous():
+        loc = loc.contiguous()
+    _mxfp8_copy_scatter_kernel[(n_rows,)](
+        nope_src.view(torch.uint8),
+        rope_src,
+        loc,
+        unified_kv_nope.view(torch.uint8),
+        unified_kv_rope,
+        n_rows,
+        NOPE_WIDTH=mxfp8.NOPE_PACKED_WIDTH,
+        DIM_ROPE=mxfp8.DIM_ROPE,
+        num_warps=4,
+    )
+
+
 def store_swa_into_unified(
     *,
     kv: torch.Tensor,  # [T, head_dim] bf16 (norm+rope'd)
@@ -183,6 +339,8 @@ def store_swa_into_unified(
     ring_stride: int,  # SWA ring stride
     final_pos: Optional[torch.Tensor] = None,  # [T] req's last position
     unified_kv_rope: Optional[torch.Tensor] = None,  # [pages,64] bf16 (fp8 mode)
+    kv_nope_packed: Optional[torch.Tensor] = None,  # [T,512] fp8 pre-packed NoPE
+    kv_rope_packed: Optional[torch.Tensor] = None,  # [T,64] bf16 pre-packed RoPE
 ) -> None:
     n_rows, D = kv.shape
     if n_rows == 0:
@@ -205,12 +363,23 @@ def store_swa_into_unified(
         if has_final:
             keep = pos64 > (final_pos.to(torch.int64) - win)
             loc = torch.where(keep, loc, torch.full_like(loc, -1))
-        _launch_mxfp8_pack(
-            kv=kv,
-            loc=loc,
-            unified_kv_nope=unified_kv,
-            unified_kv_rope=unified_kv_rope,
-        )
+        if kv_nope_packed is not None:
+            # Dedup: the prefill attention already packed this chunk's extend kv;
+            # reuse those bytes (copy-by-loc) instead of re-quantizing.
+            _launch_mxfp8_copy_scatter(
+                nope_src=kv_nope_packed,
+                rope_src=kv_rope_packed,
+                loc=loc,
+                unified_kv_nope=unified_kv,
+                unified_kv_rope=unified_kv_rope,
+            )
+        else:
+            _launch_mxfp8_pack(
+                kv=kv,
+                loc=loc,
+                unified_kv_nope=unified_kv,
+                unified_kv_rope=unified_kv_rope,
+            )
         return
 
     assert kv.dtype == unified_kv.dtype
@@ -589,6 +758,8 @@ def prefill(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     unified_kv_rope: Optional[torch.Tensor] = None,  # [pages,64] bf16 (fp8 KV)
+    kv_extend_nope: Optional[torch.Tensor] = None,  # [T,512] fp8 pre-packed extend
+    kv_extend_rope: Optional[torch.Tensor] = None,  # [T,64] bf16 pre-packed extend
 ) -> torch.Tensor:
     return sparse_attn_v4_paged_prefill(
         q,
@@ -601,4 +772,6 @@ def prefill(
         attn_sink,
         softmax_scale,
         unified_kv_rope=unified_kv_rope,
+        kv_extend_nope=kv_extend_nope,
+        kv_extend_rope=kv_extend_rope,
     )

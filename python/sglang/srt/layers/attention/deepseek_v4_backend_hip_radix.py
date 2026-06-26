@@ -1254,6 +1254,12 @@ class DeepseekV4HipRadixBackend(
             pad = T + 1 - kpre_p.shape[0]
             kpre_p = torch.cat([kpre_p, kpre_p[-1:].expand(pad)])
             kext_p = torch.cat([kext_p, kext_p[-1:].expand(pad)])
+        # fp8 (MXFP8) path: pack this chunk's extend kv ONCE. The packed bytes
+        # feed the prefill attention input and are reused by the SWA ring store
+        # below (no second quant). bf16 path leaves these None.
+        kv_ext_nope = kv_ext_rope = None
+        if unified_rope is not None:
+            kv_ext_nope, kv_ext_rope = runtime.pack_mxfp8_dense(kv)
         o = runtime.prefill(
             q=q,
             unified_kv=unified,
@@ -1265,6 +1271,8 @@ class DeepseekV4HipRadixBackend(
             attn_sink=attn_sink,
             softmax_scale=self.softmax_scale,
             unified_kv_rope=unified_rope,
+            kv_extend_nope=kv_ext_nope,
+            kv_extend_rope=kv_ext_rope,
         )
 
         # write this chunk's SWA K into the ring for future chunks / decode
@@ -1277,6 +1285,11 @@ class DeepseekV4HipRadixBackend(
             _ring_final_pos = final_pos_full if _cp_active else final_pos
             _ring_positions = positions_full if _cp_active else positions
             n_real = _ring_state_slot.shape[0]
+            # Reuse the extend pack from prefill (fp8 path) so the ring store is a
+            # plain copy-by-loc instead of a second quantization. Rows align with
+            # kv (pack was over the same tensor); slice [:n_real] to match.
+            _ring_nope = kv_ext_nope[:n_real] if kv_ext_nope is not None else None
+            _ring_rope = kv_ext_rope[:n_real] if kv_ext_rope is not None else None
             runtime.store_swa_into_unified(
                 kv=kv[:n_real],
                 state_slot=_ring_state_slot,
@@ -1286,6 +1299,8 @@ class DeepseekV4HipRadixBackend(
                 ring_stride=ring_stride,
                 final_pos=_ring_final_pos,
                 unified_kv_rope=unified_rope,
+                kv_nope_packed=_ring_nope,
+                kv_rope_packed=_ring_rope,
             )
         return o
 

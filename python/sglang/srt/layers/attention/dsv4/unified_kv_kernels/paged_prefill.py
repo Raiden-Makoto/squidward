@@ -391,6 +391,8 @@ def sparse_attn_v4_paged_prefill(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     unified_kv_rope: torch.Tensor | None = None,
+    kv_extend_nope: torch.Tensor | None = None,
+    kv_extend_rope: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """V4 prefill sparse attention over two KV sources (paged unified_kv +
     flat per-fwd kv).
@@ -429,14 +431,17 @@ def sparse_attn_v4_paged_prefill(
         if sink.shape[0] != H:
             sink = sink[:H]
         sink = sink.to(torch.float32).contiguous()
-        # Split + MXFP8-pack the per-step q and the extend kv. The prefix pool
-        # is already native MXFP8, so only these per-call tensors are packed.
-        q_nope_real, q_rope = _mxfp8.split_nope_rope(q)
-        q_nope = _mxfp8.pack_nope_mxfp8(q_nope_real.contiguous())
-        q_rope = q_rope.to(torch.bfloat16).contiguous()
-        kv_nope_real, kv_rope = _mxfp8.split_nope_rope(kv)
-        kv_nope = _mxfp8.pack_nope_mxfp8(kv_nope_real.contiguous())
-        kv_rope = kv_rope.to(torch.bfloat16).contiguous()
+        # Fused MXFP8 pack of the per-step q + extend kv (one Triton launch each,
+        # replacing the eager split+pack+cast chains). The prefix pool is already
+        # native MXFP8, so only these per-call tensors are packed. The extend kv
+        # pack is reused by the SWA store when the caller pre-packs it.
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels import runtime as _rt
+
+        q_nope, q_rope = _rt.pack_mxfp8_dense(q)
+        if kv_extend_nope is not None:
+            kv_nope, kv_rope = kv_extend_nope, kv_extend_rope
+        else:
+            kv_nope, kv_rope = _rt.pack_mxfp8_dense(kv)
         # A single-row [1, 64] RoPE slice keeps its parent's row stride (512)
         # even after .contiguous() — torch treats a size-1 leading dim as already
         # contiguous and skips the copy. The OPUS op asserts the extend RoPE page

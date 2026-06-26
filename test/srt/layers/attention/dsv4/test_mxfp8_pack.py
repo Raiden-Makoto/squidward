@@ -60,3 +60,60 @@ def test_dequant_roundtrip(rows):
     packed = mxfp8.pack_nope_mxfp8(x)
     deq = mxfp8.dequant_nope_mxfp8(packed)
     assert torch.equal(deq.to(torch.float32), ref_deq)
+
+
+@pytest.mark.parametrize(
+    "rows,scale", [(1, 1.0), (64, 1.0), (257, 8.0), (1024, 0.01), (33, 1e3)]
+)
+def test_dense_pack_bit_parity(rows, scale):
+    """The fused Triton dense packer (``runtime.pack_mxfp8_dense``) must produce
+    bytes identical to the eager/aiter reference for the NoPE stream and a plain
+    bf16 cast for the RoPE stream."""
+    from sglang.srt.layers.attention.dsv4.unified_kv_kernels import runtime
+
+    torch.manual_seed(2)
+    x = torch.randn(rows, mxfp8.DIM_HEAD, device="cuda") * scale
+    if rows == 257:
+        x[0, :32] = 0.0  # zero-block edge case
+    ref_nope, _ = _ref_quantize_nope(x[:, : mxfp8.DIM_NOPE].contiguous())
+    nope, rope = runtime.pack_mxfp8_dense(x)
+    assert torch.equal(nope.view(torch.uint8), ref_nope.view(torch.uint8))
+    assert torch.equal(rope, x[:, mxfp8.DIM_NOPE :].to(torch.bfloat16))
+
+
+@pytest.mark.parametrize("rows", [1, 64, 257])
+def test_copy_scatter_matches_quant_scatter(rows):
+    """The copy-by-loc store (reusing pre-packed bytes) must yield pool bytes
+    identical to the quant-on-store scatter for the same ``loc`` set (incl. the
+    ``loc < 0`` skip sentinel)."""
+    from sglang.srt.layers.attention.dsv4.unified_kv_kernels import runtime
+
+    torch.manual_seed(3)
+    x = torch.randn(rows, mxfp8.DIM_HEAD, device="cuda")
+    pages = rows + 5
+    loc = torch.arange(rows, device="cuda", dtype=torch.int64)
+    loc[::3] = -1  # exercise the skip sentinel
+
+    def _empty_pool():
+        nope = torch.zeros(
+            pages, mxfp8.NOPE_PACKED_WIDTH, dtype=torch.uint8, device="cuda"
+        ).view(mxfp8.FP8_DTYPE)
+        rope = torch.zeros(pages, mxfp8.DIM_ROPE, dtype=torch.bfloat16, device="cuda")
+        return nope, rope
+
+    q_nope, q_rope = _empty_pool()
+    runtime._launch_mxfp8_pack(
+        kv=x, loc=loc, unified_kv_nope=q_nope, unified_kv_rope=q_rope
+    )
+
+    packed_nope, packed_rope = runtime.pack_mxfp8_dense(x)
+    c_nope, c_rope = _empty_pool()
+    runtime._launch_mxfp8_copy_scatter(
+        nope_src=packed_nope,
+        rope_src=packed_rope,
+        loc=loc,
+        unified_kv_nope=c_nope,
+        unified_kv_rope=c_rope,
+    )
+    assert torch.equal(c_nope.view(torch.uint8), q_nope.view(torch.uint8))
+    assert torch.equal(c_rope, q_rope)
