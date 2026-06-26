@@ -537,8 +537,21 @@ def build_prefill_indices(
     kv_indptr_prefix = _lengths_to_indptr(prefix_len)
     kv_indptr_extend = _lengths_to_indptr(extend_len)
 
-    kv_indices_prefix = torch.empty(T * (win + Wc), dtype=torch.int32, device=device)
-    kv_indices_extend = torch.empty(T * win, dtype=torch.int32, device=device)
+    # OPUS reads KV in fixed KV_TILE_SIZE (64) tiles: the last partial tile of a
+    # token loads a full 64-slot index group and only masks the *scores* of the
+    # out-of-range lanes — the index values are still loaded and used to compute
+    # gather addresses. With a ragged (non-64-aligned) indptr the final token's
+    # partial tile reads index slots past its valid range, so those slots must be
+    # in-range. Zero-fill (page 0, harmlessly masked out) plus a one-tile pad at
+    # the end keeps that over-read both valid and within the allocation. (The
+    # aiter op_test never exercises this because its CSR counts are 64-aligned.)
+    _OPUS_KV_TILE = 64
+    kv_indices_prefix = torch.zeros(
+        T * (win + Wc) + _OPUS_KV_TILE, dtype=torch.int32, device=device
+    )
+    kv_indices_extend = torch.zeros(
+        T * win + _OPUS_KV_TILE, dtype=torch.int32, device=device
+    )
 
     _build_prefill_indices_kernel[(T,)](
         positions,
