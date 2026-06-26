@@ -407,33 +407,35 @@ class DeepSeekV4UnifiedKVPool:
         self.num_blocks = num_blocks
         self.k_per_block = dict(self.K_PER_BLOCK)
 
-        # fp8 1x64 block-scale storage is strictly opt-in via ``dtype``. The
-        # default (bf16) path is unchanged: a single bf16 ``kv_buffer`` per
-        # layer and no scale buffer.
+        # fp8 storage is strictly opt-in via ``dtype``. The default (bf16) path
+        # is unchanged: a single bf16 ``kv_buffer`` per layer and no rope buffer.
+        #
+        # fp8 layout (upstream aiter MXFP8, NoPE-fp8 / RoPE-bf16; PR #3751):
+        #   kv_buffer[L]:   [total_pages, 512] fp8 — MXFP8-packed NoPE row
+        #                   (448 fp8 data + 14 uint8 E8M0 block scales + 50 pad).
+        #   rope_buffer[L]: [total_pages, 64]  bf16 — RoPE kept in bf16.
+        # The decode kernel and ``pa_sparse_prefill_fp8_opus`` both consume this
+        # exact pair (see unified_kv_kernels/mxfp8.py for the packing contract).
         self.dtype = dtype
         self.use_fp8 = dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
         if self.use_fp8:
-            # Match the kernel's arch-gated fp8 dtype + GROUP_SIZE exactly
-            # (see paged_decode.py); do NOT hardcode a single fp8 dtype.
-            from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
-                _FP8_DTYPE,
-                _FP8_GROUP_SIZE,
-            )
+            from sglang.srt.layers.attention.dsv4.unified_kv_kernels import mxfp8
 
-            assert self.head_dim % _FP8_GROUP_SIZE == 0, (
-                f"head_dim={self.head_dim} must be divisible by "
-                f"GROUP_SIZE={_FP8_GROUP_SIZE} for fp8 unified KV"
+            assert self.head_dim == mxfp8.DIM_HEAD, (
+                f"head_dim={self.head_dim} must be {mxfp8.DIM_HEAD} "
+                f"(= {mxfp8.DIM_NOPE} NoPE + {mxfp8.DIM_ROPE} RoPE) for MXFP8 unified KV"
             )
-            self.fp8_dtype = _FP8_DTYPE
-            self.group_size = _FP8_GROUP_SIZE
-            self.num_groups = self.head_dim // _FP8_GROUP_SIZE
+            # MXFP8 is gfx950-only (e4m3fn); the op asserts gfx950.
+            self.fp8_dtype = mxfp8.FP8_DTYPE
+            self.nope_packed_width = mxfp8.NOPE_PACKED_WIDTH  # 512
+            self.dim_rope = mxfp8.DIM_ROPE  # 64
         else:
             self.fp8_dtype = None
-            self.group_size = None
-            self.num_groups = None
+            self.nope_packed_width = None
+            self.dim_rope = None
 
         bufs = []
-        scale_bufs = []
+        rope_bufs = []
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(custom_mem_pool)
@@ -447,16 +449,16 @@ class DeepSeekV4UnifiedKVPool:
                         bufs.append(
                             torch.zeros(
                                 total_pages,
-                                self.head_dim,
+                                self.nope_packed_width,
                                 dtype=self.fp8_dtype,
                                 device=device,
                             )
                         )
-                        scale_bufs.append(
+                        rope_bufs.append(
                             torch.zeros(
                                 total_pages,
-                                self.num_groups,
-                                dtype=torch.float32,
+                                self.dim_rope,
+                                dtype=torch.bfloat16,
                                 device=device,
                             )
                         )
@@ -470,29 +472,29 @@ class DeepSeekV4UnifiedKVPool:
                             )
                         )
         self.kv_buffer = bufs
-        # Parallel per-layer fp32 block-scale buffers, shape
-        # ``[total_pages, head_dim // GROUP_SIZE]``. ``None`` on the bf16 path.
-        self.kv_scale_buffer = scale_bufs if self.use_fp8 else None
+        # Parallel per-layer bf16 RoPE buffers, shape ``[total_pages, 64]``.
+        # ``None`` on the bf16 path (RoPE lives inline in the bf16 kv_buffer).
+        self.rope_buffer = rope_bufs if self.use_fp8 else None
 
     def get_unified_kv(self, local_layer_id: int) -> torch.Tensor:
         return self.kv_buffer[local_layer_id]
 
-    def get_unified_kv_scales(self, local_layer_id: int) -> torch.Tensor:
-        if self.kv_scale_buffer is None:
+    def get_unified_kv_rope(self, local_layer_id: int) -> torch.Tensor:
+        if self.rope_buffer is None:
             raise RuntimeError(
-                "get_unified_kv_scales called on a bf16 unified KV pool; "
-                "fp8 block scales are only allocated when the pool dtype is fp8"
+                "get_unified_kv_rope called on a bf16 unified KV pool; "
+                "the RoPE buffer is only allocated when the pool dtype is fp8"
             )
-        return self.kv_scale_buffer[local_layer_id]
+        return self.rope_buffer[local_layer_id]
 
     def get_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs = [b.data_ptr() for b in self.kv_buffer]
         data_lens = [b.nbytes for b in self.kv_buffer]
         item_lens = [b[0].nbytes for b in self.kv_buffer]
-        if self.kv_scale_buffer is not None:
-            data_ptrs += [b.data_ptr() for b in self.kv_scale_buffer]
-            data_lens += [b.nbytes for b in self.kv_scale_buffer]
-            item_lens += [b[0].nbytes for b in self.kv_scale_buffer]
+        if self.rope_buffer is not None:
+            data_ptrs += [b.data_ptr() for b in self.rope_buffer]
+            data_lens += [b.nbytes for b in self.rope_buffer]
+            item_lens += [b[0].nbytes for b in self.rope_buffer]
         return data_ptrs, data_lens, item_lens
 
 
@@ -701,8 +703,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
         return self.unified_kv_pool.get_unified_kv(layer_id - self._stage_start)
 
-    def get_unified_kv_scales(self, layer_id: int) -> torch.Tensor:
-        return self.unified_kv_pool.get_unified_kv_scales(
+    def get_unified_kv_rope(self, layer_id: int) -> torch.Tensor:
+        return self.unified_kv_pool.get_unified_kv_rope(
             layer_id - self._stage_start
         )
 

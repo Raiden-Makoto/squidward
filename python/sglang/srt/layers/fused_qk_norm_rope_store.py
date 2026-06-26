@@ -316,7 +316,7 @@ def fused_qk_norm_rope_swa_store(
     dtype: torch.dtype = torch.bfloat16,
     bf16_store: bool = False,
     fp8_unified_store: bool = False,
-    swa_scale_cache: Optional[torch.Tensor] = None,
+    swa_rope_cache: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused Q norm + KV norm + RoPE + optional SWA store.
 
@@ -327,13 +327,13 @@ def fused_qk_norm_rope_swa_store(
         swa_loc: [M] int32 pre-translated paged indices
         swa_page_size: tokens per SWA page (default 128)
         bf16_store: write the whole head_dim as plain bf16 at swa_cache[swa_loc]
-        fp8_unified_store: quant the (norm+rope'd) kv per 1x64 group and scatter
-            fp8 rows into ``swa_cache`` [num_slots, head_dim] (fp8) + fp32 scale
-            rows into ``swa_scale_cache`` [num_slots, head_dim // 64]. Mutually
+        fp8_unified_store: MXFP8-pack the (norm+rope'd) kv NoPE stream (E8M0
+            per-32-block) into ``swa_cache`` [num_slots, 512] (fp8) and write the
+            RoPE tail bf16 into ``swa_rope_cache`` [num_slots, 64]. Mutually
             exclusive with ``bf16_store``. The in-kernel SWA store is skipped in
             this mode (it only emits bf16 / FlashMLA-pow2 layouts).
-        swa_scale_cache: [num_slots, head_dim // 64] fp32 scale buffer, required
-            when ``fp8_unified_store`` is set.
+        swa_rope_cache: [num_slots, 64] bf16 RoPE buffer, required when
+            ``fp8_unified_store`` is set.
     """
     head_dim = kv.shape[1]
 
@@ -428,24 +428,21 @@ def fused_qk_norm_rope_swa_store(
 
     if fp8_unified_store and HAS_SWA_STORE:
         # ``kv`` now holds the norm+RoPE'd [M, head_dim] row (kernel writeback).
-        # Quant per 1x64 group with amax/fp8_max linear scales (the exact
-        # contract the decode/prefill kernels dequant against) and scatter the
-        # fp8 row + fp32 scale row into the unified pool at swa_loc.
-        assert swa_scale_cache is not None, (
-            "fp8_unified_store requires swa_scale_cache"
+        # MXFP8-pack the NoPE stream (E8M0 per-32-block) into the fp8 pool +
+        # write the RoPE tail bf16 into the parallel rope buffer at swa_loc — the
+        # exact on-disk contract the decode/prefill read kernels consume.
+        assert swa_rope_cache is not None, (
+            "fp8_unified_store requires swa_rope_cache"
         )
-        # HIP-safe 1x64 group quant + scatter (no CUDA-only sgl_kernel symbol).
-        # Shares the exact amax/fp8_max contract with the prefill SWA store
-        # (path 2) and the decode/prefill read kernels.
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.runtime import (
-            store_quant_fp8_by_loc,
+            store_mxfp8_by_loc,
         )
 
-        store_quant_fp8_by_loc(
+        store_mxfp8_by_loc(
             kv=kv,
             loc=swa_loc,
-            unified_kv=swa_cache,
-            unified_kv_scales=swa_scale_cache,
+            unified_kv_nope=swa_cache,
+            unified_kv_rope=swa_rope_cache,
         )
 
     return q_out

@@ -487,18 +487,19 @@ class CompressorBackendMixin:
         freqs_cis_cache: torch.Tensor,
         compress_ratio: int,
         out_loc: torch.Tensor,  # already offset by swa_pages
-        kv_buffer: torch.Tensor,  # [pages, head_dim] fp8
-        kv_scale_buffer: torch.Tensor,  # [pages, head_dim // 64] fp32
+        nope_buffer: torch.Tensor,  # [pages, 512] fp8 (MXFP8-packed NoPE)
+        rope_buffer: torch.Tensor,  # [pages, 64] bf16
     ) -> None:
-        """fp8 unified compressed-K store (Triton fallback for the JIT path).
+        """fp8 (MXFP8) unified compressed-K store, pure Triton.
 
         Mirrors the compress_forward + Triton norm/rope used by
         ``_forward_unified_hip`` (precision parity with the JIT
-        ``compress_norm_rope_store``), then applies the same 1x64
-        ``amax/fp8_max`` block-scale quant as the other two store paths and
-        scatters fp8 rows + fp32 scale rows into the unified pool. The per-token
-        write-loc selection (decode: direct; prefill: ``out_loc[ragged_id]``)
-        replicates the JIT kernel's contract exactly.
+        ``compress_norm_rope_store``), then MXFP8-packs the NoPE stream
+        (E8M0 per-32-block) + writes the RoPE bf16 into the parallel rope
+        buffer — the exact on-disk contract the decode/prefill read kernels and
+        ``pa_sparse_prefill_fp8_opus`` consume. The per-token write-loc
+        selection (decode: direct; prefill: ``out_loc[ragged_id]``) replicates
+        the JIT kernel's contract exactly.
         """
         from sglang.srt.layers.deepseek_v4_rope import (
             fused_norm_rope_inplace_triton,
@@ -554,18 +555,18 @@ class CompressorBackendMixin:
         if kv_compressed.shape[0] == 0:
             return
 
-        # Step 4: HIP-safe 1x64 group quant (amax/fp8_max) + scatter. Shares the
-        # exact contract with the decode (path 1) and prefill SWA (path 2)
-        # stores and the read kernels (no CUDA-only sgl_kernel symbol).
+        # Step 4: MXFP8 NoPE pack (E8M0 per-32-block) + bf16 RoPE scatter. Shares
+        # the exact on-disk contract with the SWA ring store and the
+        # decode/prefill read kernels (pure Triton, no CUDA-only symbol).
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.runtime import (
-            store_quant_fp8_by_loc,
+            store_mxfp8_by_loc,
         )
 
-        store_quant_fp8_by_loc(
+        store_mxfp8_by_loc(
             kv=kv_compressed.bfloat16(),
             loc=out_loc_to_store,
-            unified_kv=kv_buffer,
-            unified_kv_scales=kv_scale_buffer,
+            unified_kv_nope=nope_buffer,
+            unified_kv_rope=rope_buffer,
         )
 
     def forward_unified(
@@ -602,6 +603,7 @@ class CompressorBackendMixin:
             )
             bf16_store = False
             unified_fp8_scale = None
+            _mxfp8_stored = False
             if compressor.is_in_indexer:
                 kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
                 page_size = token_to_kv_pool.get_index_k_page_size()
@@ -613,13 +615,24 @@ class CompressorBackendMixin:
                 kv_cache = token_to_kv_pool.get_unified_kv(layer_id)
                 page_size = 1
                 if token_to_kv_pool.unified_kv_pool.use_fp8:
-                    # fp8 unified pool: fuse norm+rope+1x64 group-quant+scatter
-                    # into the single JIT kernel (forward_unified_fp8), writing
-                    # e4m3 fp8 rows + a parallel fp32 scale buffer. Byte-compatible
-                    # with the decode/prefill dequant contract.
-                    unified_fp8_scale = token_to_kv_pool.get_unified_kv_scales(
-                        layer_id
+                    # fp8 (MXFP8) unified pool: the JIT C++ store emits the legacy
+                    # 1x64 group-scale layout, which is incompatible with the
+                    # MXFP8 (E8M0 per-32-block NoPE + bf16 RoPE) format the
+                    # decode/prefill kernels now read. Route the compressed-K
+                    # store through the pure-Triton MXFP8 path instead.
+                    self._store_compress_unified_fp8(
+                        kv_score_buffer=state_pool.kv_score_buffer.kv_score,
+                        kv_score_input=kv_score_input,
+                        ape=compressor.ape,
+                        head_dim=compressor.head_dim,
+                        norm=compressor.norm,
+                        freqs_cis_cache=compressor.freqs_cis,
+                        compress_ratio=compressor.ratio,
+                        out_loc=out_loc,
+                        nope_buffer=token_to_kv_pool.get_unified_kv(layer_id),
+                        rope_buffer=token_to_kv_pool.get_unified_kv_rope(layer_id),
                     )
+                    _mxfp8_stored = True
                 else:
                     bf16_store = True
             else:
@@ -631,23 +644,24 @@ class CompressorBackendMixin:
                     out_loc = compress_kv_pool._translate_loc_to_hisparse_device(
                         out_loc
                     )
-            self._forward_compress_all_in_one(
-                kv_score_buffer=state_pool.kv_score_buffer.kv_score,
-                kv_score_input=kv_score_input,
-                ape=compressor.ape,
-                head_dim=compressor.head_dim,
-                norm=compressor.norm,
-                freqs_cis_cache=compressor.freqs_cis,
-                kv_cache=kv_cache.view(dtype=torch.uint8),
-                is_indexer=compressor.is_in_indexer,
-                rotate=compressor.rotate,
-                compress_ratio=compressor.ratio,
-                page_size=page_size,
-                out_loc=out_loc,
-                use_fp4_indexer=use_fp4_indexer,
-                bf16_store=bf16_store,
-                unified_fp8_scale=unified_fp8_scale,
-            )
+            if not _mxfp8_stored:
+                self._forward_compress_all_in_one(
+                    kv_score_buffer=state_pool.kv_score_buffer.kv_score,
+                    kv_score_input=kv_score_input,
+                    ape=compressor.ape,
+                    head_dim=compressor.head_dim,
+                    norm=compressor.norm,
+                    freqs_cis_cache=compressor.freqs_cis,
+                    kv_cache=kv_cache.view(dtype=torch.uint8),
+                    is_indexer=compressor.is_in_indexer,
+                    rotate=compressor.rotate,
+                    compress_ratio=compressor.ratio,
+                    page_size=page_size,
+                    out_loc=out_loc,
+                    use_fp4_indexer=use_fp4_indexer,
+                    bf16_store=bf16_store,
+                    unified_fp8_scale=unified_fp8_scale,
+                )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:
             online_c128_mtp.write_prefix_states(

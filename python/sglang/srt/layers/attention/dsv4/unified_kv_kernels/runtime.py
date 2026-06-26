@@ -51,19 +51,16 @@ def _swa_scatter_kernel(
     state_slot_ptr,  # [T] int
     positions_ptr,  # [T] int
     final_pos_ptr,  # [T] int
-    unified_ptr,  # [pages, D] bf16 (or fp8 when QUANT)
-    scale_ptr,  # [pages, NUM_GROUPS] fp32 (only read when QUANT)
+    unified_ptr,  # [pages, D] bf16
     n_rows,
     ring_stride,  # SWA ring per-slot stride
     win: tl.constexpr,
     D: tl.constexpr,
     HAS_FINAL: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    QUANT: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    NUM_GROUPS: tl.constexpr,
-    FP8_MAX: tl.constexpr,
 ):
+    """BF16 SWA ring scatter. The fp8 (MXFP8) ring store is a separate kernel
+    (``_mxfp8_pack_scatter_kernel``) dispatched via ``store_swa_into_unified``."""
     row = tl.program_id(0)
     if row >= n_rows:
         return
@@ -77,40 +74,115 @@ def _swa_scatter_kernel(
     offs = tl.arange(0, BLOCK_D)
     mask = offs < D
     vals = tl.load(kv_ptr + row * D + offs, mask=mask, other=0.0)
-    if QUANT:
-        # Per-token (1x512) block-scale quant: ONE scale = amax(|whole slot|) /
-        # FP8_MAX, fp8 = clamp(elem / scale). The stored bytes are per-token
-        # quantized so the decode kernel can apply a single scalar scale that
-        # factors out of the fp8 MFMA dot. The per-group scale slots are all
-        # written with this same per-token value, so prefill/OPUS (which read the
-        # [pages, NUM_GROUPS] 1x64 layout + dequant = fp8 * scale[group]) stay
-        # correct (each group scale == the token scale). BLOCK_D == D here.
-        EPS: tl.constexpr = 1e-10
-        valsf = vals.to(tl.float32)
-        token_amax = tl.max(tl.where(mask, tl.abs(valsf), 0.0))
-        scale = tl.maximum(token_amax, EPS) / FP8_MAX
-        q = tl.clamp(valsf / scale, -FP8_MAX, FP8_MAX)
-        q = q.to(unified_ptr.dtype.element_ty)
-        tl.store(unified_ptr + loc * D + offs, q, mask=mask)
-        g_offs = tl.arange(0, NUM_GROUPS)
-        tl.store(
-            scale_ptr + loc * NUM_GROUPS + g_offs,
-            tl.zeros((NUM_GROUPS,), tl.float32) + scale,
-        )
-    else:
-        tl.store(unified_ptr + loc * D + offs, vals, mask=mask)
+    tl.store(unified_ptr + loc * D + offs, vals, mask=mask)
+
+
+# ---------------------------------------------------------------------------
+# MXFP8 (E8M0 per-32-block) NoPE pack + BF16 RoPE scatter.
+#
+# Single source for all three unified-KV fp8 write paths (decode ring store,
+# prefill ring store, compressed-K store). Each program packs one [head_dim]
+# norm+rope'd row into the MXFP8 NoPE layout (see mxfp8.py) at ``loc`` of the
+# fp8 NoPE buffer + writes the RoPE tail bf16 into the parallel rope buffer.
+# Rows with ``loc < 0`` are skipped (SWA windowing sentinel).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _mxfp8_pack_scatter_kernel(
+    kv_ptr,  # [T, head_dim] norm+rope'd (any float dtype)
+    loc_ptr,  # [T] int destination rows (<0 -> skip)
+    nope_u8_ptr,  # [pages, NOPE_WIDTH] uint8 (fp8 NoPE buffer viewed as uint8)
+    rope_ptr,  # [pages, DIM_ROPE] bf16
+    n_rows,
+    kv_row_stride,
+    kv_col_stride,
+    DIM_NOPE: tl.constexpr,  # 448
+    DIM_ROPE: tl.constexpr,  # 64
+    NUM_BLOCKS: tl.constexpr,  # 14
+    FP8_BLK: tl.constexpr,  # 32
+    NOPE_WIDTH: tl.constexpr,  # 512
+    SCALE_OFF: tl.constexpr,  # 448
+    FP8_MAX: tl.constexpr,  # 448.0
+):
+    row = tl.program_id(0)
+    if row >= n_rows:
+        return
+    loc = tl.load(loc_ptr + row).to(tl.int64)
+    if loc < 0:
+        return
+    blk_offs = tl.arange(0, FP8_BLK)
+    for b in tl.static_range(NUM_BLOCKS):
+        start = b * FP8_BLK
+        vals = tl.load(
+            kv_ptr + row * kv_row_stride + (start + blk_offs) * kv_col_stride
+        ).to(tl.float32)
+        # E8M0 block exponent: e = ceil(log2(amax / FP8_MAX)); scale = 2^e.
+        # Matches mxfp8.pack_nope_mxfp8 / aiter _quantize_nope bit-for-bit.
+        amax = tl.max(tl.abs(vals))
+        amax_c = tl.maximum(amax, 1e-30)
+        e_unb = tl.ceil(tl.log2(amax_c / FP8_MAX))
+        e_unb = tl.where(amax == 0.0, 0.0, e_unb)
+        scale = tl.exp2(e_unb)
+        q = (vals / scale).to(tl.float8e4nv)
+        qb = q.to(tl.uint8, bitcast=True)
+        tl.store(nope_u8_ptr + loc * NOPE_WIDTH + start + blk_offs, qb)
+        e_byte = e_unb.to(tl.int32) + 127
+        e_byte = tl.minimum(tl.maximum(e_byte, 0), 255).to(tl.uint8)
+        tl.store(nope_u8_ptr + loc * NOPE_WIDTH + SCALE_OFF + b, e_byte)
+    rope_offs = tl.arange(0, DIM_ROPE)
+    rvals = tl.load(
+        kv_ptr + row * kv_row_stride + (DIM_NOPE + rope_offs) * kv_col_stride
+    )
+    tl.store(
+        rope_ptr + loc * DIM_ROPE + rope_offs,
+        rvals.to(rope_ptr.dtype.element_ty),
+    )
+
+
+def _launch_mxfp8_pack(
+    *,
+    kv: torch.Tensor,  # [T, head_dim]
+    loc: torch.Tensor,  # [T] int dest rows (<0 = skip)
+    unified_kv_nope: torch.Tensor,  # [pages, 512] fp8
+    unified_kv_rope: torch.Tensor,  # [pages, 64] bf16
+) -> None:
+    from sglang.srt.layers.attention.dsv4.unified_kv_kernels import mxfp8
+
+    n_rows, D = kv.shape
+    if n_rows == 0:
+        return
+    assert unified_kv_nope.dtype == mxfp8.FP8_DTYPE
+    assert D == mxfp8.DIM_HEAD, f"expected head_dim {mxfp8.DIM_HEAD}, got {D}"
+    if not loc.is_contiguous():
+        loc = loc.contiguous()
+    _mxfp8_pack_scatter_kernel[(n_rows,)](
+        kv,
+        loc,
+        unified_kv_nope.view(torch.uint8),
+        unified_kv_rope,
+        n_rows,
+        kv.stride(0),
+        kv.stride(1),
+        DIM_NOPE=mxfp8.DIM_NOPE,
+        DIM_ROPE=mxfp8.DIM_ROPE,
+        NUM_BLOCKS=mxfp8.NUM_NOPE_BLOCKS,
+        FP8_BLK=mxfp8.FP8_BLOCK,
+        NOPE_WIDTH=mxfp8.NOPE_PACKED_WIDTH,
+        SCALE_OFF=mxfp8.SCALE_OFFSET,
+        FP8_MAX=mxfp8.FP8_MAX,
+        num_warps=4,
+    )
 
 
 def store_swa_into_unified(
     *,
-    kv: torch.Tensor,  # [T, head_dim] bf16
+    kv: torch.Tensor,  # [T, head_dim] bf16 (norm+rope'd)
     state_slot: torch.Tensor,  # [T] int
     positions: torch.Tensor,  # [T] int
-    unified_kv: torch.Tensor,  # [pages, head_dim] bf16 (or fp8 when scales given)
+    unified_kv: torch.Tensor,  # [pages, head_dim] bf16, or [pages,512] fp8 (MXFP8)
     win: int,  # SWA attention window length
     ring_stride: int,  # SWA ring stride
     final_pos: Optional[torch.Tensor] = None,  # [T] req's last position
-    unified_kv_scales: Optional[torch.Tensor] = None,  # [pages, head_dim//64] fp32
+    unified_kv_rope: Optional[torch.Tensor] = None,  # [pages,64] bf16 (fp8 mode)
 ) -> None:
     n_rows, D = kv.shape
     if n_rows == 0:
@@ -122,157 +194,58 @@ def store_swa_into_unified(
     assert state_slot.is_contiguous() and positions.is_contiguous()
     assert fp_arg.is_contiguous()
 
-    # fp8 quant-on-store is gated purely on the caller passing a scales buffer
+    # fp8 (MXFP8) quant-on-store is gated on the caller passing a RoPE buffer
     # (i.e. the unified pool is fp8). The bf16 path is strictly unchanged.
-    quant = unified_kv_scales is not None
-    if quant:
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
-            _FP8_DTYPE,
-            _FP8_GROUP_SIZE,
+    if unified_kv_rope is not None:
+        # Compute destination ring rows on-device; apply the SWA window sentinel
+        # (skip rows where pos <= final_pos - win) by tagging loc = -1.
+        ss = state_slot.to(torch.int64)
+        pos64 = positions.to(torch.int64)
+        loc = ss * ring_stride + (pos64 % ring_stride)
+        if has_final:
+            keep = pos64 > (final_pos.to(torch.int64) - win)
+            loc = torch.where(keep, loc, torch.full_like(loc, -1))
+        _launch_mxfp8_pack(
+            kv=kv,
+            loc=loc,
+            unified_kv_nope=unified_kv,
+            unified_kv_rope=unified_kv_rope,
         )
-        from sglang.srt.layers.quantization.fp8_kernel import fp8_max
+        return
 
-        assert unified_kv.dtype == _FP8_DTYPE
-        assert D % _FP8_GROUP_SIZE == 0
-        num_groups = D // _FP8_GROUP_SIZE
-        assert unified_kv_scales.shape[1] == num_groups
-        group_size = _FP8_GROUP_SIZE
-        block_d = D  # exact reshape requires BLOCK_D == D
-        fp8_max_val = fp8_max
-        scale_arg = unified_kv_scales
-    else:
-        assert kv.dtype == unified_kv.dtype
-        num_groups = 1
-        group_size = 1
-        block_d = triton.next_power_of_2(D)
-        fp8_max_val = 1.0
-        scale_arg = unified_kv  # unused dummy ptr
-
+    assert kv.dtype == unified_kv.dtype
     _swa_scatter_kernel[(n_rows,)](
         kv,
         state_slot,
         positions,
         fp_arg,
         unified_kv,
-        scale_arg,
         n_rows,
         ring_stride,
         win=win,
         D=D,
         HAS_FINAL=has_final,
-        BLOCK_D=block_d,
-        QUANT=quant,
-        GROUP_SIZE=group_size,
-        NUM_GROUPS=num_groups,
-        FP8_MAX=fp8_max_val,
+        BLOCK_D=triton.next_power_of_2(D),
         num_warps=8,
     )
 
 
-# ---------------------------------------------------------------------------
-# HIP-safe 1x64 block-scale fp8 quant + scatter by explicit destination row.
-#
-# Shared by the decode store (fused_qk_norm_rope_swa_store) and the
-# compressed-K store (compressor_v2). Mirrors the ``_swa_scatter_kernel`` QUANT
-# branch above byte-for-byte (scale_g = amax(|group_g|)/FP8_MAX, fp8 =
-# clamp(elem / scale_g), dequant = fp8 * scale) so all three unified-KV write
-# paths produce an identical fp8 + per-64-group fp32 scale layout. Unlike
-# ``sglang_per_token_group_quant_fp8`` (CUDA/MUSA-only) this references no
-# CUDA-only sgl_kernel symbol, so it is safe on ROCm/HIP.
-# ---------------------------------------------------------------------------
-@triton.jit
-def _quant_scatter_by_loc_kernel(
-    kv_ptr,  # [T, D] float (norm+rope'd), arbitrary row/col stride
-    loc_ptr,  # [T] int32/int64 destination rows
-    unified_ptr,  # [pages, D] fp8 (_FP8_DTYPE)
-    scale_ptr,  # [pages, NUM_GROUPS] fp32
-    n_rows,
-    kv_row_stride,
-    kv_col_stride,
-    D: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    NUM_GROUPS: tl.constexpr,
-    FP8_MAX: tl.constexpr,
-):
-    row = tl.program_id(0)
-    if row >= n_rows:
-        return
-    loc = tl.load(loc_ptr + row).to(tl.int64)
-    offs = tl.arange(0, BLOCK_D)
-    mask = offs < D
-    vals = tl.load(
-        kv_ptr + row * kv_row_stride + offs * kv_col_stride, mask=mask, other=0.0
-    )
-    # Per-token (1x512) block-scale quant: ONE scale over the whole slot (see
-    # _swa_scatter_kernel for rationale). Bytes are per-token quantized; the
-    # per-group scale slots are all written with this same value so prefill/OPUS
-    # (1x64 dequant) stay correct. BLOCK_D == D here.
-    EPS: tl.constexpr = 1e-10
-    valsf = vals.to(tl.float32)
-    token_amax = tl.max(tl.where(mask, tl.abs(valsf), 0.0))
-    scale = tl.maximum(token_amax, EPS) / FP8_MAX
-    q = tl.clamp(valsf / scale, -FP8_MAX, FP8_MAX)
-    q = q.to(unified_ptr.dtype.element_ty)
-    tl.store(unified_ptr + loc * D + offs, q, mask=mask)
-    g_offs = tl.arange(0, NUM_GROUPS)
-    tl.store(
-        scale_ptr + loc * NUM_GROUPS + g_offs,
-        tl.zeros((NUM_GROUPS,), tl.float32) + scale,
-    )
-
-
-def store_quant_fp8_by_loc(
+def store_mxfp8_by_loc(
     *,
-    kv: torch.Tensor,  # [T, D] norm+rope'd (any float dtype)
+    kv: torch.Tensor,  # [T, head_dim] norm+rope'd (any float dtype)
     loc: torch.Tensor,  # [T] int destination rows in the unified pool
-    unified_kv: torch.Tensor,  # [pages, D] fp8 (_FP8_DTYPE)
-    unified_kv_scales: torch.Tensor,  # [pages, D // 64] fp32
+    unified_kv_nope: torch.Tensor,  # [pages, 512] fp8 (MXFP8-packed NoPE)
+    unified_kv_rope: torch.Tensor,  # [pages, 64] bf16
 ) -> None:
-    """HIP-safe 1x64 block-scale fp8 quant + scatter to explicit pool rows.
-
-    Identical on-disk contract to the ``_swa_scatter_kernel`` QUANT branch
-    (path 2) and the decode/prefill dequant (``fp8 * scale``):
-    ``scale_g = amax(|group_g|)/fp8_max``, ``fp8 = clamp(elem / scale_g)``.
-    Used by the decode store (path 1) and compressed-K store (path 3) so all
-    three paths emit byte-identical layout without any CUDA-only symbol.
-    """
-    n_rows, D = kv.shape
-    if n_rows == 0:
-        return
-
-    from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
-        _FP8_DTYPE,
-        _FP8_GROUP_SIZE,
-    )
-    from sglang.srt.layers.quantization.fp8_kernel import fp8_max
-
-    assert unified_kv.dtype == _FP8_DTYPE
-    assert D % _FP8_GROUP_SIZE == 0
-    num_groups = D // _FP8_GROUP_SIZE
-    assert unified_kv_scales.shape[1] == num_groups
-
-    # The kernel reads ``kv`` with explicit row/col strides and casts ``loc`` to
-    # int64 in-kernel, so we avoid a ``.contiguous()`` copy and an int64 cast
-    # (each was a separate per-call elementwise launch on the decode hot path).
-    # ``loc`` is required contiguous (1-D dst rows); this is a no-op when it
-    # already is, so no kernel is launched.
-    if not loc.is_contiguous():
-        loc = loc.contiguous()
-    _quant_scatter_by_loc_kernel[(n_rows,)](
-        kv,
-        loc,
-        unified_kv,
-        unified_kv_scales,
-        n_rows,
-        kv.stride(0),
-        kv.stride(1),
-        D=D,
-        BLOCK_D=D,  # exact reshape requires BLOCK_D == D
-        GROUP_SIZE=_FP8_GROUP_SIZE,
-        NUM_GROUPS=num_groups,
-        FP8_MAX=fp8_max,
-        num_warps=8,
+    """MXFP8 (E8M0 per-32-block) NoPE quant + BF16 RoPE scatter to explicit pool
+    rows. Same on-disk contract as the SWA ring store (``store_swa_into_unified``)
+    and the decode/prefill read kernels. Used by the compressed-K store; HIP-safe
+    (pure Triton, no CUDA-only symbol)."""
+    _launch_mxfp8_pack(
+        kv=kv,
+        loc=loc,
+        unified_kv_nope=unified_kv_nope,
+        unified_kv_rope=unified_kv_rope,
     )
 
 
@@ -287,15 +260,21 @@ def _lengths_to_indptr(lengths: torch.Tensor) -> torch.Tensor:
 def decode(
     *,
     q: torch.Tensor,  # [T, H, D] (local heads)
-    unified_kv: torch.Tensor,  # [pages, D] bf16 (or fp8 when kv_scales given)
+    unified_kv: torch.Tensor,  # [pages, D] bf16, or [pages,512] fp8 (MXFP8 NoPE)
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,  # [H] fp32
     softmax_scale: float,
-    kv_scales: Optional[torch.Tensor] = None,  # [pages, D//64] fp32 (fp8 KV)
+    unified_kv_rope: Optional[torch.Tensor] = None,  # [pages,64] bf16 (fp8 KV)
 ) -> torch.Tensor:
     return sparse_attn_v4_paged_decode(
-        q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale, kv_scales
+        q,
+        unified_kv,
+        kv_indices,
+        kv_indptr,
+        attn_sink,
+        softmax_scale,
+        unified_kv_rope=unified_kv_rope,
     )
 
 
@@ -585,7 +564,7 @@ def build_prefill_indices(
 def prefill(
     *,
     q: torch.Tensor,  # [T, H, D]
-    unified_kv: torch.Tensor,  # [pages, D]
+    unified_kv: torch.Tensor,  # [pages, D] bf16, or [pages,512] fp8 (MXFP8 NoPE)
     kv_indices_prefix: torch.Tensor,
     kv_indptr_prefix: torch.Tensor,
     kv_extend: torch.Tensor,  # [T, D] current-chunk K (bf16, norm+rope'd)
@@ -593,7 +572,7 @@ def prefill(
     kv_indptr_extend: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
-    kv_scales: Optional[torch.Tensor] = None,  # [pages, D//64] fp32 (fp8 KV)
+    unified_kv_rope: Optional[torch.Tensor] = None,  # [pages,64] bf16 (fp8 KV)
 ) -> torch.Tensor:
     return sparse_attn_v4_paged_prefill(
         q,
@@ -605,5 +584,5 @@ def prefill(
         kv_indptr_extend,
         attn_sink,
         softmax_scale,
-        kv_scales=kv_scales,
+        unified_kv_rope=unified_kv_rope,
     )

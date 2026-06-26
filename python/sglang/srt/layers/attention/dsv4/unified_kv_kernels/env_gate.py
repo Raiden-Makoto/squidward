@@ -19,7 +19,8 @@ _TRUTHY = ("1", "true", "yes", "on")
 
 @functools.lru_cache(maxsize=1)
 def unified_kv_use_fp8() -> bool:
-    """Whether the unified KV attention pool should use fp8 1x64 block-scale storage.
+    """Whether the unified KV attention pool should use the upstream aiter MXFP8
+    (E8M0 per-32-block NoPE-fp8 / RoPE-bf16) storage layout (#3751).
 
     Strictly opt-in and default OFF. Returns True only when ALL hold:
       (a) running on HIP (ROCm),

@@ -65,24 +65,20 @@ _is_hip = is_hip()
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
 _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
 
-# FP8 KV cache (1xGROUP_SIZE block-scale quantization).
+# MXFP8 unified KV cache (upstream aiter NoPE-fp8 / RoPE-bf16; ROCm/aiter #3751).
 #
-# Storage: unified_kv[total_pages, D] in fp8 (_FP8_DTYPE) + kv_scales[
-# total_pages, D // GROUP_SIZE] in fp32. Per-slot, D is split into NUM_GROUPS
-# chunks of GROUP_SIZE elements; each chunk shares one fp32 scale.
-# Dequant in-kernel: kv_bf16 = kv_fp8.to(fp32) * scale[d // GROUP_SIZE], cast
-# back to q.dtype before the second dot.
-#
-# GROUP_SIZE=64 matches the user's 1x64 quant spec. V4-Pro: D=512 → 8 scales
-# per slot, 4 bytes each → +6.25% storage on top of the fp8 pool (vs the
-# halving from bf16→fp8 = 2× saving — net ~46% read bandwidth reduction).
-_FP8_GROUP_SIZE = 64
+# Storage: a [pages, 512] fp8 NoPE buffer (MXFP8-packed: 448 fp8 data + 14 uint8
+# E8M0 per-32-block exponents + 50 pad, see mxfp8.py) and a parallel [pages, 64]
+# bf16 RoPE buffer. The decode kernel reconstructs a [BLOCK_K, 512] bf16 KV tile
+# from the two sources -- E8M0-dequant the 448 NoPE dims (scale = 2^(e8m0-127)),
+# copy the 64 bf16 RoPE dims -- then runs the identical bf16 online-softmax dot
+# (q[:448]·k_nope + q[448:]·k_rope folds into the single 512-wide dot).
+from sglang.srt.layers.attention.dsv4.unified_kv_kernels import mxfp8 as _mxfp8
 
-# fp8 decode path: native fp8-MFMA (per-token 1xD scale) vs the legacy bf16
-# dequant-materialize path. Default on. The store kernels write a per-token
-# scale replicated across all NUM_GROUPS scale columns, so the legacy dequant
-# path stays bit-correct when this is disabled (each group scale == token scale).
-_DECODE_FP8_MFMA = os.environ.get("SGLANG_DSV4_DECODE_FP8_MFMA", "1") == "1"
+_MXFP8_NOPE = _mxfp8.DIM_NOPE  # 448
+_MXFP8_ROPE = _mxfp8.DIM_ROPE  # 64
+_MXFP8_BLK = _mxfp8.FP8_BLOCK  # 32
+_MXFP8_FP8_DTYPE = _mxfp8.FP8_DTYPE  # e4m3fn (MXFP8 is gfx950-only)
 
 
 @functools.lru_cache(maxsize=1)
@@ -93,6 +89,52 @@ def is_fp8_fnuz() -> bool:
     return False
 
 _FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+
+
+@triton.jit
+def _load_mxfp8_kv_tile(
+    unified_fp8_ptr,  # [pages, 512] fp8 (MXFP8-packed NoPE)
+    unified_u8_ptr,  # same buffer viewed as uint8 (for the E8M0 scale bytes)
+    rope_ptr,  # [pages, 64] bf16
+    slot,  # [BLOCK_K] int  page rows
+    valid,  # [BLOCK_K] bool
+    d_offs,  # [BLOCK_D] int  (BLOCK_D == 512)
+    kv_stride_n,
+    rope_stride_n,
+    NOPE: tl.constexpr,  # 448
+    FP8_BLK: tl.constexpr,  # 32
+    OUT_DTYPE: tl.constexpr,
+):
+    """Reconstruct a [BLOCK_K, BLOCK_D=512] bf16 KV tile from the MXFP8 NoPE
+    pack + bf16 RoPE buffer.
+
+      cols [0, 448):    nope_fp8 * 2^(E8M0[d//32] - 127)
+      cols [448, 512):  rope bf16 (rope_buffer[:, d-448])
+    """
+    nope_mask = d_offs < NOPE
+    kv_fp8 = tl.load(
+        unified_fp8_ptr + slot[:, None] * kv_stride_n + d_offs[None, :],
+        mask=valid[:, None] & nope_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    # E8M0 exponent byte for block d//FP8_BLK lives inline at col NOPE + d//FP8_BLK.
+    g_idx = d_offs // FP8_BLK
+    e_byte = tl.load(
+        unified_u8_ptr + slot[:, None] * kv_stride_n + (NOPE + g_idx)[None, :],
+        mask=valid[:, None] & nope_mask[None, :],
+        other=127,
+    ).to(tl.int32)
+    scale = tl.exp2((e_byte - 127).to(tl.float32))
+    nope_deq = kv_fp8 * scale
+    # rope: cols [NOPE, NOPE+ROPE) <- rope_buffer[:, d-NOPE]
+    rope_idx = d_offs - NOPE
+    rope_val = tl.load(
+        rope_ptr + slot[:, None] * rope_stride_n + rope_idx[None, :],
+        mask=valid[:, None] & (~nope_mask[None, :]),
+        other=0.0,
+    ).to(tl.float32)
+    kv_full = tl.where(nope_mask[None, :], nope_deq, rope_val)
+    return kv_full.to(OUT_DTYPE)
 
 
 @functools.lru_cache(maxsize=1)
@@ -202,8 +244,9 @@ def _kv_splits_heuristic(
 @triton.jit
 def _paged_decode_fused_kernel(
     q_ptr,  # [N, H, D]
-    unified_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
-    kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 when QUANT_KV (dummy otherwise)
+    unified_kv_ptr,  # [total_pages, D] bf16/fp16, or [pages,512] fp8 when QUANT_KV
+    unified_u8_ptr,  # unified_kv viewed as uint8 (E8M0 bytes) when QUANT_KV (dummy otherwise)
+    rope_ptr,  # [total_pages, 64] bf16 when QUANT_KV (dummy otherwise)
     kv_indices_ptr,  # [total_indices] int32
     kv_indptr_ptr,  # [N+1] int32
     attn_sink_ptr,  # [H]
@@ -213,7 +256,7 @@ def _paged_decode_fused_kernel(
     q_stride_d,
     kv_stride_n,
     kv_stride_d,
-    ks_stride_n,  # row stride of kv_scales (groups are contiguous, stride=1)
+    rope_stride_n,  # row stride of rope buffer
     out_stride_t,
     out_stride_h,
     out_stride_d,
@@ -224,9 +267,9 @@ def _paged_decode_fused_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    QUANT_KV: tl.constexpr,  # True → dequant fp8 KV via kv_scales
-    GROUP_SIZE: tl.constexpr,  # scale block width along D (e.g. 64)
-    NUM_GROUPS: tl.constexpr,  # D // GROUP_SIZE (constexpr; D % GROUP_SIZE == 0)
+    QUANT_KV: tl.constexpr,  # True → MXFP8 dequant (E8M0 NoPE + bf16 RoPE)
+    NOPE: tl.constexpr,  # NoPE dim (448) when QUANT_KV
+    FP8_BLK: tl.constexpr,  # MXFP8 block width (32) when QUANT_KV
     NUM_K_STAGES: tl.constexpr,  # SW-pipeline depth of the inner K loop
 ):
     """Single-pass online-softmax with sink folded inline — fast path for
@@ -264,15 +307,6 @@ def _paged_decode_fused_kernel(
     acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
 
     k_offs = tl.arange(0, BLOCK_K)
-    if QUANT_KV:
-        # Load only the NUM_GROUPS distinct 1xGROUP_SIZE block-scales per page;
-        # the ×GROUP_SIZE broadcast is deferred into the multiply (see loop) so
-        # the wide fp32 scales tile is never materialized.
-        tl.static_assert(
-            BLOCK_D == NUM_GROUPS * GROUP_SIZE,
-            "fp8 dequant reshape needs BLOCK_D == NUM_GROUPS * GROUP_SIZE",
-        )
-        g_offs = tl.arange(0, NUM_GROUPS)
     # NUM_K_STAGES sets the inner K loop's SW-pipeline depth (3 for bf16, 2
     # for fp8). Deeper pipeline keeps more in-flight KV gathers while the
     # current MFMA runs — better hides AMD HBM gather latency on D=512. Cost:
@@ -287,30 +321,30 @@ def _paged_decode_fused_kernel(
             other=0,  # any in-bounds slot; the read is masked out below
         )
 
-        kv_raw = tl.load(
-            unified_kv_ptr
-            + slot[:, None] * kv_stride_n
-            + d_offs[None, :] * kv_stride_d,
-            mask=valid[:, None] & d_mask[None, :],
-            other=0.0,
-        )
         if QUANT_KV:
-            # 1xGROUP_SIZE block-scale dequant. Load only the NUM_GROUPS
-            # distinct scales per row ([BLOCK_K, NUM_GROUPS]), then broadcast
-            # over GROUP_SIZE *inside* the multiply via reshape. The wide
-            # [BLOCK_K, BLOCK_D] fp32 scales tile is never named, cutting the
-            # live fp32 footprint ~GROUP_SIZE× — this was the dominant reg/LDS
-            # pressure on the fp8 path. Row-major reshape maps column d to
-            # group d // GROUP_SIZE, matching the original per-element index.
-            scales = tl.load(
-                kv_scales_ptr + slot[:, None] * ks_stride_n + g_offs[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            ).to(q.dtype)
-            kv = tl.reshape(kv_raw.to(q.dtype), (BLOCK_K, NUM_GROUPS, GROUP_SIZE))
-            kv = tl.reshape(kv * scales[:, :, None], (BLOCK_K, BLOCK_D))
+            # MXFP8: reconstruct the [BLOCK_K, 512] bf16 KV tile (E8M0-dequant
+            # 448 NoPE dims + bf16 RoPE tail), then the dot is identical to bf16.
+            kv = _load_mxfp8_kv_tile(
+                unified_kv_ptr,
+                unified_u8_ptr,
+                rope_ptr,
+                slot,
+                valid,
+                d_offs,
+                kv_stride_n,
+                rope_stride_n,
+                NOPE,
+                FP8_BLK,
+                q.dtype,
+            )
         else:
-            kv = kv_raw
+            kv = tl.load(
+                unified_kv_ptr
+                + slot[:, None] * kv_stride_n
+                + d_offs[None, :] * kv_stride_d,
+                mask=valid[:, None] & d_mask[None, :],
+                other=0.0,
+            )
 
         scores = tl.dot(q, tl.trans(kv)) * qk_scale
         # K: drop h_mask from the per-iter where. In V4-Pro every realistic
@@ -360,8 +394,9 @@ def _paged_decode_fused_kernel(
 @triton.jit
 def _paged_decode_split_kernel(
     q_ptr,  # [N, H, D]
-    unified_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
-    kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 when QUANT_KV (dummy otherwise)
+    unified_kv_ptr,  # [total_pages, D] bf16/fp16, or [pages,512] fp8 when QUANT_KV
+    unified_u8_ptr,  # unified_kv viewed as uint8 (E8M0 bytes) when QUANT_KV (dummy otherwise)
+    rope_ptr,  # [total_pages, 64] bf16 when QUANT_KV (dummy otherwise)
     kv_indices_ptr,  # [total_indices] int32
     kv_indptr_ptr,  # [N+1] int32
     m_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
@@ -372,7 +407,7 @@ def _paged_decode_split_kernel(
     q_stride_d,
     kv_stride_n,
     kv_stride_d,
-    ks_stride_n,  # row stride of kv_scales (groups are contiguous, stride=1)
+    rope_stride_n,  # row stride of rope buffer
     mp_stride_t,
     mp_stride_k,
     mp_stride_h,
@@ -390,9 +425,9 @@ def _paged_decode_split_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    QUANT_KV: tl.constexpr,  # True → dequant fp8 KV via kv_scales
-    GROUP_SIZE: tl.constexpr,  # scale block width along D (e.g. 64)
-    NUM_GROUPS: tl.constexpr,  # D // GROUP_SIZE
+    QUANT_KV: tl.constexpr,  # True → MXFP8 dequant (E8M0 NoPE + bf16 RoPE)
+    NOPE: tl.constexpr,  # NoPE dim (448) when QUANT_KV
+    FP8_BLK: tl.constexpr,  # MXFP8 block width (32) when QUANT_KV
     NUM_K_STAGES: tl.constexpr,  # SW-pipeline depth of the inner K loop
 ):
     """3D split-K + exp2-softmax sparse paged-decode. Grid: (N, ceil(H/BLOCK_H), KV_SPLITS).
@@ -443,13 +478,6 @@ def _paged_decode_split_kernel(
     acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
 
     k_offs = tl.arange(0, BLOCK_K)
-    if QUANT_KV:
-        # See fused kernel: skinny per-group scale load, broadcast deferred.
-        tl.static_assert(
-            BLOCK_D == NUM_GROUPS * GROUP_SIZE,
-            "fp8 dequant reshape needs BLOCK_D == NUM_GROUPS * GROUP_SIZE",
-        )
-        g_offs = tl.arange(0, NUM_GROUPS)
     # NUM_K_STAGES (see fused kernel comment for rationale).
     for j in tl.range(tile_start, tile_end, num_stages=NUM_K_STAGES):
         k_start = j * BLOCK_K
@@ -461,25 +489,28 @@ def _paged_decode_split_kernel(
             other=0,  # any in-bounds slot; masked out below
         )
 
-        kv_raw = tl.load(
-            unified_kv_ptr
-            + slot[:, None] * kv_stride_n
-            + d_offs[None, :] * kv_stride_d,
-            mask=valid[:, None] & d_mask[None, :],
-            other=0.0,
-        )
         if QUANT_KV:
-            # See fused kernel: skinny [BLOCK_K, NUM_GROUPS] scale load, defer
-            # the GROUP_SIZE broadcast to the multiply via reshape.
-            scales = tl.load(
-                kv_scales_ptr + slot[:, None] * ks_stride_n + g_offs[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            ).to(q.dtype)
-            kv = tl.reshape(kv_raw.to(q.dtype), (BLOCK_K, NUM_GROUPS, GROUP_SIZE))
-            kv = tl.reshape(kv * scales[:, :, None], (BLOCK_K, BLOCK_D))
+            kv = _load_mxfp8_kv_tile(
+                unified_kv_ptr,
+                unified_u8_ptr,
+                rope_ptr,
+                slot,
+                valid,
+                d_offs,
+                kv_stride_n,
+                rope_stride_n,
+                NOPE,
+                FP8_BLK,
+                q.dtype,
+            )
         else:
-            kv = kv_raw
+            kv = tl.load(
+                unified_kv_ptr
+                + slot[:, None] * kv_stride_n
+                + d_offs[None, :] * kv_stride_d,
+                mask=valid[:, None] & d_mask[None, :],
+                other=0.0,
+            )
 
         scores = tl.dot(q, tl.trans(kv)) * qk_scale
         # K (same as fused kernel): drop h_mask from per-iter where.
@@ -651,254 +682,10 @@ def _paged_decode_reduce_kernel(
     )
 
 
-# ---------------------------------------------------------------------------
-# FP8 native-MFMA decode (per-token 1xD scale).
-#
-# The fp8 dequant path above materializes a bf16 KV tile (cast + per-group scale
-# multiply) to feed a bf16 MFMA — VALU-bound, ~2-4x slower than bf16 at decode
-# shapes. These kernels instead feed fp8 DIRECTLY to tl.dot (native fp8 MFMA, 2x
-# throughput, no bf16 materialize). q is quantized per-row to fp8 once; p is
-# quantized per-row to fp8 each tile. The KV cache is per-TOKEN quantized (one
-# scale per slot, replicated across the NUM_GROUPS scale columns by the store
-# kernels), so the scale is a scalar per slot that factors out of the dot:
-#   QK:  scores[h,k] = q_scale[h] * kv_scale[k] * dot(q_fp8, kv_fp8)[h,k]
-#   PV:  acc[h,:]    = sum_k (p[h,k]*kv_scale[k]) * kv_fp8[k,:]
-# kv_scale[k] is read from scale column 0 (all columns are equal). Measured
-# ~0.79-0.92x bf16 (vs ~2.4-3.8x for the dequant path) across decode shapes.
-# ---------------------------------------------------------------------------
-
-
-@triton.jit
-def _paged_decode_fp8mfma_fused_kernel(
-    q_ptr,  # [N, H, D]
-    unified_kv_ptr,  # [total_pages, D] fp8 (_FP8_DTYPE)
-    kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 (per-token: all cols equal)
-    kv_indices_ptr,  # [total_indices] int32
-    kv_indptr_ptr,  # [N+1] int32
-    attn_sink_ptr,  # [H]
-    out_ptr,  # [N, H, D]
-    q_stride_t,
-    q_stride_h,
-    q_stride_d,
-    kv_stride_n,
-    kv_stride_d,
-    ks_stride_n,  # row stride of kv_scales (read column 0 == per-token scale)
-    out_stride_t,
-    out_stride_h,
-    out_stride_d,
-    qk_scale,  # = softmax_scale * LOG2E
-    log2e,  # = LOG2E
-    H: tl.constexpr,
-    D: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    FP8_MAX: tl.constexpr,  # arch fp8 e4m3 max (448 fn / 240 fnuz)
-    NUM_K_STAGES: tl.constexpr,
-):
-    """Single-pass per-token fp8-MFMA decode (kv_splits == 1 fast path)."""
-    t = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
-    d_offs = tl.arange(0, BLOCK_D)
-    h_mask = h_offs < H
-    d_mask = d_offs < D
-
-    q = tl.load(
-        q_ptr
-        + t * q_stride_t
-        + h_offs[:, None] * q_stride_h
-        + d_offs[None, :] * q_stride_d,
-        mask=h_mask[:, None] & d_mask[None, :],
-        other=0.0,
-    )
-    # Per-row q quant to fp8 (loop-invariant). Scale folded back post-dot.
-    sq = tl.max(tl.abs(q), axis=1) / FP8_MAX + 1e-20
-    qf = (q / sq[:, None]).to(unified_kv_ptr.dtype.element_ty)
-
-    kv_start = tl.load(kv_indptr_ptr + t)
-    kv_end = tl.load(kv_indptr_ptr + t + 1)
-    kv_len = kv_end - kv_start
-    num_tiles = tl.cdiv(kv_len, BLOCK_K)
-
-    neg = -3.4028234663852886e38
-    m_i = tl.full((BLOCK_H,), neg, dtype=tl.float32)
-    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
-    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
-
-    k_offs = tl.arange(0, BLOCK_K)
-    for j in tl.range(0, num_tiles, num_stages=NUM_K_STAGES):
-        k_pos = j * BLOCK_K + k_offs
-        valid = k_pos < kv_len
-        slot = tl.load(kv_indices_ptr + kv_start + k_pos, mask=valid, other=0)
-        kv = tl.load(
-            unified_kv_ptr
-            + slot[:, None] * kv_stride_n
-            + d_offs[None, :] * kv_stride_d,
-            mask=valid[:, None] & d_mask[None, :],
-            other=0.0,
-        )  # [BLOCK_K, D] fp8
-        skv = tl.load(kv_scales_ptr + slot * ks_stride_n, mask=valid, other=0.0)
-
-        # QK: single full-D fp8 dot; per-token scales factor out post-dot.
-        raw = tl.dot(qf, tl.trans(kv))
-        scores = raw * sq[:, None] * skv[None, :] * qk_scale
-        scores = tl.where(valid[None, :], scores, neg)
-
-        m_block = tl.max(scores, axis=1)
-        m_new = tl.maximum(m_i, m_block)
-        alpha = tl.exp2(m_i - m_new)
-        p = tl.exp2(scores - m_new[:, None])
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-
-        # PV: fold per-token kv scale into p, one fp8 quant, one full-D dot.
-        pp = p * skv[None, :]
-        sp = tl.max(tl.abs(pp), axis=1) / FP8_MAX + 1e-20
-        ppf = (pp / sp[:, None]).to(unified_kv_ptr.dtype.element_ty)
-        acc = acc * alpha[:, None] + tl.dot(ppf, kv) * sp[:, None]
-        m_i = m_new
-
-    sink_raw = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg).to(tl.float32)
-    sink = sink_raw * log2e
-    m_final = tl.maximum(m_i, sink)
-    alpha_kv = tl.exp2(m_i - m_final)
-    alpha_sink = tl.exp2(sink - m_final)
-    l_final = l_i * alpha_kv + alpha_sink
-    denom = tl.maximum(l_final, 1.0e-30)
-    out = tl.where(
-        l_final[:, None] > 0.0, (acc * alpha_kv[:, None]) / denom[:, None], 0.0
-    )
-    tl.store(
-        out_ptr
-        + t * out_stride_t
-        + h_offs[:, None] * out_stride_h
-        + d_offs[None, :] * out_stride_d,
-        out.to(out_ptr.dtype.element_ty),
-        mask=h_mask[:, None] & d_mask[None, :],
-    )
-
-
-@triton.jit
-def _paged_decode_fp8mfma_split_kernel(
-    q_ptr,  # [N, H, D]
-    unified_kv_ptr,  # [total_pages, D] fp8
-    kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 (per-token: all cols equal)
-    kv_indices_ptr,  # [total_indices] int32
-    kv_indptr_ptr,  # [N+1] int32
-    m_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
-    l_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
-    acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32
-    q_stride_t,
-    q_stride_h,
-    q_stride_d,
-    kv_stride_n,
-    kv_stride_d,
-    ks_stride_n,
-    mp_stride_t,
-    mp_stride_k,
-    mp_stride_h,
-    lp_stride_t,
-    lp_stride_k,
-    lp_stride_h,
-    ap_stride_t,
-    ap_stride_k,
-    ap_stride_h,
-    ap_stride_d,
-    H: tl.constexpr,
-    D: tl.constexpr,
-    KV_SPLITS: tl.constexpr,
-    qk_scale,
-    BLOCK_H: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    FP8_MAX: tl.constexpr,
-    NUM_K_STAGES: tl.constexpr,
-):
-    """Split-K per-token fp8-MFMA decode. Grid: (N, ceil(H/BLOCK_H), KV_SPLITS).
-
-    Mirrors ``_paged_decode_split_kernel`` control flow (tiles_per_segment
-    early-return + pre-sink (m, l, acc) fp32 partials); the existing reduce
-    kernel folds the sink and combines splits.
-    """
-    t = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    pid_k = tl.program_id(2)
-
-    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
-    d_offs = tl.arange(0, BLOCK_D)
-    h_mask = h_offs < H
-    d_mask = d_offs < D
-
-    q = tl.load(
-        q_ptr
-        + t * q_stride_t
-        + h_offs[:, None] * q_stride_h
-        + d_offs[None, :] * q_stride_d,
-        mask=h_mask[:, None] & d_mask[None, :],
-        other=0.0,
-    )
-    sq = tl.max(tl.abs(q), axis=1) / FP8_MAX + 1e-20
-    qf = (q / sq[:, None]).to(unified_kv_ptr.dtype.element_ty)
-
-    kv_start = tl.load(kv_indptr_ptr + t)
-    kv_end = tl.load(kv_indptr_ptr + t + 1)
-    kv_len = kv_end - kv_start
-
-    tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
-    if pid_k * tiles_per_segment * BLOCK_K >= kv_len:
-        return
-    num_tiles = tl.cdiv(kv_len, BLOCK_K)
-    tile_start = pid_k * tiles_per_segment
-    tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
-
-    neg = -3.4028234663852886e38
-    m_i = tl.full((BLOCK_H,), neg, dtype=tl.float32)
-    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
-    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
-
-    k_offs = tl.arange(0, BLOCK_K)
-    for j in tl.range(tile_start, tile_end, num_stages=NUM_K_STAGES):
-        k_pos = j * BLOCK_K + k_offs
-        valid = k_pos < kv_len
-        slot = tl.load(kv_indices_ptr + kv_start + k_pos, mask=valid, other=0)
-        kv = tl.load(
-            unified_kv_ptr
-            + slot[:, None] * kv_stride_n
-            + d_offs[None, :] * kv_stride_d,
-            mask=valid[:, None] & d_mask[None, :],
-            other=0.0,
-        )
-        skv = tl.load(kv_scales_ptr + slot * ks_stride_n, mask=valid, other=0.0)
-
-        raw = tl.dot(qf, tl.trans(kv))
-        scores = raw * sq[:, None] * skv[None, :] * qk_scale
-        scores = tl.where(valid[None, :], scores, neg)
-
-        m_block = tl.max(scores, axis=1)
-        m_new = tl.maximum(m_i, m_block)
-        alpha = tl.exp2(m_i - m_new)
-        p = tl.exp2(scores - m_new[:, None])
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-
-        pp = p * skv[None, :]
-        sp = tl.max(tl.abs(pp), axis=1) / FP8_MAX + 1e-20
-        ppf = (pp / sp[:, None]).to(unified_kv_ptr.dtype.element_ty)
-        acc = acc * alpha[:, None] + tl.dot(ppf, kv) * sp[:, None]
-        m_i = m_new
-
-    m_base = t * mp_stride_t + pid_k * mp_stride_k
-    tl.store(m_partial_ptr + m_base + h_offs * mp_stride_h, m_i, mask=h_mask)
-    l_base = t * lp_stride_t + pid_k * lp_stride_k
-    tl.store(l_partial_ptr + l_base + h_offs * lp_stride_h, l_i, mask=h_mask)
-    a_base = t * ap_stride_t + pid_k * ap_stride_k
-    tl.store(
-        acc_partial_ptr
-        + a_base
-        + h_offs[:, None] * ap_stride_h
-        + d_offs[None, :] * ap_stride_d,
-        acc,
-        mask=h_mask[:, None] & d_mask[None, :],
-    )
+# NOTE: A per-token native-fp8-MFMA decode path lived here previously. It relied
+# on a single per-token scalar KV scale, which the MXFP8 (per-32-block E8M0)
+# format no longer provides, so it was removed. The MXFP8 path dequants to bf16
+# in-kernel (``_load_mxfp8_kv_tile``) and reuses the bf16 dot above.
 
 
 # ---------------------------------------------------------------------------
@@ -913,7 +700,7 @@ def _sparse_attn_v4_paged_decode_triton(
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
-    kv_scales: torch.Tensor | None = None,
+    unified_kv_rope: torch.Tensor | None = None,
     block_h: int | None = None,
     kv_splits: int | None = None,
     block_k: int | None = None,
@@ -923,10 +710,13 @@ def _sparse_attn_v4_paged_decode_triton(
     exp2 softmax, CG-safe heuristic. ``block_h`` and ``kv_splits`` are
     escape hatches for benchmarks; production callers pass neither.
 
-    When ``kv_scales`` is provided, ``unified_kv`` must be the arch fp8 format
-    ``_FP8_DTYPE`` (e4m3fn on gfx950 / e4m3fnuz on gfx942) and ``kv_scales``
-    must be ``[total_pages, D // GROUP_SIZE]`` fp32 — 1xGROUP_SIZE block-scale
-    quantization. Dequant happens in-kernel; the dot still runs in q.dtype.
+    When ``unified_kv_rope`` is provided, the pool is the upstream aiter MXFP8
+    layout: ``unified_kv`` is ``[pages, 512]`` fp8 (``_MXFP8_FP8_DTYPE``,
+    MXFP8-packed NoPE = 448 fp8 data + 14 uint8 E8M0 per-32-block exponents +
+    50 pad) and ``unified_kv_rope`` is ``[pages, 64]`` bf16. The kernel
+    reconstructs a ``[BLOCK_K, 512]`` bf16 KV tile in-kernel
+    (``_load_mxfp8_kv_tile``: E8M0-dequant the 448 NoPE dims, copy the 64 RoPE
+    dims) and runs the identical bf16 online-softmax dot.
     """
     if not q.is_cuda:
         raise RuntimeError(
@@ -937,28 +727,32 @@ def _sparse_attn_v4_paged_decode_triton(
             f"sparse_attn_v4_paged_decode expects fp16/bf16 q, got {q.dtype}"
         )
 
-    quant_kv = kv_scales is not None
+    quant_kv = unified_kv_rope is not None
     if quant_kv:
-        if unified_kv.dtype != _FP8_DTYPE:
+        if unified_kv.dtype != _MXFP8_FP8_DTYPE:
             raise RuntimeError(
-                f"kv_scales supplied but unified_kv is {unified_kv.dtype}, "
-                f"expected {_FP8_DTYPE}"
+                f"MXFP8 unified_kv_rope supplied but unified_kv is "
+                f"{unified_kv.dtype}, expected {_MXFP8_FP8_DTYPE}"
             )
-        if kv_scales.dtype != torch.float32:
-            raise RuntimeError(f"kv_scales must be fp32, got {kv_scales.dtype}")
-        D_check = unified_kv.shape[-1]
-        if D_check % _FP8_GROUP_SIZE != 0:
+        if unified_kv.shape[-1] != 512:
             raise RuntimeError(
-                f"D={D_check} must be divisible by GROUP_SIZE={_FP8_GROUP_SIZE}"
+                f"MXFP8 NoPE buffer must be [pages, 512], got "
+                f"{tuple(unified_kv.shape)}"
             )
-        expected_g = D_check // _FP8_GROUP_SIZE
-        if kv_scales.shape != (unified_kv.shape[0], expected_g):
+        if unified_kv_rope.shape[-1] != _MXFP8_ROPE:
             raise RuntimeError(
-                f"kv_scales shape {tuple(kv_scales.shape)} does not match "
-                f"expected ({unified_kv.shape[0]}, {expected_g})"
+                f"RoPE buffer must be [pages, {_MXFP8_ROPE}], got "
+                f"{tuple(unified_kv_rope.shape)}"
             )
-        if kv_scales.stride(-1) != 1:
-            kv_scales = kv_scales.contiguous()
+        if unified_kv_rope.dtype != q.dtype:
+            raise RuntimeError(
+                f"RoPE buffer dtype {unified_kv_rope.dtype} must match q "
+                f"dtype {q.dtype}"
+            )
+        if unified_kv.stride(-1) != 1:
+            unified_kv = unified_kv.contiguous()
+        if unified_kv_rope.stride(-1) != 1:
+            unified_kv_rope = unified_kv_rope.contiguous()
     else:
         if unified_kv.dtype != q.dtype:
             raise RuntimeError(
@@ -984,77 +778,43 @@ def _sparse_attn_v4_paged_decode_triton(
     qk_scale = float(softmax_scale) * LOG2E
     _bk, num_warps, num_stages = _kernel_config(block_h)
     if block_k is None:
-        # fp8 dequant inflates per-tile ALU work ~4×; a wider K tile amortizes
-        # the per-tile dequant cost (scale load + cast + multiply) over more
-        # MFMA work (BLOCK_K=32 reported ~20% faster than 16 on fp8). BLOCK_K=32
-        # + the inner-loop num_stages=3 pipeline overflowed gfx950's 160KB LDS
-        # at D=512; pairing BLOCK_K=32 with NUM_K_STAGES=2 drops a staged
-        # (KV+fp32 scales) tile to fit. Experiment: confirm this launches.
+        # MXFP8 dequant inflates per-tile ALU work; a wider K tile amortizes
+        # the per-tile dequant cost (fp8 load + E8M0 exp2 scale + cast) over
+        # more MFMA work. BLOCK_K=32 + the inner-loop num_stages=3 pipeline
+        # overflowed gfx950's 160KB LDS at D=512; pairing BLOCK_K=32 with
+        # NUM_K_STAGES=2 drops a staged tile to fit.
         block_k = 32 if quant_kv else _bk
     # Inner K-loop SW-pipeline depth (escape hatch for benchmarks): default
     # bf16 keeps 3; fp8 uses 2.
     if num_k_stages is None:
         num_k_stages = 2 if quant_kv else 3
 
-    # Native fp8-MFMA decode (per-token 1xD scale): feeds fp8 directly to tl.dot
-    # instead of materializing a bf16 KV tile. Gated on the fp8 pool + env flag.
-    use_fp8_mfma = quant_kv and _DECODE_FP8_MFMA
-    fp8_max_val = float(torch.finfo(_FP8_DTYPE).max)
-
-    # Kernel reads (kv_scales_ptr, ks_stride_n) only when QUANT_KV — supply a
-    # dummy 1-element fp32 tensor on the bf16 path so the launch signature
-    # stays uniform (avoids a separate JIT specialization per call).
+    # The kernels read (unified_u8_ptr, rope_ptr, rope_stride_n) only when
+    # QUANT_KV — supply dummy 1-element tensors on the bf16 path so the launch
+    # signature stays uniform (avoids a separate JIT specialization per call).
     if quant_kv:
-        kv_scales_arg = kv_scales
-        ks_stride_n_arg = kv_scales.stride(0)
-        num_groups_arg = D // _FP8_GROUP_SIZE
+        unified_u8_arg = unified_kv.view(torch.uint8)
+        rope_arg = unified_kv_rope
+        kv_stride_n_arg = unified_kv.stride(0)
+        kv_stride_d_arg = unified_kv.stride(1)
+        rope_stride_n_arg = unified_kv_rope.stride(0)
     else:
-        kv_scales_arg = q.new_empty(1, dtype=torch.float32)
-        ks_stride_n_arg = 1
-        # NUM_GROUPS still needs a constexpr value (unused at compile time
-        # because the QUANT_KV=False branch elides the dequant code).
-        num_groups_arg = 1
+        unified_u8_arg = unified_kv  # unused at compile time (QUANT_KV False)
+        rope_arg = q.new_empty(1)
+        kv_stride_n_arg = unified_kv.stride(0)
+        kv_stride_d_arg = unified_kv.stride(1)
+        rope_stride_n_arg = 1
 
     # Fast path: when the base grid (T * n_head_blocks) already saturates the
     # GPU, kv_splits=1 and a single-pass fused kernel beats split+reduce by
     # skipping the partial-buffer alloc and the second kernel launch.
     if kv_splits == 1:
         grid_fused = (T, n_head_blocks)
-        if use_fp8_mfma:
-            _paged_decode_fp8mfma_fused_kernel[grid_fused](
-                q,
-                unified_kv,
-                kv_scales_arg,
-                kv_indices,
-                kv_indptr,
-                attn_sink,
-                out,
-                q.stride(0),
-                q.stride(1),
-                q.stride(2),
-                unified_kv.stride(0),
-                unified_kv.stride(1),
-                ks_stride_n_arg,
-                out.stride(0),
-                out.stride(1),
-                out.stride(2),
-                qk_scale,
-                LOG2E,
-                H,
-                D,
-                BLOCK_H=block_h,
-                BLOCK_D=block_d,
-                BLOCK_K=block_k,
-                FP8_MAX=fp8_max_val,
-                NUM_K_STAGES=num_k_stages,
-                num_warps=num_warps,
-                num_stages=num_stages,
-            )
-            return out
         _paged_decode_fused_kernel[grid_fused](
             q,
             unified_kv,
-            kv_scales_arg,
+            unified_u8_arg,
+            rope_arg,
             kv_indices,
             kv_indptr,
             attn_sink,
@@ -1062,9 +822,9 @@ def _sparse_attn_v4_paged_decode_triton(
             q.stride(0),
             q.stride(1),
             q.stride(2),
-            unified_kv.stride(0),
-            unified_kv.stride(1),
-            ks_stride_n_arg,
+            kv_stride_n_arg,
+            kv_stride_d_arg,
+            rope_stride_n_arg,
             out.stride(0),
             out.stride(1),
             out.stride(2),
@@ -1076,8 +836,8 @@ def _sparse_attn_v4_paged_decode_triton(
             BLOCK_D=block_d,
             BLOCK_K=block_k,
             QUANT_KV=quant_kv,
-            GROUP_SIZE=_FP8_GROUP_SIZE,
-            NUM_GROUPS=num_groups_arg,
+            NOPE=_MXFP8_NOPE,
+            FP8_BLK=_MXFP8_BLK,
             NUM_K_STAGES=num_k_stages,
             num_warps=num_warps,
             num_stages=num_stages,
@@ -1097,84 +857,46 @@ def _sparse_attn_v4_paged_decode_triton(
     )
 
     grid_split = (T, n_head_blocks, kv_splits)
-    if use_fp8_mfma:
-        _paged_decode_fp8mfma_split_kernel[grid_split](
-            q,
-            unified_kv,
-            kv_scales_arg,
-            kv_indices,
-            kv_indptr,
-            m_partial,
-            l_partial,
-            acc_partial,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            unified_kv.stride(0),
-            unified_kv.stride(1),
-            ks_stride_n_arg,
-            m_partial.stride(0),
-            m_partial.stride(1),
-            m_partial.stride(2),
-            l_partial.stride(0),
-            l_partial.stride(1),
-            l_partial.stride(2),
-            acc_partial.stride(0),
-            acc_partial.stride(1),
-            acc_partial.stride(2),
-            acc_partial.stride(3),
-            H,
-            D,
-            kv_splits,
-            qk_scale,
-            BLOCK_H=block_h,
-            BLOCK_D=block_d,
-            BLOCK_K=block_k,
-            FP8_MAX=fp8_max_val,
-            NUM_K_STAGES=num_k_stages,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-    else:
-        _paged_decode_split_kernel[grid_split](
-            q,
-            unified_kv,
-            kv_scales_arg,
-            kv_indices,
-            kv_indptr,
-            m_partial,
-            l_partial,
-            acc_partial,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            unified_kv.stride(0),
-            unified_kv.stride(1),
-            ks_stride_n_arg,
-            m_partial.stride(0),
-            m_partial.stride(1),
-            m_partial.stride(2),
-            l_partial.stride(0),
-            l_partial.stride(1),
-            l_partial.stride(2),
-            acc_partial.stride(0),
-            acc_partial.stride(1),
-            acc_partial.stride(2),
-            acc_partial.stride(3),
-            H,
-            D,
-            kv_splits,
-            qk_scale,
-            BLOCK_H=block_h,
-            BLOCK_D=block_d,
-            BLOCK_K=block_k,
-            QUANT_KV=quant_kv,
-            GROUP_SIZE=_FP8_GROUP_SIZE,
-            NUM_GROUPS=num_groups_arg,
-            NUM_K_STAGES=num_k_stages,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
+    _paged_decode_split_kernel[grid_split](
+        q,
+        unified_kv,
+        unified_u8_arg,
+        rope_arg,
+        kv_indices,
+        kv_indptr,
+        m_partial,
+        l_partial,
+        acc_partial,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        kv_stride_n_arg,
+        kv_stride_d_arg,
+        rope_stride_n_arg,
+        m_partial.stride(0),
+        m_partial.stride(1),
+        m_partial.stride(2),
+        l_partial.stride(0),
+        l_partial.stride(1),
+        l_partial.stride(2),
+        acc_partial.stride(0),
+        acc_partial.stride(1),
+        acc_partial.stride(2),
+        acc_partial.stride(3),
+        H,
+        D,
+        kv_splits,
+        qk_scale,
+        BLOCK_H=block_h,
+        BLOCK_D=block_d,
+        BLOCK_K=block_k,
+        QUANT_KV=quant_kv,
+        NOPE=_MXFP8_NOPE,
+        FP8_BLK=_MXFP8_BLK,
+        NUM_K_STAGES=num_k_stages,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
 
     # 2D-tile reduce: grid = (T, H, ceil(D/D_CHUNK)). One CTA per
     # (token, single-head, D-chunk). Adaptive D_CHUNK based on whether the
@@ -1234,13 +956,14 @@ def sparse_attn_v4_paged_decode(
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
-    kv_scales: torch.Tensor | None = None,
+    unified_kv_rope: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
-    When ``kv_scales`` is provided, ``unified_kv`` must be the arch fp8 format
-    ``_FP8_DTYPE`` (e4m3fn on gfx950 / e4m3fnuz on gfx942) and will be
-    dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
+    When ``unified_kv_rope`` is provided, ``unified_kv`` must be the upstream
+    aiter MXFP8 NoPE pack (``[pages, 512]`` fp8: 448 fp8 + 14 E8M0 bytes + 50
+    pad) and ``unified_kv_rope`` the parallel ``[pages, 64]`` bf16 RoPE buffer;
+    the kernel dequants the NoPE block-scales in-kernel and runs a bf16 dot.
     """
     return _sparse_attn_v4_paged_decode_triton(
         q,
@@ -1249,5 +972,5 @@ def sparse_attn_v4_paged_decode(
         kv_indptr,
         attn_sink,
         softmax_scale,
-        kv_scales=kv_scales,
+        unified_kv_rope=unified_kv_rope,
     )

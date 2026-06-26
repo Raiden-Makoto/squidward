@@ -49,14 +49,21 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.dsv4.unified_kv_kernels import mxfp8 as _mxfp8
 from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
-    _FP8_DTYPE,
-    _FP8_GROUP_SIZE,
+    _load_mxfp8_kv_tile,
 )
 from sglang.srt.utils.common import is_gfx95_supported
 
-# OPUS gfx950 paged-prefill kernel is preferred when importable; otherwise fall
-# back to the Triton implementation below.
+_MXFP8_NOPE = _mxfp8.DIM_NOPE  # 448
+_MXFP8_ROPE = _mxfp8.DIM_ROPE  # 64
+_MXFP8_BLK = _mxfp8.FP8_BLOCK  # 32
+_MXFP8_FP8_DTYPE = _mxfp8.FP8_DTYPE  # e4m3fn (MXFP8 is gfx950-only)
+
+# OPUS gfx950 paged-prefill kernels are preferred when importable; otherwise
+# fall back to the Triton implementation below. The bf16 prefix uses
+# ``pa_sparse_prefill_opus``; the MXFP8 fp8 prefix uses the split-input
+# ``pa_sparse_prefill_fp8_opus`` (ROCm/aiter #3751).
 try:
     from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
 
@@ -65,15 +72,24 @@ except ImportError:
     pa_sparse_prefill_opus = None
     _HAS_OPUS = False
 
+try:
+    from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_fp8_opus
+
+    _HAS_FP8_OPUS = is_gfx95_supported()
+except ImportError:
+    pa_sparse_prefill_fp8_opus = None
+    _HAS_FP8_OPUS = False
+
 
 @triton.jit
 def _sparse_attn_v4_paged_prefill_kernel(
     q_ptr,  # [N, H, D]
-    unified_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV — prefix src
-    kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 when QUANT_KV (dummy otherwise)
+    unified_kv_ptr,  # [total_pages, D] bf16/fp16, or [pages,512] fp8 (MXFP8) — prefix src
+    unified_u8_ptr,  # unified_kv viewed as uint8 (E8M0 bytes) when QUANT_KV (dummy otherwise)
+    rope_ptr,  # [total_pages, 64] bf16 prefix RoPE when QUANT_KV (dummy otherwise)
     kv_indices_prefix_ptr,  # [total_prefix_indices] int32
     kv_indptr_prefix_ptr,  # [N+1] int32
-    kv_ptr,  # [total_tokens, D]    — extend source
+    kv_ptr,  # [total_tokens, D]    — extend source (live bf16, never fp8)
     kv_indices_extend_ptr,  # [total_extend_indices] int32
     kv_indptr_extend_ptr,  # [N+1] int32
     attn_sink_ptr,  # [H]
@@ -83,7 +99,7 @@ def _sparse_attn_v4_paged_prefill_kernel(
     q_stride_d: tl.constexpr,
     pkv_stride_n: tl.constexpr,  # unified_kv stride 0 (= D usually)
     pkv_stride_d: tl.constexpr,  # unified_kv stride 1 (= 1 usually)
-    ks_stride_n,  # row stride of kv_scales (groups contiguous, stride=1)
+    rope_stride_n,  # row stride of prefix rope buffer (QUANT_KV only)
     ekv_stride_n: tl.constexpr,  # kv stride 0
     ekv_stride_d: tl.constexpr,  # kv stride 1
     out_stride_t: tl.constexpr,
@@ -95,9 +111,9 @@ def _sparse_attn_v4_paged_prefill_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    QUANT_KV: tl.constexpr,  # True → dequant fp8 unified_kv prefix via kv_scales
-    GROUP_SIZE: tl.constexpr,  # scale block width along D (e.g. 64)
-    NUM_GROUPS: tl.constexpr,  # D // GROUP_SIZE (constexpr; D % GROUP_SIZE == 0)
+    QUANT_KV: tl.constexpr,  # True → MXFP8 dequant of the unified_kv prefix
+    NOPE: tl.constexpr,  # NoPE dim (448) when QUANT_KV
+    FP8_BLK: tl.constexpr,  # MXFP8 block width (32) when QUANT_KV
 ):
     t = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -122,10 +138,6 @@ def _sparse_attn_v4_paged_prefill_kernel(
     acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
 
     k_offs = tl.arange(0, BLOCK_K)
-    if QUANT_KV:
-        # Compile-time per-D-element group index (NUM_GROUPS distinct values);
-        # only used to dequant the unified-pool prefix loads below.
-        g_idx_per_d = d_offs // GROUP_SIZE
 
     # ===== Region 1: prefix from unified_kv =====
     p_start = tl.load(kv_indptr_prefix_ptr + t)
@@ -143,26 +155,31 @@ def _sparse_attn_v4_paged_prefill_kernel(
         valid = in_range & (slot >= 0)
         slot_clamped = tl.maximum(slot, 0)
 
-        kv = tl.load(
-            unified_kv_ptr
-            + slot_clamped[:, None] * pkv_stride_n
-            + d_offs[None, :] * pkv_stride_d,
-            mask=valid[:, None] & d_mask[None, :],
-            other=0.0,
-        )
         if QUANT_KV:
-            # 1xGROUP_SIZE block-scale dequant of the fp8 unified-pool prefix
-            # loads (mirrors the decode kernel): broadcast-load the per-group
-            # fp32 scale and multiply after casting fp8 → q.dtype. The extend
-            # region (Region 2) reads live bf16 kv and is NOT dequantized.
-            scales_full = tl.load(
-                kv_scales_ptr
-                + slot_clamped[:, None] * ks_stride_n
-                + g_idx_per_d[None, :],
+            # MXFP8: reconstruct the [BLOCK_K, 512] bf16 prefix tile (E8M0-dequant
+            # 448 NoPE dims + bf16 RoPE tail) — identical layout/read as decode.
+            # The extend region (Region 2) reads live bf16 kv and is unchanged.
+            kv = _load_mxfp8_kv_tile(
+                unified_kv_ptr,
+                unified_u8_ptr,
+                rope_ptr,
+                slot_clamped,
+                valid,
+                d_offs,
+                pkv_stride_n,
+                rope_stride_n,
+                NOPE,
+                FP8_BLK,
+                q.dtype,
+            )
+        else:
+            kv = tl.load(
+                unified_kv_ptr
+                + slot_clamped[:, None] * pkv_stride_n
+                + d_offs[None, :] * pkv_stride_d,
                 mask=valid[:, None] & d_mask[None, :],
                 other=0.0,
-            ).to(q.dtype)
-            kv = kv.to(q.dtype) * scales_full
+            )
 
         scores = tl.dot(q, tl.trans(kv)) * softmax_scale
         scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
@@ -250,7 +267,7 @@ def _sparse_attn_v4_paged_prefill_triton(
     kv_indptr_extend: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
-    kv_scales: torch.Tensor | None = None,
+    unified_kv_rope: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if not q.is_cuda:
         raise RuntimeError(
@@ -261,41 +278,46 @@ def _sparse_attn_v4_paged_prefill_triton(
             f"sparse_attn_v4_paged_prefill expects fp16/bf16 q, got {q.dtype}"
         )
 
-    # fp8 prefix path is gated purely on the caller passing a scales buffer
-    # (i.e. the unified pool is fp8). The bf16 path below is strictly unchanged.
-    quant_kv = kv_scales is not None
+    # fp8 (MXFP8) prefix path is gated purely on the caller passing a RoPE
+    # buffer (i.e. the unified pool is fp8). The bf16 path is strictly
+    # unchanged. The extend region always reads the live bf16/fp16 `kv`, never
+    # fp8, so only the unified-pool prefix is dequantized in-kernel.
+    quant_kv = unified_kv_rope is not None
     if quant_kv:
-        if unified_kv.dtype != _FP8_DTYPE:
+        if unified_kv.dtype != _MXFP8_FP8_DTYPE:
             raise RuntimeError(
-                f"kv_scales supplied but unified_kv is {unified_kv.dtype}, "
-                f"expected {_FP8_DTYPE}"
+                f"MXFP8 unified_kv_rope supplied but unified_kv is "
+                f"{unified_kv.dtype}, expected {_MXFP8_FP8_DTYPE}"
             )
-        if kv_scales.dtype != torch.float32:
-            raise RuntimeError(f"kv_scales must be fp32, got {kv_scales.dtype}")
-        D_check = unified_kv.shape[-1]
-        if D_check % _FP8_GROUP_SIZE != 0:
+        if unified_kv.shape[-1] != 512:
             raise RuntimeError(
-                f"D={D_check} must be divisible by GROUP_SIZE={_FP8_GROUP_SIZE}"
+                f"MXFP8 NoPE buffer must be [pages, 512], got "
+                f"{tuple(unified_kv.shape)}"
             )
-        expected_g = D_check // _FP8_GROUP_SIZE
-        if kv_scales.shape != (unified_kv.shape[0], expected_g):
+        if unified_kv_rope.shape[-1] != _MXFP8_ROPE:
             raise RuntimeError(
-                f"kv_scales shape {tuple(kv_scales.shape)} does not match "
-                f"expected ({unified_kv.shape[0]}, {expected_g})"
+                f"RoPE buffer must be [pages, {_MXFP8_ROPE}], got "
+                f"{tuple(unified_kv_rope.shape)}"
             )
-        if kv_scales.stride(-1) != 1:
-            kv_scales = kv_scales.contiguous()
+        if unified_kv_rope.dtype != q.dtype:
+            raise RuntimeError(
+                f"RoPE buffer dtype {unified_kv_rope.dtype} must match q "
+                f"dtype {q.dtype}"
+            )
+        if unified_kv.stride(-1) != 1:
+            unified_kv = unified_kv.contiguous()
+        if unified_kv_rope.stride(-1) != 1:
+            unified_kv_rope = unified_kv_rope.contiguous()
     else:
         if unified_kv.dtype != q.dtype:
             raise RuntimeError(
                 f"unified_kv dtype mismatch: kv={unified_kv.dtype}, q={q.dtype}"
             )
-    # The extend region always reads the live bf16/fp16 `kv` (never fp8).
     if kv.dtype != q.dtype:
         raise RuntimeError(f"kv dtype mismatch: kv={kv.dtype}, q={q.dtype}")
-    if unified_kv.size(-1) != kv.size(-1):
+    if kv.size(-1) != q.size(-1):
         raise RuntimeError(
-            f"head_dim mismatch: unified_kv={unified_kv.size(-1)}, kv={kv.size(-1)}"
+            f"head_dim mismatch: q={q.size(-1)}, kv={kv.size(-1)}"
         )
 
     T, H, D = q.shape
@@ -309,22 +331,23 @@ def _sparse_attn_v4_paged_prefill_triton(
     block_d = triton.next_power_of_2(D)
     block_k = 32 if quant_kv else (16 if D >= 256 else 32)
 
-    # Kernel reads (kv_scales_ptr, ks_stride_n) only when QUANT_KV — supply a
-    # dummy 1-element fp32 tensor on the bf16 path so the launch signature stays
-    # uniform (avoids a separate JIT specialization per call).
+    # The kernel reads (unified_u8_ptr, rope_ptr, rope_stride_n) only when
+    # QUANT_KV — supply dummy 1-element tensors on the bf16 path so the launch
+    # signature stays uniform (avoids a separate JIT specialization per call).
     if quant_kv:
-        kv_scales_arg = kv_scales
-        ks_stride_n_arg = kv_scales.stride(0)
-        num_groups_arg = D // _FP8_GROUP_SIZE
+        unified_u8_arg = unified_kv.view(torch.uint8)
+        rope_arg = unified_kv_rope
+        rope_stride_n_arg = unified_kv_rope.stride(0)
     else:
-        kv_scales_arg = q.new_empty(1, dtype=torch.float32)
-        ks_stride_n_arg = 1
-        num_groups_arg = 1
+        unified_u8_arg = unified_kv  # unused at compile time (QUANT_KV False)
+        rope_arg = q.new_empty(1)
+        rope_stride_n_arg = 1
 
     _sparse_attn_v4_paged_prefill_kernel[(T, triton.cdiv(H, block_h))](
         q,
         unified_kv,
-        kv_scales_arg,
+        unified_u8_arg,
+        rope_arg,
         kv_indices_prefix,
         kv_indptr_prefix,
         kv,
@@ -337,7 +360,7 @@ def _sparse_attn_v4_paged_prefill_triton(
         q.stride(2),
         unified_kv.stride(0),
         unified_kv.stride(1),
-        ks_stride_n_arg,
+        rope_stride_n_arg,
         kv.stride(0),
         kv.stride(1),
         out.stride(0),
@@ -350,8 +373,8 @@ def _sparse_attn_v4_paged_prefill_triton(
         BLOCK_D=block_d,
         BLOCK_K=block_k,
         QUANT_KV=quant_kv,
-        GROUP_SIZE=_FP8_GROUP_SIZE,
-        NUM_GROUPS=num_groups_arg,
+        NOPE=_MXFP8_NOPE,
+        FP8_BLK=_MXFP8_BLK,
         num_warps=4,
     )
     return out
@@ -367,39 +390,72 @@ def sparse_attn_v4_paged_prefill(
     kv_indptr_extend: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
-    kv_scales: torch.Tensor | None = None,
+    unified_kv_rope: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """V4 prefill sparse attention over two KV sources (paged unified_kv +
     flat per-fwd kv).
 
     Args:
-      q:                 [T, H, D] BF16/FP16 — query.
-      unified_kv:        [total_pages, D] BF16/FP16 — prefix source (paged).
-        When ``kv_scales`` is provided this is the arch fp8 format
-        ``_FP8_DTYPE`` and the prefix loads are dequantized in-kernel.
+      q:                 [T, H, D] BF16/FP16 — query (D == 512: 448 NoPE + 64 RoPE).
+      unified_kv:        prefix source (paged). bf16 ``[pages, D]`` in the
+        default path; when ``unified_kv_rope`` is provided this is the upstream
+        MXFP8 NoPE pack ``[pages, 512]`` fp8 (448 fp8 + 14 E8M0 + 50 pad).
       kv_indices_prefix: [total_prefix] int32 — flat per-token slot lists into
         unified_kv. -1 sentinels skipped.
       kv_indptr_prefix:  [T+1] int32 — true prefix sum.
       kv:                [total_tokens, D] BF16/FP16 — extend source (this
-        fwd's input K, NOT yet in swa_kv ring). Always bf16/fp16 — the fp8
-        dequant applies ONLY to the unified-pool prefix region.
+        fwd's input K, NOT yet in swa_kv ring). Always bf16/fp16; the fp8 OPUS
+        op packs it on the fly into its split NoPE-fp8 / RoPE-bf16 inputs.
       kv_indices_extend: [total_extend] int32 — flat per-token row idx lists
         into kv. -1 sentinels skipped.
       kv_indptr_extend:  [T+1] int32 — true prefix sum.
       attn_sink:         [H] — per-head softmax-denom bias.
       softmax_scale:     float.
-      kv_scales:         [total_pages, D//GROUP_SIZE] fp32 — 1xGROUP_SIZE block
-        scales for the fp8 unified pool. None → bf16 prefix (default path).
+      unified_kv_rope:   [total_pages, 64] bf16 — RoPE companion buffer for the
+        MXFP8 unified pool. None → bf16 prefix (default path).
 
     Returns:
       out: [T, H, D] same dtype as q.
     """
-    # OPUS fast path. It handles both the bf16 prefix (kv_scales is None) and the
-    # fp8 unified-KV prefix (kv_scales given → in-kernel 1xGROUP_SIZE dequant) for
-    # any head count: the aiter kernel dispatches H<=32 to the 16mx1_16nx4 variant
-    # and H>32 (DP attention carries all heads per rank) to the 16mx8_32nx1 variant
-    # — both support fp8, so a single call reads the KV prefix once.
-    if _HAS_OPUS:
+    quant_kv = unified_kv_rope is not None
+
+    # MXFP8 fp8 fast path: upstream split-input ``pa_sparse_prefill_fp8_opus``
+    # (#3751). It consumes the pool's NoPE-fp8 / RoPE-bf16 buffers directly and
+    # packs the per-step q + extend kv on the fly (no prefix repack).
+    if quant_kv and _HAS_FP8_OPUS:
+        q = q.contiguous()
+        H = q.shape[1]
+        sink = attn_sink
+        if sink.shape[0] != H:
+            sink = sink[:H]
+        sink = sink.to(torch.float32).contiguous()
+        # Split + MXFP8-pack the per-step q and the extend kv. The prefix pool
+        # is already native MXFP8, so only these per-call tensors are packed.
+        q_nope_real, q_rope = _mxfp8.split_nope_rope(q)
+        q_nope = _mxfp8.pack_nope_mxfp8(q_nope_real.contiguous())
+        q_rope = q_rope.to(torch.bfloat16).contiguous()
+        kv_nope_real, kv_rope = _mxfp8.split_nope_rope(kv)
+        kv_nope = _mxfp8.pack_nope_mxfp8(kv_nope_real.contiguous())
+        kv_rope = kv_rope.to(torch.bfloat16).contiguous()
+        return pa_sparse_prefill_fp8_opus(
+            q_nope,
+            q_rope,
+            unified_kv,
+            unified_kv_rope,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv_nope,
+            kv_rope,
+            kv_indices_extend,
+            kv_indptr_extend,
+            sink,
+            softmax_scale,
+        )
+
+    # bf16 OPUS fast path (default, non-fp8 pool). Handles any head count: the
+    # aiter kernel dispatches H<=32 to the 16mx1_16nx4 variant and H>32 (DP
+    # attention carries all heads per rank) to the 16mx8_32nx1 variant.
+    if (not quant_kv) and _HAS_OPUS:
         # OPUS contract differs from the Triton kernel in two ways the Triton
         # path tolerates implicitly:
         #  - it requires a FULLY-contiguous q (it only asserts stride(2)==1 but
@@ -428,8 +484,11 @@ def sparse_attn_v4_paged_prefill(
             kv_indptr_extend,
             attn_sink,
             softmax_scale,
-            kv_scales=kv_scales,
         )
+
+    # Triton fallback (OPUS absent). The MXFP8 prefix is dequantized in-kernel
+    # (NoPE E8M0 + bf16 RoPE -> bf16 tile) and the extend region reads live
+    # bf16 kv; q stays full bf16.
     return _sparse_attn_v4_paged_prefill_triton(
         q,
         unified_kv,
@@ -440,5 +499,5 @@ def sparse_attn_v4_paged_prefill(
         kv_indptr_extend,
         attn_sink,
         softmax_scale,
-        kv_scales=kv_scales,
+        unified_kv_rope=unified_kv_rope,
     )
