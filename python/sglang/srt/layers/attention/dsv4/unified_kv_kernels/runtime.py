@@ -537,20 +537,23 @@ def build_prefill_indices(
     kv_indptr_prefix = _lengths_to_indptr(prefix_len)
     kv_indptr_extend = _lengths_to_indptr(extend_len)
 
-    # OPUS reads KV in fixed KV_TILE_SIZE (64) tiles: the last partial tile of a
-    # token loads a full 64-slot index group and only masks the *scores* of the
-    # out-of-range lanes — the index values are still loaded and used to compute
-    # gather addresses. With a ragged (non-64-aligned) indptr the final token's
-    # partial tile reads index slots past its valid range, so those slots must be
-    # in-range. Zero-fill (page 0, harmlessly masked out) plus a one-tile pad at
-    # the end keeps that over-read both valid and within the allocation. (The
-    # aiter op_test never exercises this because its CSR counts are 64-aligned.)
+    # OPUS reads KV in fixed KV_TILE_SIZE (64) tiles and *prefetches one tile
+    # ahead* (`next_kv_page = load_kv_page(tile_idx + 1)`). On the final tile that
+    # prefetch reads the index slot a whole extra tile past the valid range, and
+    # the last partial tile likewise loads a full 64-slot group (masking only the
+    # scores, not the index loads). With a ragged (non-64-aligned) indptr these
+    # reads run up to ~2 tiles beyond a token's valid count, so the index buffers
+    # need in-range padding there. Zero-fill (page 0 — a valid row, masked out of
+    # the softmax) plus a two-tile pad keeps every over-read both valid and within
+    # the allocation. (The aiter op_test never trips this: its CSR counts are
+    # always 64-aligned, so there is no partial tile and no stray prefetch.)
     _OPUS_KV_TILE = 64
+    _OPUS_PAD = 2 * _OPUS_KV_TILE
     kv_indices_prefix = torch.zeros(
-        T * (win + Wc) + _OPUS_KV_TILE, dtype=torch.int32, device=device
+        T * (win + Wc) + _OPUS_PAD, dtype=torch.int32, device=device
     )
     kv_indices_extend = torch.zeros(
-        T * win + _OPUS_KV_TILE, dtype=torch.int32, device=device
+        T * win + _OPUS_PAD, dtype=torch.int32, device=device
     )
 
     _build_prefill_indices_kernel[(T,)](
