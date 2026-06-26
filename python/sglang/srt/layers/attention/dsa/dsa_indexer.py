@@ -492,17 +492,29 @@ class Indexer(MultiPlatformOp):
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
 
-    def _quant_query(self, query, act_quant):
+    def _quant_query(self, query, act_quant, weights=None):
         """Quantize the indexer query to fp8. When fusion is enabled the query
         is passed in WITHOUT the hadamard (skipped in _get_q_k_bf16) and the
         fused kernel does hadamard + quant in one pass; otherwise it has already
-        been hadamard'd and we just act_quant it."""
+        been hadamard'd and we just act_quant it.
+
+        If `weights` (the head-gate, ready before quant on the decode path) is
+        passed AND fusion is on, the kernel also folds
+        `_apply_q_scale_and_softmax_scale` and returns
+        `(q_fp8, q_scale, weights_scaled)`; the caller then skips that elementwise.
+        Otherwise returns `(q_fp8, q_scale)`."""
         if self.fuse_hadamard_quant:
             from sglang.srt.layers.attention.dsa.triton_hadamard_quant import (
                 fused_hadamard_act_quant,
             )
 
-            return fused_hadamard_act_quant(query, self.block_size, self.scale_fmt)
+            return fused_hadamard_act_quant(
+                query,
+                self.block_size,
+                self.scale_fmt,
+                weights=weights,
+                softmax_scale=self.softmax_scale,
+            )
         return act_quant(query, self.block_size, self.scale_fmt)
 
     @torch.compile(dynamic=True)
@@ -1745,7 +1757,15 @@ class Indexer(MultiPlatformOp):
             query, key, weights_raw = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
             )
-            q_fp8, q_scale = self._quant_query(query, act_quant)
+            if self.fuse_hadamard_quant:
+                # fold _apply_q_scale_and_softmax_scale (weights * q_scale *
+                # softmax_scale) into the fused quant kernel: weights is ready here
+                # and the kernel already emits q_scale, so no separate launch.
+                q_fp8, q_scale, weights = self._quant_query(
+                    query, act_quant, weights=weights
+                )
+            else:
+                q_fp8, q_scale = self._quant_query(query, act_quant)
             with torch.cuda.stream(self.alt_stream):
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
@@ -1756,7 +1776,7 @@ class Indexer(MultiPlatformOp):
             current_stream.wait_stream(self.alt_stream)
             if _use_dsa_indexer_fusion:
                 weights = self._scale_head_gates(weights_raw, q_scale)
-            else:
+            elif not self.fuse_hadamard_quant:
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
         else:
             query, key, weights_raw = self._get_q_k_bf16(

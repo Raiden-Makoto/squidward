@@ -45,11 +45,15 @@ def _hadamard_quant_kernel(
     h_ptr,
     y_ptr,
     s_ptr,
+    w_ptr,
+    wo_ptr,
     M,
     inv_sqrt_n,
     fp8_max,
     fp8_min,
+    softmax_scale,
     ROUND_SCALE: tl.constexpr,
+    FUSE_WEIGHTS: tl.constexpr,
     N: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
@@ -77,15 +81,32 @@ def _hadamard_quant_kernel(
     tl.store(y_ptr + rows[:, None] * N + n[None, :], y, mask=rmask[:, None])
     tl.store(s_ptr + rows, s, mask=rmask)
 
+    # Optional fold of `_apply_q_scale_and_softmax_scale`: the indexer rescales the
+    # per-(token,head) head-gate `weights` by this row's quant scale `s` (==q_scale)
+    # and the softmax scale. `w`/`s` are row-aligned, so emit it here instead of a
+    # separate elementwise launch.
+    if FUSE_WEIGHTS:
+        w = tl.load(w_ptr + rows, mask=rmask, other=0.0).to(tl.float32)
+        tl.store(wo_ptr + rows, w * s * softmax_scale, mask=rmask)
+
 
 def fused_hadamard_act_quant(
-    x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    x: torch.Tensor,
+    block_size: int = 128,
+    scale_fmt: Optional[str] = None,
+    weights: Optional[torch.Tensor] = None,
+    softmax_scale: float = 1.0,
+):
     """Fused hadamard(scale=N**-0.5) + block fp8 quant.
 
     Drop-in for `act_quant(rotate_activation(x), block_size, scale_fmt)` when the
     last dim N is a power of 2 and == block_size (one quant group). Returns
     (fp8 tensor same shape as x, fp32 scale of shape x.shape[:-1] + (1,)).
+
+    If `weights` (the indexer head-gate, shape x.shape[:-1]) is given, also folds
+    `_apply_q_scale_and_softmax_scale` (weights * q_scale * softmax_scale) into the
+    same kernel and returns it as a third value `(y, s, weights_scaled)` of shape
+    x.shape[:-1] + (1,) -- eliminating the separate elementwise launch.
     """
     assert x.is_contiguous(), "input must be contiguous"
     N = x.size(-1)
@@ -98,6 +119,17 @@ def fused_hadamard_act_quant(
     M = x2.shape[0]
     h = _hadamard_pm1(N, x.device, torch.bfloat16)
 
+    fuse_weights = weights is not None
+    if fuse_weights:
+        assert (
+            weights.shape == x.shape[:-1]
+        ), f"weights {tuple(weights.shape)} must match x.shape[:-1] {tuple(x.shape[:-1])}"
+        w_in = weights.contiguous().view(-1)
+        w_out = torch.empty(M, dtype=torch.float32, device=x.device)
+    else:
+        w_in = x2  # unused dummy ptr
+        w_out = s.view(-1)  # unused dummy ptr
+
     BLOCK_M = 32
     grid = (triton.cdiv(M, BLOCK_M),)
     _hadamard_quant_kernel[grid](
@@ -105,14 +137,20 @@ def fused_hadamard_act_quant(
         h,
         y.view(-1, N),
         s.view(-1),
+        w_in,
+        w_out,
         M,
         float(N) ** -0.5,
         _FP8_MAX,
         -_FP8_MAX,
+        float(softmax_scale),
         ROUND_SCALE=scale_fmt is not None,
+        FUSE_WEIGHTS=fuse_weights,
         N=N,
         BLOCK_M=BLOCK_M,
     )
+    if fuse_weights:
+        return y, s, w_out.view(*weights.shape, 1)
     return y, s
 
 
@@ -123,6 +161,7 @@ if __name__ == "__main__":
     from sglang.srt.layers.attention.dsa.tilelang_kernel import act_quant
 
     torch.manual_seed(0)
+    softmax_scale = 0.1337
     for shape in [(8, 32, 128), (4096, 32, 128), (1, 8, 128)]:
         x = (torch.randn(*shape, device="cuda", dtype=torch.bfloat16) * 0.3).contiguous()
         y_ref, s_ref = act_quant(rotate_activation(x.clone()), 128, None)
@@ -136,7 +175,15 @@ if __name__ == "__main__":
         cos = torch.nn.functional.cosine_similarity(
             dq_ref.flatten(), dq_f.flatten(), dim=0
         ).item()
+        # weights fold vs _apply_q_scale_and_softmax_scale
+        w = (torch.randn(*shape[:-1], device="cuda", dtype=torch.bfloat16)).contiguous()
+        w_ref = w.unsqueeze(-1) * s_f * softmax_scale
+        _, _, w_fused = fused_hadamard_act_quant(
+            x.clone(), 128, None, weights=w, softmax_scale=softmax_scale
+        )
+        w_maxabs = (w_ref.float() - w_fused.float()).abs().max().item()
         print(
             f"shape={shape}: fp8_exact_frac={same_fp8:.5f} "
-            f"scale_maxrel={s_maxrel:.3e} dequant_cos={cos:.6f}"
+            f"scale_maxrel={s_maxrel:.3e} dequant_cos={cos:.6f} "
+            f"weights_fold_maxabs={w_maxabs:.3e}"
         )
