@@ -437,6 +437,17 @@ def sparse_attn_v4_paged_prefill(
         kv_nope_real, kv_rope = _mxfp8.split_nope_rope(kv)
         kv_nope = _mxfp8.pack_nope_mxfp8(kv_nope_real.contiguous())
         kv_rope = kv_rope.to(torch.bfloat16).contiguous()
+        # A single-row [1, 64] RoPE slice keeps its parent's row stride (512)
+        # even after .contiguous() — torch treats a size-1 leading dim as already
+        # contiguous and skips the copy. The OPUS op asserts the extend RoPE page
+        # stride matches the prefix pool's (64), so force a width-equal row stride
+        # whenever it diverges (only possible for shape[0] <= 1, where stride(0)
+        # is never actually used for addressing). Mirrors the bf16 path's size-1
+        # kv fixup above.
+        if kv_rope.stride(0) != kv_rope.shape[-1]:
+            kv_rope = kv_rope.as_strided(kv_rope.shape, (kv_rope.shape[-1], 1))
+        if kv_nope.stride(0) != kv_nope.shape[-1]:
+            kv_nope = kv_nope.as_strided(kv_nope.shape, (kv_nope.shape[-1], 1))
         return pa_sparse_prefill_fp8_opus(
             q_nope,
             q_rope,
