@@ -1,0 +1,31 @@
+---
+description: main is read-only and sync-only — never do code/feature work on main
+alwaysApply: true
+---
+
+# `main` is read-only and sync-only
+
+`main` exists only to track `upstream/main` plus the fork-only tooling that sits
+on top of it. Do NOT use it as a working branch.
+
+## Allowed on `main`
+- Syncing with upstream — ONLY via the `sync-upstream-main` skill
+  (`git merge upstream/main`, never rebase), then `git push origin main`.
+- Nothing else by default.
+
+## Forbidden on `main`
+- No feature work, bug fixes, refactors, or any code edits.
+- No experiments, benchmarks, or server runs launched while checked out on `main`.
+- No direct commits, no rebases, no force-pushes, no history rewrites.
+- Do NOT advance the remote box to `main` for dev work.
+
+## How to work
+- Branch off `main` for any change: `git checkout -b <feature> main`.
+- Do all edits, commits, and runs on the feature branch.
+- To pull in new upstream commits, run the `sync-upstream-main` skill on `main`,
+  then merge `main` into your feature branch (not the other way around).
+
+## Tooling exception
+Fork-only tooling (`.cursor/rules/`, `.claude/skills/`, `utilities/`) is the one
+category that legitimately lives on `main`. Add/update it with a single explicit
+tooling commit only when the user asks; never bundle it with code changes.
