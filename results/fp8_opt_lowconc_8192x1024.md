@@ -1,20 +1,21 @@
-gbt MI35x gfx950 (v4-pro), TP8,DP1 | random 8192 in / 1024 out | bench_serving, steady-state
-delta% = fp8 optimized vs baseline (- = faster/lower/worse-tput, + = higher)
+gbt MI35x gfx950 (v4-pro), TP8,DP1 | random 8192 in / 1024 out | e2e_low_conc.sh, bench_serving, steady-state
+clean re-baseline: GPUs verified clear (rocm-smi ~0.3GB/GPU) before each launch, both halves on commit `78fc750f0` via run_dsv4.sh, differ only by SGLANG_UNIFIED_KV_FP8
+delta% = fp8 vs bf16 baseline (- = lower, + = higher)
 
-baseline `2294c4ca2` (bf16 unified-kv, SGLANG_UNIFIED_KV_FP8=0)
+bf16 baseline `78fc750f0` (SGLANG_UNIFIED_KV_FP8=0)
 
 | Conc | TTT (tok/s) | E2EL (ms) | TTFT (ms) | ITL (ms) |
 |---|---|---|---|---|
-| 2  | 107.10 | 19114.53 | 636.47  | 18.06 |
-| 4  | 207.12 | 19766.97 | 1090.84 | 18.26 |
-| 8  | 370.69 | 22089.01 | 1805.55 | 19.83 |
-| 16 | 604.77 | 27078.06 | 3190.73 | 23.35 |
+| 2  | 107.49 | 19045.77 | 716.44  | 17.92 |
+| 4  | 206.81 | 19797.24 | 1096.84 | 18.28 |
+| 8  | 371.74 | 22026.79 | 1796.23 | 19.78 |
+| 16 | 610.86 | 26807.74 | 3172.08 | 23.10 |
 
-fp8 optimized `905951e96` (vectorized MXFP8 packs + cached swa_loc decode store, SGLANG_UNIFIED_KV_FP8=1)
+fp8 `78fc750f0` (in-kernel MXFP8 decode store, SGLANG_UNIFIED_KV_FP8=1) | GSM8K 8-shot acc 0.953
 
 | Conc | TTT (tok/s) | E2EL (ms) | TTFT (ms) | ITL (ms) | TTT% | E2E% | TTFT% | ITL% |
 |---|---|---|---|---|---|---|---|---|
-| 2  | 93.72  | 21842.72 | 666.60  | 20.70 | -12.5 | +14.3 | +4.7 | +14.6 |
-| 4  | 178.78 | 22902.01 | 1169.09 | 21.24 | -13.7 | +15.9 | +7.2 | +16.3 |
-| 8  | 323.21 | 25335.17 | 1898.82 | 22.91 | -12.8 | +14.7 | +5.2 | +15.5 |
-| 16 | 532.90 | 30730.70 | 3360.50 | 26.75 | -11.9 | +13.5 | +5.3 | +14.6 |
+| 2  | 94.28  | 21714.85 | 677.52  | 20.56 | -12.3 | +14.0 | -5.4 | +14.7 |
+| 4  | 180.54 | 22677.63 | 1157.80 | 21.04 | -12.7 | +14.5 | +5.6 | +15.1 |
+| 8  | 323.48 | 25313.19 | 1896.74 | 22.89 | -13.0 | +14.9 | +5.6 | +15.7 |
+| 16 | 541.19 | 30259.69 | 3345.79 | 26.31 | -11.4 | +12.9 | +5.5 | +13.9 |
