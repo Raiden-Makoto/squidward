@@ -1148,6 +1148,9 @@ class DeepseekV4HipRadixBackend(
         if is_decode:
             state_slot = forward_batch.req_pool_indices[:T]
             if save_kv_cache:
+                # Ring dest is layer-independent; reuse the per-forward cached
+                # swa_loc (decode never trips the SWA window sentinel since
+                # final_pos == positions) instead of recomputing it per layer.
                 runtime.store_swa_into_unified(
                     kv=kv,
                     state_slot=state_slot,
@@ -1157,6 +1160,11 @@ class DeepseekV4HipRadixBackend(
                     ring_stride=ring_stride,
                     final_pos=positions,
                     unified_kv_rope=unified_rope,
+                    loc=(
+                        self.get_unified_swa_loc(forward_batch)
+                        if unified_rope is not None
+                        else None
+                    ),
                 )
             unified_metadata = core_attn_metadata.unified
             if compress_ratio == 0:

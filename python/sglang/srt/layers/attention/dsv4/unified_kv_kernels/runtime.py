@@ -371,6 +371,7 @@ def store_swa_into_unified(
     unified_kv_rope: Optional[torch.Tensor] = None,  # [pages,64] bf16 (fp8 mode)
     kv_nope_packed: Optional[torch.Tensor] = None,  # [T,512] fp8 pre-packed NoPE
     kv_rope_packed: Optional[torch.Tensor] = None,  # [T,64] bf16 pre-packed RoPE
+    loc: Optional[torch.Tensor] = None,  # [T] precomputed ring dest rows (<0 = skip)
 ) -> None:
     n_rows, D = kv.shape
     if n_rows == 0:
@@ -385,14 +386,18 @@ def store_swa_into_unified(
     # fp8 (MXFP8) quant-on-store is gated on the caller passing a RoPE buffer
     # (i.e. the unified pool is fp8). The bf16 path is strictly unchanged.
     if unified_kv_rope is not None:
-        # Compute destination ring rows on-device; apply the SWA window sentinel
+        # Destination ring rows. The decode caller precomputes ``loc`` once per
+        # forward (shared by every layer) and passes it in -- avoids the per-layer
+        # eager loc op-chain that dominated the fp8 decode store. When not
+        # provided (prefill), compute on-device and apply the SWA window sentinel
         # (skip rows where pos <= final_pos - win) by tagging loc = -1.
-        ss = state_slot.to(torch.int64)
-        pos64 = positions.to(torch.int64)
-        loc = ss * ring_stride + (pos64 % ring_stride)
-        if has_final:
-            keep = pos64 > (final_pos.to(torch.int64) - win)
-            loc = torch.where(keep, loc, torch.full_like(loc, -1))
+        if loc is None:
+            ss = state_slot.to(torch.int64)
+            pos64 = positions.to(torch.int64)
+            loc = ss * ring_stride + (pos64 % ring_stride)
+            if has_final:
+                keep = pos64 > (final_pos.to(torch.int64) - win)
+                loc = torch.where(keep, loc, torch.full_like(loc, -1))
         if kv_nope_packed is not None:
             # Dedup: the prefill attention already packed this chunk's extend kv;
             # reuse those bytes (copy-by-loc) instead of re-quantizing.
