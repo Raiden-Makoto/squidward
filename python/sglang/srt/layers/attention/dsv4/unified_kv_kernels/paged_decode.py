@@ -124,7 +124,12 @@ def _load_mxfp8_kv_tile(
         mask=valid[:, None] & nope_mask[None, :],
         other=127,
     ).to(tl.int32)
-    scale = tl.exp2((e_byte - 127).to(tl.float32))
+    # scale = 2^(e_byte-127). An fp32 with biased exponent e_byte and zero
+    # mantissa IS exactly 2^(e_byte-127), so synthesize it with an int shift +
+    # bitcast instead of an SFU exp2 over the whole [BLOCK_K, 512] tile (the
+    # hot-loop ALU cost of the MXFP8 dequant). Bit-identical to exp2 for all
+    # E8M0 codes the store emits (e_byte in [0,254]; e_byte=255 never occurs).
+    scale = (e_byte << 23).to(tl.float32, bitcast=True)
     nope_deq = kv_fp8 * scale
     # rope: cols [NOPE, NOPE+ROPE) <- rope_buffer[:, d-NOPE]
     rope_idx = d_offs - NOPE
