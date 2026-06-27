@@ -102,39 +102,47 @@ def _mxfp8_pack_scatter_kernel(
     NOPE_WIDTH: tl.constexpr,  # 512
     SCALE_OFF: tl.constexpr,  # 448
     FP8_MAX: tl.constexpr,  # 448.0
+    BLOCK_ROWS: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    if row >= n_rows:
-        return
-    loc = tl.load(loc_ptr + row).to(tl.int64)
-    if loc < 0:
-        return
-    blk_offs = tl.arange(0, FP8_BLK)
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)  # [BLOCK_ROWS]
+    loc = tl.load(loc_ptr + rows, mask=rows < n_rows, other=-1).to(tl.int64)
+    # Per-row validity: in-range and not the SWA windowing skip sentinel.
+    rmask = (rows < n_rows) & (loc >= 0)
+    blk_offs = tl.arange(0, FP8_BLK)  # [FP8_BLK]
     for b in tl.static_range(NUM_BLOCKS):
         start = b * FP8_BLK
-        vals = tl.load(
-            kv_ptr + row * kv_row_stride + (start + blk_offs) * kv_col_stride
-        ).to(tl.float32)
+        cols = start + blk_offs  # [FP8_BLK]
+        offs = rows[:, None] * kv_row_stride + cols[None, :] * kv_col_stride
+        vals = tl.load(kv_ptr + offs, mask=rmask[:, None], other=0.0).to(tl.float32)
         # E8M0 block exponent: e = ceil(log2(amax / FP8_MAX)); scale = 2^e.
         # Matches mxfp8.pack_nope_mxfp8 / aiter _quantize_nope bit-for-bit.
-        amax = tl.max(tl.abs(vals))
+        amax = tl.max(tl.abs(vals), axis=1)  # [BLOCK_ROWS]
         amax_c = tl.maximum(amax, 1e-30)
         e_unb = tl.ceil(tl.log2(amax_c / FP8_MAX))
         e_unb = tl.where(amax == 0.0, 0.0, e_unb)
         scale = tl.exp2(e_unb)
-        q = (vals / scale).to(tl.float8e4nv)
+        q = (vals / scale[:, None]).to(tl.float8e4nv)
         qb = q.to(tl.uint8, bitcast=True)
-        tl.store(nope_u8_ptr + loc * NOPE_WIDTH + start + blk_offs, qb)
+        tl.store(
+            nope_u8_ptr + loc[:, None] * NOPE_WIDTH + cols[None, :],
+            qb,
+            mask=rmask[:, None],
+        )
         e_byte = e_unb.to(tl.int32) + 127
         e_byte = tl.minimum(tl.maximum(e_byte, 0), 255).to(tl.uint8)
-        tl.store(nope_u8_ptr + loc * NOPE_WIDTH + SCALE_OFF + b, e_byte)
-    rope_offs = tl.arange(0, DIM_ROPE)
-    rvals = tl.load(
-        kv_ptr + row * kv_row_stride + (DIM_NOPE + rope_offs) * kv_col_stride
-    )
+        tl.store(
+            nope_u8_ptr + loc * NOPE_WIDTH + SCALE_OFF + b,
+            e_byte,
+            mask=rmask,
+        )
+    rope_offs = tl.arange(0, DIM_ROPE)  # [DIM_ROPE]
+    roffs = rows[:, None] * kv_row_stride + (DIM_NOPE + rope_offs)[None, :] * kv_col_stride
+    rvals = tl.load(kv_ptr + roffs, mask=rmask[:, None], other=0.0)
     tl.store(
-        rope_ptr + loc * DIM_ROPE + rope_offs,
+        rope_ptr + loc[:, None] * DIM_ROPE + rope_offs[None, :],
         rvals.to(rope_ptr.dtype.element_ty),
+        mask=rmask[:, None],
     )
 
 
@@ -153,38 +161,54 @@ def _mxfp8_pack_dense_kernel(
     NOPE_WIDTH: tl.constexpr,  # 512
     SCALE_OFF: tl.constexpr,  # 448
     FP8_MAX: tl.constexpr,  # 448.0
+    BLOCK_ROWS: tl.constexpr,
 ):
     """Dense (row i -> row i) variant of ``_mxfp8_pack_scatter_kernel``. Quant
     math is identical bit-for-bit; only the destination addressing differs (no
     ``loc`` indirection / no skip sentinel). Used by ``pack_mxfp8_dense`` to fuse
-    the per-step q / extend-kv pack chains in the fp8 prefill path."""
-    row = tl.program_id(0)
-    if row >= n_rows:
-        return
-    blk_offs = tl.arange(0, FP8_BLK)
+    the per-step q / extend-kv pack chains in the fp8 prefill path.
+
+    Each program packs a tile of ``BLOCK_ROWS`` rows. The per-32 E8M0 block math
+    is vectorized across rows (reduce along the 32-wide axis), so every lane is
+    busy and rows are loaded/stored coalesced -- far better HW utilization than a
+    one-row-per-program, 32-lane launch."""
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)  # [BLOCK_ROWS]
+    row_mask = rows < n_rows
+    blk_offs = tl.arange(0, FP8_BLK)  # [FP8_BLK]
     for b in tl.static_range(NUM_BLOCKS):
         start = b * FP8_BLK
-        vals = tl.load(
-            kv_ptr + row * kv_row_stride + (start + blk_offs) * kv_col_stride
-        ).to(tl.float32)
-        amax = tl.max(tl.abs(vals))
+        cols = start + blk_offs  # [FP8_BLK]
+        offs = rows[:, None] * kv_row_stride + cols[None, :] * kv_col_stride
+        vals = tl.load(kv_ptr + offs, mask=row_mask[:, None], other=0.0).to(tl.float32)
+        # E8M0 block exponent: e = ceil(log2(amax / FP8_MAX)); scale = 2^e.
+        # Matches mxfp8.pack_nope_mxfp8 / aiter _quantize_nope bit-for-bit.
+        amax = tl.max(tl.abs(vals), axis=1)  # [BLOCK_ROWS]
         amax_c = tl.maximum(amax, 1e-30)
         e_unb = tl.ceil(tl.log2(amax_c / FP8_MAX))
         e_unb = tl.where(amax == 0.0, 0.0, e_unb)
         scale = tl.exp2(e_unb)
-        q = (vals / scale).to(tl.float8e4nv)
+        q = (vals / scale[:, None]).to(tl.float8e4nv)
         qb = q.to(tl.uint8, bitcast=True)
-        tl.store(nope_u8_ptr + row * NOPE_WIDTH + start + blk_offs, qb)
+        tl.store(
+            nope_u8_ptr + rows[:, None] * NOPE_WIDTH + cols[None, :],
+            qb,
+            mask=row_mask[:, None],
+        )
         e_byte = e_unb.to(tl.int32) + 127
         e_byte = tl.minimum(tl.maximum(e_byte, 0), 255).to(tl.uint8)
-        tl.store(nope_u8_ptr + row * NOPE_WIDTH + SCALE_OFF + b, e_byte)
-    rope_offs = tl.arange(0, DIM_ROPE)
-    rvals = tl.load(
-        kv_ptr + row * kv_row_stride + (DIM_NOPE + rope_offs) * kv_col_stride
-    )
+        tl.store(
+            nope_u8_ptr + rows * NOPE_WIDTH + SCALE_OFF + b,
+            e_byte,
+            mask=row_mask,
+        )
+    rope_offs = tl.arange(0, DIM_ROPE)  # [DIM_ROPE]
+    roffs = rows[:, None] * kv_row_stride + (DIM_NOPE + rope_offs)[None, :] * kv_col_stride
+    rvals = tl.load(kv_ptr + roffs, mask=row_mask[:, None], other=0.0)
     tl.store(
-        rope_ptr + row * DIM_ROPE + rope_offs,
+        rope_ptr + rows[:, None] * DIM_ROPE + rope_offs[None, :],
         rvals.to(rope_ptr.dtype.element_ty),
+        mask=row_mask[:, None],
     )
 
 
@@ -214,7 +238,9 @@ def pack_mxfp8_dense(
     )
     rope = torch.empty(n_rows, mxfp8.DIM_ROPE, dtype=torch.bfloat16, device=x.device)
     if n_rows > 0:
-        _mxfp8_pack_dense_kernel[(n_rows,)](
+        BLOCK_ROWS = 8
+        grid = (triton.cdiv(n_rows, BLOCK_ROWS),)
+        _mxfp8_pack_dense_kernel[grid](
             flat,
             nope,
             rope,
@@ -228,6 +254,7 @@ def pack_mxfp8_dense(
             NOPE_WIDTH=mxfp8.NOPE_PACKED_WIDTH,
             SCALE_OFF=mxfp8.SCALE_OFFSET,
             FP8_MAX=mxfp8.FP8_MAX,
+            BLOCK_ROWS=BLOCK_ROWS,
             num_warps=4,
         )
     nope = nope.view(mxfp8.FP8_DTYPE).reshape(*lead, mxfp8.NOPE_PACKED_WIDTH)
@@ -251,7 +278,9 @@ def _launch_mxfp8_pack(
     assert D == mxfp8.DIM_HEAD, f"expected head_dim {mxfp8.DIM_HEAD}, got {D}"
     if not loc.is_contiguous():
         loc = loc.contiguous()
-    _mxfp8_pack_scatter_kernel[(n_rows,)](
+    BLOCK_ROWS = 8
+    grid = (triton.cdiv(n_rows, BLOCK_ROWS),)
+    _mxfp8_pack_scatter_kernel[grid](
         kv,
         loc,
         unified_kv_nope.view(torch.uint8),
@@ -266,6 +295,7 @@ def _launch_mxfp8_pack(
         NOPE_WIDTH=mxfp8.NOPE_PACKED_WIDTH,
         SCALE_OFF=mxfp8.SCALE_OFFSET,
         FP8_MAX=mxfp8.FP8_MAX,
+        BLOCK_ROWS=BLOCK_ROWS,
         num_warps=4,
     )
 
