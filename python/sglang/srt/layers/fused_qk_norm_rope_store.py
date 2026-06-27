@@ -16,8 +16,12 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.utils import is_gfx95_supported
 
 _fp8_fnuz = is_fp8_fnuz()
+# In-kernel MXFP8 store pins FP8_MAX=448.0 (e4m3fn) and emits float8e4nv -- valid
+# on gfx950 only. gfx942 (e4m3fnuz) keeps the validated store_mxfp8_by_loc path.
+_is_gfx950 = is_gfx95_supported()
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +72,7 @@ def _fused_qk_norm_rope_store_kernel(
     sin_ptr,
     swa_cache_ptr,
     swa_loc_ptr,
+    rope_cache_ptr,  # [num_slots, ROPE_DIM] bf16 (FP8_UNIFIED_STORE only; dummy otherwise)
     M,
     q_in_splitk_stride,
     q_in_m_stride,
@@ -80,6 +85,7 @@ def _fused_qk_norm_rope_store_kernel(
     cos_stride_t,
     cos_stride_d,
     swa_cache_stride_page,
+    rope_cache_stride_page,  # row stride of rope_cache (FP8_UNIFIED_STORE only)
     q_eps,
     kv_eps,
     BLOCK_SIZE_M: tl.constexpr,
@@ -97,6 +103,8 @@ def _fused_qk_norm_rope_store_kernel(
     SWA_PAGE_SIZE: tl.constexpr,
     BF16_STORE: tl.constexpr,
     IS_FNUZ: tl.constexpr,
+    FP8_UNIFIED_STORE: tl.constexpr = False,  # unified_kv MXFP8 (E8M0 per-32-block) store
+    MXFP8_BLK: tl.constexpr = 32,  # MXFP8 group width for E8M0 block scales
 ):
     pid_m = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1).to(tl.int64)
@@ -225,6 +233,58 @@ def _fused_qk_norm_rope_store_kernel(
             kv_pe.to(swa_cache_ptr.dtype.element_ty),
             mask=src_mask[:, None],
         )
+    elif HAS_SWA_STORE and FP8_UNIFIED_STORE:
+        # unified_kv MXFP8 store (gfx950 fp8 KV pool). E8M0 per-32-block NoPE
+        # quant into swa_cache_ptr (uint8 view of the [num_slots, NOPE_WIDTH] fp8
+        # NoPE pool) + bf16 RoPE into rope_cache_ptr ([num_slots, ROPE_DIM]) at
+        # row=loc. Folds the standalone _mxfp8_pack_scatter_kernel SWA-ring store
+        # into this fused kernel; the NoPE blocks are re-read from the kv_ptr
+        # writeback (above) so the quant input is the SAME bf16-rounded value the
+        # standalone packer consumed -> bit-identical bytes. RoPE is taken from
+        # kv_pe directly (== the kv[:, NOPE:] writeback the packer re-read).
+        loc = tl.load(swa_loc_ptr + src_id, mask=src_mask, other=-1).to(tl.int64)
+        rmask = src_mask & (loc >= 0)
+        MXFP8_NUM_BLOCKS: tl.constexpr = DIM_NOPE // MXFP8_BLK
+        # NoPE pool row width (uint8) = swa_cache_stride_page (runtime, == 512).
+        row_base = loc * swa_cache_stride_page
+        blk_offs = tl.arange(0, MXFP8_BLK)
+        for b in tl.static_range(MXFP8_NUM_BLOCKS):
+            start = b * MXFP8_BLK
+            cols = start + blk_offs
+            vals = tl.load(
+                kv_ptr
+                + src_id[:, None].to(tl.int64) * stride_kv_m
+                + cols[None, :] * stride_kv_d,
+                mask=rmask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            # E8M0 block exponent: e = ceil(log2(amax / FP8_MAX)); scale = 2^e.
+            # Matches _mxfp8_pack_scatter_kernel / mxfp8.pack_nope_mxfp8 bit-for-bit.
+            amax = tl.max(tl.abs(vals), axis=1)
+            amax_c = tl.maximum(amax, 1e-30)
+            e_unb = tl.ceil(tl.log2(amax_c / FP8_MAX))
+            e_unb = tl.where(amax == 0.0, 0.0, e_unb)
+            scale = tl.exp2(e_unb)
+            q = (vals / scale[:, None]).to(tl.float8e4nv)
+            qb = q.to(tl.uint8, bitcast=True)
+            tl.store(
+                swa_cache_ptr + row_base[:, None] + cols[None, :],
+                qb,
+                mask=rmask[:, None],
+            )
+            e_byte = e_unb.to(tl.int32) + 127
+            e_byte = tl.minimum(tl.maximum(e_byte, 0), 255).to(tl.uint8)
+            tl.store(
+                swa_cache_ptr + row_base + DIM_NOPE + b,
+                e_byte,
+                mask=rmask,
+            )
+        rope_offs = tl.arange(0, ROPE_DIM)
+        tl.store(
+            rope_cache_ptr + loc[:, None] * rope_cache_stride_page + rope_offs[None, :],
+            kv_pe.to(rope_cache_ptr.dtype.element_ty),
+            mask=rmask[:, None],
+        )
     elif HAS_SWA_STORE:
         loc = tl.load(swa_loc_ptr + src_id, mask=src_mask, other=0)
         page_id = loc // SWA_PAGE_SIZE
@@ -329,9 +389,11 @@ def fused_qk_norm_rope_swa_store(
         bf16_store: write the whole head_dim as plain bf16 at swa_cache[swa_loc]
         fp8_unified_store: MXFP8-pack the (norm+rope'd) kv NoPE stream (E8M0
             per-32-block) into ``swa_cache`` [num_slots, 512] (fp8) and write the
-            RoPE tail bf16 into ``swa_rope_cache`` [num_slots, 64]. Mutually
-            exclusive with ``bf16_store``. The in-kernel SWA store is skipped in
-            this mode (it only emits bf16 / FlashMLA-pow2 layouts).
+            RoPE tail bf16 into ``swa_rope_cache`` [num_slots, 64]. On gfx950 this
+            is folded into the kernel (FP8_UNIFIED_STORE branch), bit-identical to
+            the standalone _mxfp8_pack_scatter_kernel; on gfx942 (e4m3fnuz) it
+            falls back to the standalone store_mxfp8_by_loc. Mutually exclusive
+            with ``bf16_store``.
         swa_rope_cache: [num_slots, 64] bf16 RoPE buffer, required when
             ``fp8_unified_store`` is set.
     """
@@ -357,15 +419,20 @@ def fused_qk_norm_rope_swa_store(
         )
 
     HAS_SWA_STORE = swa_cache is not None and swa_loc is not None
-    # fp8 unified store: the in-kernel SWA store only emits bf16 / FlashMLA-pow2
-    # layouts, neither of which matches the fp8 1x64 linear-scale unified kv
-    # buffer. So run the kernel for norm+RoPE (it still writes the normed+roped
-    # row back into ``kv`` in-place) and do the validated 1x64 group quant +
-    # scatter in Python below. ``bf16_store`` is the strictly-unchanged default.
     assert not (fp8_unified_store and bf16_store), (
         "fp8_unified_store and bf16_store are mutually exclusive"
     )
-    kernel_swa_store = HAS_SWA_STORE and not fp8_unified_store
+    # fp8 unified store on gfx950: fold the MXFP8 (E8M0 per-32-block) NoPE pack +
+    # bf16 RoPE scatter directly into the fused kernel (FP8_UNIFIED_STORE branch),
+    # bit-identical to the standalone _mxfp8_pack_scatter_kernel it replaces. The
+    # in-kernel path pins FP8_MAX=448.0 / float8e4nv (e4m3fn), so it is gated to
+    # gfx950; gfx942 (e4m3fnuz) falls back to the validated store_mxfp8_by_loc
+    # Python path below. ``bf16_store`` / the FlashMLA-pow2 path are unchanged.
+    inkernel_fp8_store = fp8_unified_store and HAS_SWA_STORE and _is_gfx950
+    python_fp8_store = fp8_unified_store and HAS_SWA_STORE and not _is_gfx950
+    # The kernel runs its SWA store for bf16 / FlashMLA / gfx950-fp8; for the
+    # gfx942-fp8 fallback it only does norm+RoPE writeback (store done in Python).
+    kernel_swa_store = HAS_SWA_STORE and not python_fp8_store
 
     dim_nope = 448
     dim_rope = 64
@@ -378,6 +445,32 @@ def fused_qk_norm_rope_swa_store(
         fp8_info = torch.finfo(torch.float8_e4m3fnuz)
     else:
         fp8_info = torch.finfo(torch.float8_e4m3fn)
+
+    # Per-mode store tensors / scalar constants. Only one store branch is live per
+    # call (constexpr-gated); we pass the tensor + strides each branch expects.
+    fp8_max = fp8_info.max
+    mxfp8_blk = 32
+    rope_cache_ptr = swa_cache  # dummy (FlashMLA / bf16 branches ignore it)
+    rope_cache_stride = 0
+    swa_cache_arg = swa_cache if kernel_swa_store else None
+    swa_cache_stride = swa_cache.stride(0) if kernel_swa_store else 0
+
+    if inkernel_fp8_store:
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels import mxfp8
+
+        assert swa_rope_cache is not None, "fp8_unified_store requires swa_rope_cache"
+        assert swa_cache.dtype == mxfp8.FP8_DTYPE
+        assert head_dim == mxfp8.DIM_HEAD
+        assert rope_head_dim == mxfp8.DIM_ROPE
+        # NoPE pool addressed as uint8 [num_slots, NOPE_PACKED_WIDTH]; MXFP8 quant
+        # uses the fixed e4m3fn max (448.0), not the arch fp8 finfo (240 on fnuz).
+        nope_u8 = swa_cache.view(torch.uint8)
+        swa_cache_arg = nope_u8
+        swa_cache_stride = nope_u8.stride(0)  # == NOPE_PACKED_WIDTH (512)
+        rope_cache_ptr = swa_rope_cache
+        rope_cache_stride = swa_rope_cache.stride(0)
+        fp8_max = mxfp8.FP8_MAX
+        mxfp8_blk = mxfp8.FP8_BLOCK
 
     BLOCK_SIZE_M = min(4, triton.next_power_of_2(M)) if M < 4 else 4
     num_warps = 4
@@ -392,8 +485,9 @@ def fused_qk_norm_rope_swa_store(
         positions,
         cos_cache,
         sin_cache,
-        swa_cache if kernel_swa_store else None,
+        swa_cache_arg,
         swa_loc if kernel_swa_store else None,
+        rope_cache_ptr,
         M,
         q_in_splitk_stride,
         q_in_m_stride,
@@ -405,7 +499,8 @@ def fused_qk_norm_rope_swa_store(
         kv.stride(1),
         cos_cache.stride(0),
         cos_cache.stride(-1),
-        swa_cache.stride(0) if kernel_swa_store else 0,
+        swa_cache_stride,
+        rope_cache_stride,
         q_rms_eps,
         kv_rms_eps,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
@@ -418,22 +513,21 @@ def fused_qk_norm_rope_swa_store(
         TILE_SIZE=tile_size,
         NUM_NOPE_TILES=num_nope_tiles,
         FP8_MIN=fp8_info.min,
-        FP8_MAX=fp8_info.max,
+        FP8_MAX=fp8_max,
         BYTES_PER_TOKEN=bytes_per_token,
         SWA_PAGE_SIZE=swa_page_size,
         BF16_STORE=bf16_store,
         IS_FNUZ=_fp8_fnuz,
+        FP8_UNIFIED_STORE=inkernel_fp8_store,
+        MXFP8_BLK=mxfp8_blk,
         num_warps=num_warps,
     )
 
-    if fp8_unified_store and HAS_SWA_STORE:
-        # ``kv`` now holds the norm+RoPE'd [M, head_dim] row (kernel writeback).
-        # MXFP8-pack the NoPE stream (E8M0 per-32-block) into the fp8 pool +
-        # write the RoPE tail bf16 into the parallel rope buffer at swa_loc — the
-        # exact on-disk contract the decode/prefill read kernels consume.
-        assert swa_rope_cache is not None, (
-            "fp8_unified_store requires swa_rope_cache"
-        )
+    if python_fp8_store:
+        # gfx942 (e4m3fnuz) fallback: the kernel only did the norm+RoPE writeback
+        # into ``kv``; MXFP8-pack the NoPE stream + write the bf16 RoPE tail via
+        # the validated standalone scatter (unchanged from before #2).
+        assert swa_rope_cache is not None, "fp8_unified_store requires swa_rope_cache"
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.runtime import (
             store_mxfp8_by_loc,
         )
