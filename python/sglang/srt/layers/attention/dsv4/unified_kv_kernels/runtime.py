@@ -453,6 +453,198 @@ def store_mxfp8_by_loc(
     )
 
 
+@triton.jit
+def _fused_norm_rope_mxfp8_store_kernel(
+    kv_ptr,  # [N, HEAD_DIM] raw compressed kv (pre norm+rope), any float dtype
+    weight_ptr,  # [HEAD_DIM] RMSNorm weight
+    freqs_real_ptr,  # [max_seq, DIM_ROPE] = view_as_real(freqs_cis).flatten(-2)
+    positions_ptr,  # [N] int absolute positions
+    loc_ptr,  # [N] int dest rows (<0 -> skip)
+    nope_u8_ptr,  # [pages, NOPE_WIDTH] uint8 (pool NoPE viewed as uint8)
+    rope_ptr,  # [pages, DIM_ROPE] bf16 (pool RoPE)
+    n_rows,
+    eps,
+    kv_row_stride,
+    freq_row_stride,
+    DIM_NOPE: tl.constexpr,  # 448
+    DIM_ROPE: tl.constexpr,  # 64
+    HEAD_DIM: tl.constexpr,  # 512
+    NUM_BLOCKS: tl.constexpr,  # 14
+    FP8_BLK: tl.constexpr,  # 32
+    NOPE_WIDTH: tl.constexpr,  # 512
+    SCALE_OFF: tl.constexpr,  # 448
+    FP8_MAX: tl.constexpr,  # 448.0
+    BLOCK_ROWS: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,  # next_pow2(HEAD_DIM)
+    ROPE_PAIR_BLOCK: tl.constexpr,  # next_pow2(DIM_ROPE // 2)
+):
+    """Single-launch fold of (RMSNorm over head_dim) + (RoPE on the rope tail) +
+    (MXFP8 E8M0-per-32-block NoPE pack) + (bf16 RoPE scatter) to explicit pool
+    rows ``loc`` (skip when ``loc < 0``).
+
+    Bit-exact replacement for the compressor's two-kernel sequence
+    ``fused_norm_rope_inplace_triton(kv); store_mxfp8_by_loc(kv.bfloat16())``:
+    the normed NoPE / roped tail are rounded to bf16 (matching the ``.bfloat16()``
+    cast the split path applies before packing) before the E8M0 quant math. Saves
+    one full HBM round-trip of the normed tile plus a kernel launch by keeping the
+    normed/roped values in registers and packing them directly."""
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)  # [BLOCK_ROWS]
+    loc = tl.load(loc_ptr + rows, mask=rows < n_rows, other=-1).to(tl.int64)
+    rmask = (rows < n_rows) & (loc >= 0)
+
+    # RMSNorm reduction over the full head_dim (raw input, pre-rope) -- matches
+    # _fused_norm_rope_kernel's sum over the whole row including the raw tail.
+    hoffs = tl.arange(0, HEAD_BLOCK)  # [HEAD_BLOCK]
+    hmask = hoffs < HEAD_DIM
+    full_offs = rows[:, None] * kv_row_stride + hoffs[None, :]
+    xfull = tl.load(
+        kv_ptr + full_offs, mask=rmask[:, None] & hmask[None, :], other=0.0
+    ).to(tl.float32)
+    sum_sq = tl.sum(xfull * xfull, axis=1)  # [BLOCK_ROWS]
+    rms_inv = tl.rsqrt(sum_sq / HEAD_DIM + eps)  # [BLOCK_ROWS]
+
+    # ---- NoPE: norm (with weight) -> bf16 round -> MXFP8 (E8M0 per 32) ----
+    blk_offs = tl.arange(0, FP8_BLK)  # [FP8_BLK]
+    for b in tl.static_range(NUM_BLOCKS):
+        cols = b * FP8_BLK + blk_offs  # [FP8_BLK]
+        offs = rows[:, None] * kv_row_stride + cols[None, :]
+        raw = tl.load(kv_ptr + offs, mask=rmask[:, None], other=0.0).to(tl.float32)
+        w = tl.load(weight_ptr + cols).to(tl.float32)  # [FP8_BLK]
+        normed = raw * rms_inv[:, None] * w[None, :]
+        # Round to bf16 then widen: the split path packs kv_compressed.bfloat16().
+        normed = normed.to(tl.bfloat16).to(tl.float32)
+        amax = tl.max(tl.abs(normed), axis=1)  # [BLOCK_ROWS]
+        amax_c = tl.maximum(amax, 1e-30)
+        e_unb = tl.ceil(tl.log2(amax_c / FP8_MAX))
+        e_unb = tl.where(amax == 0.0, 0.0, e_unb)
+        scale = tl.exp2(e_unb)
+        q = (normed / scale[:, None]).to(tl.float8e4nv)
+        qb = q.to(tl.uint8, bitcast=True)
+        tl.store(
+            nope_u8_ptr + loc[:, None] * NOPE_WIDTH + cols[None, :],
+            qb,
+            mask=rmask[:, None],
+        )
+        e_byte = e_unb.to(tl.int32) + 127
+        e_byte = tl.minimum(tl.maximum(e_byte, 0), 255).to(tl.uint8)
+        tl.store(
+            nope_u8_ptr + loc * NOPE_WIDTH + SCALE_OFF + b,
+            e_byte,
+            mask=rmask,
+        )
+
+    # ---- RoPE tail: norm (with weight) -> rotate -> bf16 scatter ----
+    rope_start = HEAD_DIM - DIM_ROPE
+    pair_offs = tl.arange(0, ROPE_PAIR_BLOCK)  # [ROPE_PAIR_BLOCK]
+    pair_mask = rmask[:, None] & (pair_offs < (DIM_ROPE // 2))[None, :]
+
+    real_cols = rope_start + 2 * pair_offs  # [ROPE_PAIR_BLOCK]
+    imag_cols = real_cols + 1
+    x_real = tl.load(
+        kv_ptr + rows[:, None] * kv_row_stride + real_cols[None, :],
+        mask=pair_mask,
+        other=0.0,
+    ).to(tl.float32)
+    x_imag = tl.load(
+        kv_ptr + rows[:, None] * kv_row_stride + imag_cols[None, :],
+        mask=pair_mask,
+        other=0.0,
+    ).to(tl.float32)
+    w_real = tl.load(weight_ptr + real_cols, mask=pair_offs < (DIM_ROPE // 2), other=1.0).to(
+        tl.float32
+    )
+    w_imag = tl.load(weight_ptr + imag_cols, mask=pair_offs < (DIM_ROPE // 2), other=1.0).to(
+        tl.float32
+    )
+    x_real = x_real * rms_inv[:, None] * w_real[None, :]
+    x_imag = x_imag * rms_inv[:, None] * w_imag[None, :]
+
+    positions = tl.load(positions_ptr + rows, mask=rows < n_rows, other=0).to(tl.int64)
+    freq_base = positions[:, None] * freq_row_stride
+    f_real = tl.load(
+        freqs_real_ptr + freq_base + real_cols[None, :] - rope_start,
+        mask=pair_mask,
+        other=0.0,
+    ).to(tl.float32)
+    f_imag = tl.load(
+        freqs_real_ptr + freq_base + imag_cols[None, :] - rope_start,
+        mask=pair_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    out_real = x_real * f_real - x_imag * f_imag
+    out_imag = x_real * f_imag + x_imag * f_real
+
+    # rope pool row is contiguous bf16: rope[2*pair]=real, rope[2*pair+1]=imag,
+    # matching the split store reading kv cols [DIM_NOPE..HEAD_DIM) verbatim.
+    rope_real_dst = loc[:, None] * DIM_ROPE + 2 * pair_offs[None, :]
+    tl.store(rope_ptr + rope_real_dst, out_real.to(rope_ptr.dtype.element_ty), mask=pair_mask)
+    tl.store(
+        rope_ptr + rope_real_dst + 1, out_imag.to(rope_ptr.dtype.element_ty), mask=pair_mask
+    )
+
+
+def store_mxfp8_norm_rope_by_loc(
+    *,
+    kv: torch.Tensor,  # [T, head_dim] raw compressed kv (pre norm+rope)
+    weight: torch.Tensor,  # [head_dim] RMSNorm weight
+    eps: float,
+    freqs_cis: torch.Tensor,  # complex freqs table indexed by positions
+    positions: torch.Tensor,  # [T] int absolute positions
+    loc: torch.Tensor,  # [T] int destination rows in the unified pool (<0 = skip)
+    unified_kv_nope: torch.Tensor,  # [pages, 512] fp8 (MXFP8-packed NoPE)
+    unified_kv_rope: torch.Tensor,  # [pages, 64] bf16
+) -> None:
+    """Fused (RMSNorm + RoPE + MXFP8 NoPE pack + bf16 RoPE scatter) compressed-K
+    store. Single-launch, bit-exact replacement for
+    ``fused_norm_rope_inplace_triton(kv); store_mxfp8_by_loc(kv.bfloat16())``.
+    Same on-disk contract as the decode/prefill read kernels; pure Triton."""
+    from sglang.srt.layers.attention.dsv4.unified_kv_kernels import mxfp8
+
+    n_rows, D = kv.shape
+    if n_rows == 0:
+        return
+    assert unified_kv_nope.dtype == mxfp8.FP8_DTYPE
+    assert D == mxfp8.DIM_HEAD, f"expected head_dim {mxfp8.DIM_HEAD}, got {D}"
+    assert kv.stride(-1) == 1, "fused norm-rope store needs contiguous head_dim"
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    rope_dim = freqs_real.shape[-1]
+    assert rope_dim == mxfp8.DIM_ROPE, f"expected rope_dim {mxfp8.DIM_ROPE}, got {rope_dim}"
+    assert weight.shape == (D,)
+    if not loc.is_contiguous():
+        loc = loc.contiguous()
+    if not positions.is_contiguous():
+        positions = positions.contiguous()
+    BLOCK_ROWS = 8
+    grid = (triton.cdiv(n_rows, BLOCK_ROWS),)
+    _fused_norm_rope_mxfp8_store_kernel[grid](
+        kv,
+        weight,
+        freqs_real,
+        positions,
+        loc,
+        unified_kv_nope.view(torch.uint8),
+        unified_kv_rope,
+        n_rows,
+        eps,
+        kv.stride(0),
+        freqs_real.stride(0),
+        DIM_NOPE=mxfp8.DIM_NOPE,
+        DIM_ROPE=mxfp8.DIM_ROPE,
+        HEAD_DIM=mxfp8.DIM_HEAD,
+        NUM_BLOCKS=mxfp8.NUM_NOPE_BLOCKS,
+        FP8_BLK=mxfp8.FP8_BLOCK,
+        NOPE_WIDTH=mxfp8.NOPE_PACKED_WIDTH,
+        SCALE_OFF=mxfp8.SCALE_OFFSET,
+        FP8_MAX=mxfp8.FP8_MAX,
+        BLOCK_ROWS=BLOCK_ROWS,
+        HEAD_BLOCK=triton.next_power_of_2(D),
+        ROPE_PAIR_BLOCK=max(triton.next_power_of_2(rope_dim // 2), 1),
+        num_warps=4,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Ragged indptr helper (shared by the decode streams + prefill builders)
 # ---------------------------------------------------------------------------

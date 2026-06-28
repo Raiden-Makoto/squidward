@@ -501,10 +501,6 @@ class CompressorBackendMixin:
         selection (decode: direct; prefill: ``out_loc[ragged_id]``) replicates
         the JIT kernel's contract exactly.
         """
-        from sglang.srt.layers.deepseek_v4_rope import (
-            fused_norm_rope_inplace_triton,
-        )
-
         assert compress_ratio in (4, 128)
         plan = self._get_paged_compress_metadata(compress_ratio)
 
@@ -533,18 +529,9 @@ class CompressorBackendMixin:
                 is_boundary, kv_compressed, torch.zeros_like(kv_compressed)
             )
 
-        # Step 2: norm + rope (Triton fallback, precision parity with the JIT).
+        # Step 2: resolve per-token write locations (matches the JIT kernel).
         positions = _extract_positions_from_plan(plan, compress_ratio)
         positions_safe = positions.clamp(min=0)
-        fused_norm_rope_inplace_triton(
-            kv_compressed,
-            norm.weight,
-            norm.variance_epsilon,
-            freqs_cis_cache,
-            positions=positions_safe,
-        )
-
-        # Step 3: resolve per-token write locations (matches the JIT kernel).
         if plan.is_decode:
             out_loc_to_store = out_loc
         else:
@@ -555,15 +542,22 @@ class CompressorBackendMixin:
         if kv_compressed.shape[0] == 0:
             return
 
-        # Step 4: MXFP8 NoPE pack (E8M0 per-32-block) + bf16 RoPE scatter. Shares
+        # Step 3: fused norm + rope + MXFP8 NoPE pack (E8M0 per-32-block) + bf16
+        # RoPE scatter in a single Triton launch. Bit-exact replacement for the
+        # split ``fused_norm_rope_inplace_triton`` + ``store_mxfp8_by_loc`` pair
+        # (saves one HBM round-trip of the normed tile + a kernel launch). Shares
         # the exact on-disk contract with the SWA ring store and the
         # decode/prefill read kernels (pure Triton, no CUDA-only symbol).
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.runtime import (
-            store_mxfp8_by_loc,
+            store_mxfp8_norm_rope_by_loc,
         )
 
-        store_mxfp8_by_loc(
-            kv=kv_compressed.bfloat16(),
+        store_mxfp8_norm_rope_by_loc(
+            kv=kv_compressed,
+            weight=norm.weight,
+            eps=norm.variance_epsilon,
+            freqs_cis=freqs_cis_cache,
+            positions=positions_safe,
             loc=out_loc_to_store,
             unified_kv_nope=nope_buffer,
             unified_kv_rope=rope_buffer,
