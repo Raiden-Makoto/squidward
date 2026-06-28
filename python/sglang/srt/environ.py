@@ -841,6 +841,11 @@ class Envs:
     # Opt-in: native CDNA4 MXFP8 scaled-MFMA (tl.dot_scaled) for the QK dot in the
     # unified-KV fp8 decode kernels (gfx950 only). Requires SGLANG_UNIFIED_KV_FP8.
     SGLANG_UNIFIED_KV_FP8_QK_NATIVE = EnvBool(False)
+    # Opt-in: store the RoPE half of the unified-KV fp8 cache as MXFP8 (E8M0
+    # per-32-block) co-located in the NoPE pack row, instead of a separate bf16
+    # RoPE buffer. Collapses the decode tile read from 3 indexed gathers to 2
+    # (one 512-wide fp8 load + one 16-wide E8M0 load). Requires SGLANG_UNIFIED_KV_FP8.
+    SGLANG_UNIFIED_KV_FP8_ROPE8 = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(False)
 

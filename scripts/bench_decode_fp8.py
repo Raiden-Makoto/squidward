@@ -30,6 +30,7 @@ from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
 )
 from sglang.srt.layers.attention.dsv4.unified_kv_kernels.runtime import (
     pack_mxfp8_dense,
+    pack_mxfp8_rope8_dense,
 )
 
 _D = mxfp8.DIM_HEAD  # 512
@@ -56,6 +57,16 @@ def _build_inputs(T: int, H: int, kv_len: int, device: str, seed: int = 0,
     ).to(torch.bfloat16)
 
     nope_fp8, rope_bf16 = pack_mxfp8_dense(latent)  # [pages,512] fp8, [pages,64] bf16
+
+    if layout == "fp8rope":
+        # All-fp8 co-located layout: kv_fp8 [pages,512] (NoPE 0:448 + RoPE
+        # 448:512), scale [pages,16] uint8 E8M0. The scale buffer is passed via
+        # the unified_kv_rope slot; the kernel engages the fused 2-gather read
+        # when SGLANG_UNIFIED_KV_FP8_ROPE8=1. Requires the fp8 backend gates set.
+        kv_fp8, scale = pack_mxfp8_rope8_dense(latent)
+        nope_fp8 = kv_fp8
+        rope_bf16 = scale  # [pages,16] uint8 (carried in the rope slot)
+        assert nope_fp8.shape == (pages, 512) and rope_bf16.shape == (pages, 16)
 
     if layout == "combined":
         # One contiguous [pages, 512 + 128] byte buffer: [0:512] NoPE pack,
@@ -138,9 +149,12 @@ def main() -> None:
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--warmup", type=int, default=30)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--layout", choices=["split", "combined"], default="split",
-                    help="fp8 pool layout: split (two buffers) or combined "
-                         "(co-located NoPE+RoPE per row)")
+    ap.add_argument("--layout", choices=["split", "combined", "fp8rope"], default="split",
+                    help="fp8 pool layout: split (two buffers), combined "
+                         "(co-located NoPE+RoPE bf16 per row), or fp8rope "
+                         "(all-fp8 co-located NoPE+RoPE + E8M0 scale, fused read)")
+    ap.add_argument("--check", action="store_true",
+                    help="also report accuracy of the fp8 output vs the bf16 reference")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -157,6 +171,15 @@ def main() -> None:
         f"arch={arch} T={args.batch} H={args.heads} kv_len={args.kv_len} D={_D} "
         f"iters={args.iters} ablate={ablate} qk_native={qk_native} layout={args.layout}"
     )
+
+    if args.check:
+        out_ref = _call("bf16", inp).float()
+        out_fp8 = _call("fp8", inp).float()
+        cos = (out_ref.flatten() @ out_fp8.flatten()) / (
+            out_ref.norm() * out_fp8.norm() + 1e-30
+        )
+        rel = (out_fp8 - out_ref).norm() / (out_ref.norm() + 1e-30)
+        print(f"accuracy vs bf16: cosine={cos.item():.6f} rel_l2={rel.item():.6e}")
 
     modes = ["bf16", "fp8"] if args.mode == "all" else [args.mode]
     results = {}

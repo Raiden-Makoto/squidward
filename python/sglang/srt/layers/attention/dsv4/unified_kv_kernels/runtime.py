@@ -262,6 +262,91 @@ def pack_mxfp8_dense(
     return nope, rope
 
 
+@triton.jit
+def _mxfp8_rope8_pack_dense_kernel(
+    kv_ptr,  # [N, head_dim] norm+rope'd (any float dtype)
+    kv_u8_ptr,  # [N, DIM_HEAD] uint8 (dense fp8 NoPE+RoPE out viewed as uint8)
+    scale_ptr,  # [N, NUM_BLOCKS] uint8 E8M0 (one per 32-block over the full head)
+    n_rows,
+    kv_row_stride,
+    kv_col_stride,
+    DIM_HEAD: tl.constexpr,  # 512 (448 NoPE + 64 RoPE)
+    NUM_BLOCKS: tl.constexpr,  # 16 (= DIM_HEAD / 32)
+    FP8_BLK: tl.constexpr,  # 32
+    FP8_MAX: tl.constexpr,  # 448.0
+    BLOCK_ROWS: tl.constexpr,
+):
+    """RoPE8 dense packer: quantize the FULL head latent (NoPE 0:448 + RoPE
+    448:512) to MXFP8 (E8M0 per-32-block) into a contiguous [N, 512] fp8 row plus
+    a [N, 16] E8M0 scale buffer. Identical per-32 block math to the split packer;
+    the difference is that the RoPE tail is quantized in-place (blocks 14,15)
+    instead of copied as bf16, and the E8M0 bytes go to a separate scale buffer
+    (the 512 fp8 row is fully used by NoPE+RoPE, leaving no inline scale room)."""
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = rows < n_rows
+    blk_offs = tl.arange(0, FP8_BLK)
+    for b in tl.static_range(NUM_BLOCKS):
+        cols = b * FP8_BLK + blk_offs
+        offs = rows[:, None] * kv_row_stride + cols[None, :] * kv_col_stride
+        vals = tl.load(kv_ptr + offs, mask=row_mask[:, None], other=0.0).to(tl.float32)
+        amax = tl.max(tl.abs(vals), axis=1)
+        amax_c = tl.maximum(amax, 1e-30)
+        e_unb = tl.ceil(tl.log2(amax_c / FP8_MAX))
+        e_unb = tl.where(amax == 0.0, 0.0, e_unb)
+        scale = tl.exp2(e_unb)
+        q = (vals / scale[:, None]).to(tl.float8e4nv)
+        qb = q.to(tl.uint8, bitcast=True)
+        tl.store(
+            kv_u8_ptr + rows[:, None] * DIM_HEAD + cols[None, :],
+            qb,
+            mask=row_mask[:, None],
+        )
+        e_byte = e_unb.to(tl.int32) + 127
+        e_byte = tl.minimum(tl.maximum(e_byte, 0), 255).to(tl.uint8)
+        tl.store(scale_ptr + rows * NUM_BLOCKS + b, e_byte, mask=row_mask)
+
+
+def pack_mxfp8_rope8_dense(
+    x: torch.Tensor,  # [..., head_dim] norm+rope'd (any float dtype)
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """RoPE8 dense pack: returns ``(kv_fp8 [..., 512], scale [..., 16])`` where
+    ``kv_fp8`` is the full head (NoPE 0:448 + RoPE 448:512) MXFP8-quantized fp8
+    and ``scale`` the per-32-block E8M0 exponents (uint8). Co-located layout for
+    the fused 2-gather decode read (``SGLANG_UNIFIED_KV_FP8_ROPE8``)."""
+    from sglang.srt.layers.attention.dsv4.unified_kv_kernels import mxfp8
+
+    assert x.shape[-1] == mxfp8.DIM_HEAD, (
+        f"pack_mxfp8_rope8_dense expects head_dim {mxfp8.DIM_HEAD}, got {x.shape[-1]}"
+    )
+    num_blocks = mxfp8.DIM_HEAD // mxfp8.FP8_BLOCK  # 16
+    lead = x.shape[:-1]
+    flat = x.reshape(-1, mxfp8.DIM_HEAD)
+    n_rows = flat.shape[0]
+    kv_u8 = torch.zeros(n_rows, mxfp8.DIM_HEAD, dtype=torch.uint8, device=x.device)
+    scale = torch.zeros(n_rows, num_blocks, dtype=torch.uint8, device=x.device)
+    if n_rows > 0:
+        BLOCK_ROWS = 8
+        grid = (triton.cdiv(n_rows, BLOCK_ROWS),)
+        _mxfp8_rope8_pack_dense_kernel[grid](
+            flat,
+            kv_u8,
+            scale,
+            n_rows,
+            flat.stride(0),
+            flat.stride(1),
+            DIM_HEAD=mxfp8.DIM_HEAD,
+            NUM_BLOCKS=num_blocks,
+            FP8_BLK=mxfp8.FP8_BLOCK,
+            FP8_MAX=mxfp8.FP8_MAX,
+            BLOCK_ROWS=BLOCK_ROWS,
+            num_warps=4,
+        )
+    kv_fp8 = kv_u8.view(mxfp8.FP8_DTYPE).reshape(*lead, mxfp8.DIM_HEAD)
+    scale = scale.reshape(*lead, num_blocks)
+    return kv_fp8, scale
+
+
 def _launch_mxfp8_pack(
     *,
     kv: torch.Tensor,  # [T, head_dim]
