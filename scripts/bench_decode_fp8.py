@@ -71,6 +71,9 @@ def _build_inputs(T: int, H: int, kv_len: int, device: str, seed: int = 0):
     }
 
 
+_FP8_CFG: dict = {}  # optional forced escape hatches for fp8 (profiling)
+
+
 def _call(mode: str, inp: dict) -> torch.Tensor:
     if mode == "bf16":
         return sparse_attn_v4_paged_decode(
@@ -82,6 +85,8 @@ def _call(mode: str, inp: dict) -> torch.Tensor:
             inp["softmax_scale"],
             unified_kv_rope=None,
         )
+    if _FP8_CFG:
+        return _call_cfg(inp, **_FP8_CFG)
     return sparse_attn_v4_paged_decode(
         inp["q"],
         inp["nope_fp8"],
@@ -172,7 +177,20 @@ def main() -> None:
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--warmup", type=int, default=30)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--block-k", type=int, default=None)
+    ap.add_argument("--num-k-stages", type=int, default=None)
+    ap.add_argument("--kv-splits", dest="kv_splits", type=int, default=None)
+    ap.add_argument("--block-h", type=int, default=None)
     args = ap.parse_args()
+
+    for k, v in (
+        ("block_k", args.block_k),
+        ("num_k_stages", args.num_k_stages),
+        ("kv_splits", args.kv_splits),
+        ("block_h", args.block_h),
+    ):
+        if v is not None:
+            _FP8_CFG[k] = v
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA/HIP device required")
