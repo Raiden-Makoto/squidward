@@ -171,6 +171,8 @@ def _sparse_attn_v4_paged_prefill_kernel(
                 NOPE,
                 FP8_BLK,
                 q.dtype,
+                BLOCK_K,
+                BLOCK_D,
             )
         else:
             kv = tl.load(

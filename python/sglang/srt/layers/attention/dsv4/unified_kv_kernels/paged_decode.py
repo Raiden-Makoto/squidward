@@ -104,6 +104,8 @@ def _load_mxfp8_kv_tile(
     NOPE: tl.constexpr,  # 448
     FP8_BLK: tl.constexpr,  # 32
     OUT_DTYPE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,  # 512
 ):
     """Reconstruct a [BLOCK_K, BLOCK_D=512] bf16 KV tile from the MXFP8 NoPE
     pack + bf16 RoPE buffer.
@@ -117,11 +119,17 @@ def _load_mxfp8_kv_tile(
         mask=valid[:, None] & nope_mask[None, :],
         other=0.0,
     ).to(tl.float32)
-    # E8M0 exponent byte for block d//FP8_BLK lives inline at col NOPE + d//FP8_BLK.
-    g_idx = d_offs // FP8_BLK
-    e_byte = tl.load(
-        unified_u8_ptr + slot[:, None] * kv_stride_n + (NOPE + g_idx)[None, :],
-        mask=valid[:, None] & nope_mask[None, :],
+    # E8M0 exponent byte for block g lives inline at col NOPE + g (one byte per
+    # FP8_BLK group). Load the narrow [BLOCK_K, NUM_GROUPS] block once and
+    # broadcast each group across its FP8_BLK dims, instead of re-gathering the
+    # same byte for all FP8_BLK lanes of a group (a BLOCK_D-wide gather of only
+    # NUM_GROUPS unique bytes -> a NUM_GROUPS-wide load).
+    NUM_GROUPS: tl.constexpr = BLOCK_D // FP8_BLK
+    NOPE_GROUPS: tl.constexpr = NOPE // FP8_BLK
+    group_offs = tl.arange(0, NUM_GROUPS)
+    e_g = tl.load(
+        unified_u8_ptr + slot[:, None] * kv_stride_n + (NOPE + group_offs)[None, :],
+        mask=valid[:, None] & (group_offs < NOPE_GROUPS)[None, :],
         other=127,
     ).to(tl.int32)
     # scale = 2^(e_byte-127). An fp32 with biased exponent e_byte and zero
@@ -129,7 +137,12 @@ def _load_mxfp8_kv_tile(
     # bitcast instead of an SFU exp2 over the whole [BLOCK_K, 512] tile (the
     # hot-loop ALU cost of the MXFP8 dequant). Bit-identical to exp2 for all
     # E8M0 codes the store emits (e_byte in [0,254]; e_byte=255 never occurs).
-    scale = (e_byte << 23).to(tl.float32, bitcast=True)
+    scale_g = (e_g << 23).to(tl.float32, bitcast=True)  # [BLOCK_K, NUM_GROUPS]
+    # Expand group scale to per-dim: scale[k, d] = scale_g[k, d // FP8_BLK].
+    scale = tl.reshape(
+        tl.broadcast_to(scale_g[:, :, None], (BLOCK_K, NUM_GROUPS, FP8_BLK)),
+        (BLOCK_K, BLOCK_D),
+    )
     nope_deq = kv_fp8 * scale
     # rope: cols [NOPE, NOPE+ROPE) <- rope_buffer[:, d-NOPE]
     rope_idx = d_offs - NOPE
@@ -341,6 +354,8 @@ def _paged_decode_fused_kernel(
                 NOPE,
                 FP8_BLK,
                 q.dtype,
+                BLOCK_K,
+                BLOCK_D,
             )
         else:
             kv = tl.load(
@@ -507,6 +522,8 @@ def _paged_decode_split_kernel(
                 NOPE,
                 FP8_BLK,
                 q.dtype,
+                BLOCK_K,
+                BLOCK_D,
             )
         else:
             kv = tl.load(
