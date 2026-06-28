@@ -1083,16 +1083,18 @@ def _sparse_attn_v4_paged_decode_triton(
     qk_scale = float(softmax_scale) * LOG2E
     _bk, num_warps, num_stages = _kernel_config(block_h)
     if block_k is None:
-        # MXFP8 dequant inflates per-tile ALU work; a wider K tile amortizes
-        # the per-tile dequant cost (fp8 load + E8M0 exp2 scale + cast) over
-        # more MFMA work. BLOCK_K=32 + the inner-loop num_stages=3 pipeline
-        # overflowed gfx950's 160KB LDS at D=512; pairing BLOCK_K=32 with
-        # NUM_K_STAGES=2 drops a staged tile to fit.
-        block_k = 32 if quant_kv else _bk
-    # Inner K-loop SW-pipeline depth (escape hatch for benchmarks): default
-    # bf16 keeps 3; fp8 uses 2.
+        # fp8 uses the SAME BLOCK_K=16 as bf16. A microbench sweep over
+        # {16,32,64} x {2,3} stages (gfx950, T>=16, D=512) found the earlier
+        # "wider K tile amortizes the dequant" reasoning backwards: BLOCK_K=32
+        # is ~13us slower at T=16 and ~29us slower at T=32 than BLOCK_K=16. The
+        # narrow tile keeps register/LDS footprint low enough for deeper
+        # pipelining and better occupancy, which dominates the per-tile dequant.
+        block_k = _bk
+    # Inner K-loop SW-pipeline depth (escape hatch for benchmarks). Both paths
+    # use 3: with BLOCK_K=16 the fp8 staged tile (16x3) is smaller than the old
+    # BLOCK_K=32 x 2 default, so it fits gfx950 LDS and pipelines deeper.
     if num_k_stages is None:
-        num_k_stages = 2 if quant_kv else 3
+        num_k_stages = 3
 
     # Native QK: opt-in MXFP8 dot_scaled for the score path (gfx950). Pre-quantize
     # the NoPE half of q to a padded fp8 + E8M0 layout once per decode call so
