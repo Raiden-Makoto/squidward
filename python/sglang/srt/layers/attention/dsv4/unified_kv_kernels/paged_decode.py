@@ -65,6 +65,20 @@ _is_hip = is_hip()
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
 _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
 
+
+# TEMP (profiling-only): MXFP8 dequant ablation gate, read once from
+# SGLANG_UNIFIED_KV_FP8_ABLATE. Lets bench_decode_fp8.py attribute the fp8 gap.
+#   none (0)          : full dequant (production behaviour).
+#   noscale (1)       : skip E8M0 load + scale multiply -> isolates dequant ALU.
+#   noropegather (2)  : skip the separate RoPE gather -> isolates split-gather.
+# Remove after profiling.
+_ABLATE_MAP = {"none": 0, "noscale": 1, "noropegather": 2}
+
+
+@functools.lru_cache(maxsize=1)
+def _ablate_mode() -> int:
+    return _ABLATE_MAP.get(os.environ.get("SGLANG_UNIFIED_KV_FP8_ABLATE", "none"), 0)
+
 # MXFP8 unified KV cache (upstream aiter NoPE-fp8 / RoPE-bf16; ROCm/aiter #3751).
 #
 # Storage: a [pages, 512] fp8 NoPE buffer (MXFP8-packed: 448 fp8 data + 14 uint8
@@ -115,6 +129,7 @@ def _load_mxfp8_kv_tile(
     OUT_DTYPE: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,  # 512
+    ABLATE: tl.constexpr,  # TEMP profiling: 0=full 1=noscale 2=noropegather
 ):
     """Reconstruct a [BLOCK_K, BLOCK_D=512] bf16 KV tile from the MXFP8 NoPE
     pack + bf16 RoPE buffer.
@@ -128,38 +143,46 @@ def _load_mxfp8_kv_tile(
         mask=valid[:, None] & nope_mask[None, :],
         other=0.0,
     ).to(tl.float32)
-    # E8M0 exponent byte for block g lives inline at col NOPE + g (one byte per
-    # FP8_BLK group). Load the narrow [BLOCK_K, NUM_GROUPS] block once and
-    # broadcast each group across its FP8_BLK dims, instead of re-gathering the
-    # same byte for all FP8_BLK lanes of a group (a BLOCK_D-wide gather of only
-    # NUM_GROUPS unique bytes -> a NUM_GROUPS-wide load).
-    NUM_GROUPS: tl.constexpr = BLOCK_D // FP8_BLK
-    NOPE_GROUPS: tl.constexpr = NOPE // FP8_BLK
-    group_offs = tl.arange(0, NUM_GROUPS)
-    e_g = tl.load(
-        unified_u8_ptr + slot[:, None] * kv_stride_n + (NOPE + group_offs)[None, :],
-        mask=valid[:, None] & (group_offs < NOPE_GROUPS)[None, :],
-        other=127,
-    ).to(tl.int32)
-    # scale = 2^(e_byte-127). An fp32 with biased exponent e_byte and zero
-    # mantissa IS exactly 2^(e_byte-127), so synthesize it with an int shift +
-    # bitcast instead of an SFU exp2 over the whole [BLOCK_K, 512] tile (the
-    # hot-loop ALU cost of the MXFP8 dequant). Bit-identical to exp2 for all
-    # E8M0 codes the store emits (e_byte in [0,254]; e_byte=255 never occurs).
-    scale_g = (e_g << 23).to(tl.float32, bitcast=True)  # [BLOCK_K, NUM_GROUPS]
-    # Expand group scale to per-dim: scale[k, d] = scale_g[k, d // FP8_BLK].
-    scale = tl.reshape(
-        tl.broadcast_to(scale_g[:, :, None], (BLOCK_K, NUM_GROUPS, FP8_BLK)),
-        (BLOCK_K, BLOCK_D),
-    )
-    nope_deq = kv_fp8 * scale
-    # rope: cols [NOPE, NOPE+ROPE) <- rope_buffer[:, d-NOPE]
-    rope_idx = d_offs - NOPE
-    rope_val = tl.load(
-        rope_ptr + slot[:, None] * rope_stride_n + rope_idx[None, :],
-        mask=valid[:, None] & (~nope_mask[None, :]),
-        other=0.0,
-    ).to(tl.float32)
+    if ABLATE == 1:
+        # noscale: skip the E8M0 load + multiply to isolate the dequant ALU cost.
+        nope_deq = kv_fp8
+    else:
+        # E8M0 exponent byte for block g lives inline at col NOPE + g (one byte
+        # per FP8_BLK group). Load the narrow [BLOCK_K, NUM_GROUPS] block once
+        # and broadcast each group across its FP8_BLK dims, instead of
+        # re-gathering the same byte for all FP8_BLK lanes of a group (a
+        # BLOCK_D-wide gather of only NUM_GROUPS unique bytes -> NUM_GROUPS-wide).
+        NUM_GROUPS: tl.constexpr = BLOCK_D // FP8_BLK
+        NOPE_GROUPS: tl.constexpr = NOPE // FP8_BLK
+        group_offs = tl.arange(0, NUM_GROUPS)
+        e_g = tl.load(
+            unified_u8_ptr + slot[:, None] * kv_stride_n + (NOPE + group_offs)[None, :],
+            mask=valid[:, None] & (group_offs < NOPE_GROUPS)[None, :],
+            other=127,
+        ).to(tl.int32)
+        # scale = 2^(e_byte-127). An fp32 with biased exponent e_byte and zero
+        # mantissa IS exactly 2^(e_byte-127), so synthesize it with an int shift
+        # + bitcast instead of an SFU exp2 over the whole [BLOCK_K, 512] tile (the
+        # hot-loop ALU cost of the MXFP8 dequant). Bit-identical to exp2 for all
+        # E8M0 codes the store emits (e_byte in [0,254]; e_byte=255 never occurs).
+        scale_g = (e_g << 23).to(tl.float32, bitcast=True)  # [BLOCK_K, NUM_GROUPS]
+        # Expand group scale to per-dim: scale[k, d] = scale_g[k, d // FP8_BLK].
+        scale = tl.reshape(
+            tl.broadcast_to(scale_g[:, :, None], (BLOCK_K, NUM_GROUPS, FP8_BLK)),
+            (BLOCK_K, BLOCK_D),
+        )
+        nope_deq = kv_fp8 * scale
+    if ABLATE == 2:
+        # noropegather: skip the separate RoPE gather to isolate split-gather cost.
+        rope_val = tl.zeros((BLOCK_K, BLOCK_D), dtype=tl.float32)
+    else:
+        # rope: cols [NOPE, NOPE+ROPE) <- rope_buffer[:, d-NOPE]
+        rope_idx = d_offs - NOPE
+        rope_val = tl.load(
+            rope_ptr + slot[:, None] * rope_stride_n + rope_idx[None, :],
+            mask=valid[:, None] & (~nope_mask[None, :]),
+            other=0.0,
+        ).to(tl.float32)
     kv_full = tl.where(nope_mask[None, :], nope_deq, rope_val)
     return kv_full.to(OUT_DTYPE)
 
@@ -461,6 +484,7 @@ def _paged_decode_fused_kernel(
     NOPE: tl.constexpr,  # NoPE dim (448) when QUANT_KV
     FP8_BLK: tl.constexpr,  # MXFP8 block width (32) when QUANT_KV
     NUM_K_STAGES: tl.constexpr,  # SW-pipeline depth of the inner K loop
+    ABLATE: tl.constexpr,  # TEMP profiling dequant ablation (see _ablate_mode)
 ):
     """Single-pass online-softmax with sink folded inline — fast path for
     cases where ``kv_splits = 1`` (base grid already saturates the GPU). Skips
@@ -580,6 +604,7 @@ def _paged_decode_fused_kernel(
                 q.dtype,
                 BLOCK_K,
                 BLOCK_D,
+                ABLATE,
             )
             scores = tl.dot(q, tl.trans(kv)) * qk_scale
         else:
@@ -681,6 +706,7 @@ def _paged_decode_split_kernel(
     NOPE: tl.constexpr,  # NoPE dim (448) when QUANT_KV
     FP8_BLK: tl.constexpr,  # MXFP8 block width (32) when QUANT_KV
     NUM_K_STAGES: tl.constexpr,  # SW-pipeline depth of the inner K loop
+    ABLATE: tl.constexpr,  # TEMP profiling dequant ablation (see _ablate_mode)
 ):
     """3D split-K + exp2-softmax sparse paged-decode. Grid: (N, ceil(H/BLOCK_H), KV_SPLITS).
 
@@ -806,6 +832,7 @@ def _paged_decode_split_kernel(
                 q.dtype,
                 BLOCK_K,
                 BLOCK_D,
+                ABLATE,
             )
             scores = tl.dot(q, tl.trans(kv)) * qk_scale
         else:
@@ -1093,6 +1120,9 @@ def _sparse_attn_v4_paged_decode_triton(
     # bf16 keeps 3; fp8 uses 2.
     if num_k_stages is None:
         num_k_stages = 2 if quant_kv else 3
+    # TEMP (profiling-only): dequant ablation gate. 0 (none) on the bf16 path and
+    # in production; non-zero only when SGLANG_UNIFIED_KV_FP8_ABLATE is set.
+    ablate_mode = _ablate_mode() if quant_kv else 0
 
     # Native QK: opt-in MXFP8 dot_scaled for the score path (gfx950). Pre-quantize
     # the NoPE half of q to a padded fp8 + E8M0 layout once per decode call so
@@ -1173,6 +1203,7 @@ def _sparse_attn_v4_paged_decode_triton(
             NOPE=_MXFP8_NOPE,
             FP8_BLK=_MXFP8_BLK,
             NUM_K_STAGES=num_k_stages,
+            ABLATE=ablate_mode,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -1235,6 +1266,7 @@ def _sparse_attn_v4_paged_decode_triton(
         NOPE=_MXFP8_NOPE,
         FP8_BLK=_MXFP8_BLK,
         NUM_K_STAGES=num_k_stages,
+        ABLATE=ablate_mode,
         num_warps=num_warps,
         num_stages=num_stages,
     )
