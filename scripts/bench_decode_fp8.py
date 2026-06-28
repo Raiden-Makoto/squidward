@@ -26,6 +26,7 @@ import torch
 
 from sglang.srt.layers.attention.dsv4.unified_kv_kernels import mxfp8
 from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
+    _sparse_attn_v4_paged_decode_triton,
     sparse_attn_v4_paged_decode,
 )
 from sglang.srt.layers.attention.dsv4.unified_kv_kernels.runtime import (
@@ -92,25 +93,79 @@ def _call(mode: str, inp: dict) -> torch.Tensor:
     )
 
 
-def _time_us(mode: str, inp: dict, iters: int, warmup: int) -> float:
+def _call_cfg(inp: dict, **cfg) -> torch.Tensor:
+    """fp8 decode via the internal wrapper with explicit tuning escape hatches
+    (block_k / num_k_stages / kv_splits / block_h)."""
+    return _sparse_attn_v4_paged_decode_triton(
+        inp["q"],
+        inp["nope_fp8"],
+        inp["kv_indices"],
+        inp["kv_indptr"],
+        inp["attn_sink"],
+        inp["softmax_scale"],
+        unified_kv_rope=inp["rope_bf16"],
+        **{k: v for k, v in cfg.items() if v is not None},
+    )
+
+
+def _time_fn(fn, iters: int, warmup: int) -> float:
     for _ in range(warmup):
-        _call(mode, inp)
+        fn()
     torch.cuda.synchronize()
     samples = []
     for _ in range(iters):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        _call(mode, inp)
+        fn()
         end.record()
         end.synchronize()
         samples.append(start.elapsed_time(end) * 1e3)  # ms -> us
     return statistics.median(samples)
 
 
+def _time_us(mode: str, inp: dict, iters: int, warmup: int) -> float:
+    return _time_fn(lambda: _call(mode, inp), iters, warmup)
+
+
+def _sweep(inp: dict, iters: int, warmup: int) -> None:
+    """Grid over the fp8 decode tuning knobs to see if a config beats the
+    'safe-to-fit' default (block_k=32, num_k_stages=2). Configs that overflow
+    LDS / fail to compile are reported as FAIL."""
+    bf16 = _time_us("bf16", inp, iters, warmup)
+    fp8_default = _time_us("fp8", inp, iters, warmup)
+    print(f"  bf16            : {bf16:8.2f} us")
+    print(f"  fp8 (default)   : {fp8_default:8.2f} us  (delta {fp8_default-bf16:+.2f})")
+    print("  --- fp8 sweep (block_k / stages / kv_splits / block_h) ---")
+    block_ks = [16, 32, 64]
+    stages = [2, 3]
+    kv_splits_opts = [None, 8, 16]
+    block_hs = [None, 32]
+    best = (fp8_default, "default")
+    for bk in block_ks:
+        for st in stages:
+            for ks in kv_splits_opts:
+                for bh in block_hs:
+                    cfg = dict(block_k=bk, num_k_stages=st, kv_splits=ks, block_h=bh)
+                    tag = f"bk={bk} st={st} ks={ks or 'auto'} bh={bh or 'auto'}"
+                    try:
+                        us = _time_fn(lambda: _call_cfg(inp, **cfg), iters, warmup)
+                    except Exception as e:  # noqa: BLE001
+                        msg = str(e).splitlines()[0][:60]
+                        print(f"  {tag:42s}:   FAIL ({msg})")
+                        continue
+                    mark = ""
+                    if us < best[0]:
+                        best = (us, tag)
+                        mark = "  <-- best"
+                    print(f"  {tag:42s}: {us:8.2f} us (delta {us-bf16:+.2f}){mark}")
+    print(f"  === best fp8: {best[0]:.2f} us [{best[1]}] vs bf16 {bf16:.2f} "
+          f"(gap {best[0]-bf16:+.2f}, default gap {fp8_default-bf16:+.2f}) ===")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["bf16", "fp8", "all"], default="all")
+    ap.add_argument("--mode", choices=["bf16", "fp8", "all", "sweep"], default="all")
     ap.add_argument("--batch", type=int, default=16, help="T (decode tokens)")
     ap.add_argument("--heads", type=int, default=16, help="H (q heads per rank)")
     ap.add_argument("--kv-len", type=int, default=8192)
@@ -132,6 +187,10 @@ def main() -> None:
         f"arch={arch} T={args.batch} H={args.heads} kv_len={args.kv_len} D={_D} "
         f"iters={args.iters} ablate={ablate} qk_native={qk_native}"
     )
+
+    if args.mode == "sweep":
+        _sweep(inp, args.iters, args.warmup)
+        return
 
     modes = ["bf16", "fp8"] if args.mode == "all" else [args.mode]
     results = {}
