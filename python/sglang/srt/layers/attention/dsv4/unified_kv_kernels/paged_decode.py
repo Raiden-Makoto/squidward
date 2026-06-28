@@ -59,6 +59,7 @@ import triton
 import triton.language as tl
 from aiter.ops.triton.utils.device_info import get_num_sms
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 _is_hip = is_hip()
 
@@ -1090,11 +1091,17 @@ def _sparse_attn_v4_paged_decode_triton(
         # narrow tile keeps register/LDS footprint low enough for deeper
         # pipelining and better occupancy, which dominates the per-tile dequant.
         block_k = _bk
+        _env_bk = envs.SGLANG_UNIFIED_KV_FP8_BLOCK_K.get()
+        if quant_kv and _env_bk > 0:
+            block_k = _env_bk
     # Inner K-loop SW-pipeline depth (escape hatch for benchmarks). Both paths
     # use 3: with BLOCK_K=16 the fp8 staged tile (16x3) is smaller than the old
     # BLOCK_K=32 x 2 default, so it fits gfx950 LDS and pipelines deeper.
     if num_k_stages is None:
         num_k_stages = 3
+        _env_st = envs.SGLANG_UNIFIED_KV_FP8_NUM_K_STAGES.get()
+        if quant_kv and _env_st > 0:
+            num_k_stages = _env_st
 
     # Native QK: opt-in MXFP8 dot_scaled for the score path (gfx950). Pre-quantize
     # the NoPE half of q to a padded fp8 + E8M0 layout once per decode call so
