@@ -245,40 +245,43 @@ def _fused_qk_norm_rope_store_kernel(
         loc = tl.load(swa_loc_ptr + src_id, mask=src_mask, other=-1).to(tl.int64)
         rmask = src_mask & (loc >= 0)
         MXFP8_NUM_BLOCKS: tl.constexpr = DIM_NOPE // MXFP8_BLK
+        HEAD_NUM_BLOCKS: tl.constexpr = HEAD_DIM // MXFP8_BLK
         # NoPE pool row width (uint8) = swa_cache_stride_page (runtime, == 512).
         row_base = loc * swa_cache_stride_page
-        blk_offs = tl.arange(0, MXFP8_BLK)
-        for b in tl.static_range(MXFP8_NUM_BLOCKS):
-            start = b * MXFP8_BLK
-            cols = start + blk_offs
-            vals = tl.load(
-                kv_ptr
-                + src_id[:, None].to(tl.int64) * stride_kv_m
-                + cols[None, :] * stride_kv_d,
-                mask=rmask[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            # E8M0 block exponent: e = ceil(log2(amax / FP8_MAX)); scale = 2^e.
-            # Matches _mxfp8_pack_scatter_kernel / mxfp8.pack_nope_mxfp8 bit-for-bit.
-            amax = tl.max(tl.abs(vals), axis=1)
-            amax_c = tl.maximum(amax, 1e-30)
-            e_unb = tl.ceil(tl.log2(amax_c / FP8_MAX))
-            e_unb = tl.where(amax == 0.0, 0.0, e_unb)
-            scale = tl.exp2(e_unb)
-            q = (vals / scale[:, None]).to(tl.float8e4nv)
-            qb = q.to(tl.uint8, bitcast=True)
-            tl.store(
-                swa_cache_ptr + row_base[:, None] + cols[None, :],
-                qb,
-                mask=rmask[:, None],
-            )
-            e_byte = e_unb.to(tl.int32) + 127
-            e_byte = tl.minimum(tl.maximum(e_byte, 0), 255).to(tl.uint8)
-            tl.store(
-                swa_cache_ptr + row_base + DIM_NOPE + b,
-                e_byte,
-                mask=rmask,
-            )
+        # Reuse the in-register normed tile instead of re-reading the NoPE
+        # writeback (448 elts/row) back from HBM. Round through kv_ptr's element
+        # dtype first so the quant input is the SAME rounded value the writeback
+        # (and the standalone packer) consumed -> bit-identical bytes. The per-32
+        # E8M0 reduction is vectorized over all blocks at once (no per-block load
+        # / no static loop). Trailing rope-region blocks are computed but masked
+        # off on store.
+        # E8M0 block exponent: e = ceil(log2(amax / FP8_MAX)); scale = 2^e.
+        # Matches _mxfp8_pack_scatter_kernel / mxfp8.pack_nope_mxfp8 bit-for-bit.
+        nope_blk = tl.reshape(
+            kv_normed.to(kv_ptr.dtype.element_ty).to(tl.float32),
+            (BLOCK_SIZE_M, HEAD_NUM_BLOCKS, MXFP8_BLK),
+        )
+        amax = tl.max(tl.abs(nope_blk), axis=2)  # [M, HEAD_NUM_BLOCKS]
+        amax_c = tl.maximum(amax, 1e-30)
+        e_unb = tl.ceil(tl.log2(amax_c / FP8_MAX))
+        e_unb = tl.where(amax == 0.0, 0.0, e_unb)
+        scale = tl.exp2(e_unb)
+        q = (nope_blk / scale[:, :, None]).to(tl.float8e4nv)
+        qb = tl.reshape(q.to(tl.uint8, bitcast=True), (BLOCK_SIZE_M, HEAD_DIM))
+        nope_cols = tl.arange(0, HEAD_DIM)
+        tl.store(
+            swa_cache_ptr + row_base[:, None] + nope_cols[None, :],
+            qb,
+            mask=rmask[:, None] & (nope_cols < DIM_NOPE)[None, :],
+        )
+        e_byte = e_unb.to(tl.int32) + 127
+        e_byte = tl.minimum(tl.maximum(e_byte, 0), 255).to(tl.uint8)
+        blk_ids = tl.arange(0, HEAD_NUM_BLOCKS)
+        tl.store(
+            swa_cache_ptr + row_base[:, None] + DIM_NOPE + blk_ids[None, :],
+            e_byte,
+            mask=rmask[:, None] & (blk_ids < MXFP8_NUM_BLOCKS)[None, :],
+        )
         rope_offs = tl.arange(0, ROPE_DIM)
         tl.store(
             rope_cache_ptr + loc[:, None] * rope_cache_stride_page + rope_offs[None, :],
