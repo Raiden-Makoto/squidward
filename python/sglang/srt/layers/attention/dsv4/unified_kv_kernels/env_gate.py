@@ -53,23 +53,3 @@ def unified_kv_fp8_qk_native() -> bool:
     if not unified_kv_use_fp8():
         return False
     return envs.SGLANG_UNIFIED_KV_FP8_QK_NATIVE.get()
-
-
-@functools.lru_cache(maxsize=1)
-def unified_kv_fp8_rope8() -> bool:
-    """Whether the fp8 unified-KV cache stores the RoPE half as MXFP8 (E8M0
-    per-32-block) co-located in the NoPE pack row, rather than as a separate
-    bf16 RoPE buffer.
-
-    Strictly opt-in and default OFF. Returns True only when BOTH hold:
-      (a) the fp8 unified-KV pool is active (``unified_kv_use_fp8()``),
-      (b) ``SGLANG_UNIFIED_KV_FP8_ROPE8`` is set truthy.
-
-    Co-locating RoPE as fp8 lets the decode tile read use one 512-wide fp8 load
-    (NoPE 0:448 + RoPE 448:512) plus one 16-wide E8M0 load -- 2 indexed gathers
-    instead of 3 (the separate bf16 RoPE buffer is dropped). gfx950-only in
-    practice (the MXFP8 pack asserts e4m3fn).
-    """
-    if not unified_kv_use_fp8():
-        return False
-    return envs.SGLANG_UNIFIED_KV_FP8_ROPE8.get()

@@ -30,25 +30,15 @@ from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
 )
 from sglang.srt.layers.attention.dsv4.unified_kv_kernels.runtime import (
     pack_mxfp8_dense,
-    pack_mxfp8_rope8_dense,
 )
 
 _D = mxfp8.DIM_HEAD  # 512
 
 
-def _build_inputs(T: int, H: int, kv_len: int, device: str, seed: int = 0,
-                  layout: str = "split"):
+def _build_inputs(T: int, H: int, kv_len: int, device: str, seed: int = 0):
     """Build a paged decode workload: T tokens, each attending to kv_len slots
     (page_size=1, distinct slots), plus the bf16 and MXFP8 views of one shared
-    latent so both pools represent identical data.
-
-    layout="split"    : the production two-buffer pool ([pages,512] fp8 NoPE +
-                        separate [pages,64] bf16 RoPE).
-    layout="combined" : NoPE pack + RoPE co-located in one contiguous
-                        [pages,640]-byte row; NoPE/RoPE are passed as strided
-                        views (stride 640/320), so each slot's data lives in one
-                        cache-line region. The decode kernel already honours
-                        rope_stride_n, so this needs no kernel change."""
+    latent so both pools represent identical data."""
     g = torch.Generator(device=device).manual_seed(seed)
     pages = T * kv_len
     # Shared latent (NoPE 448 + RoPE 64). Small magnitude keeps fp8 in range.
@@ -57,28 +47,6 @@ def _build_inputs(T: int, H: int, kv_len: int, device: str, seed: int = 0,
     ).to(torch.bfloat16)
 
     nope_fp8, rope_bf16 = pack_mxfp8_dense(latent)  # [pages,512] fp8, [pages,64] bf16
-
-    if layout == "fp8rope":
-        # All-fp8 co-located layout: kv_fp8 [pages,512] (NoPE 0:448 + RoPE
-        # 448:512), scale [pages,16] uint8 E8M0. The scale buffer is passed via
-        # the unified_kv_rope slot; the kernel engages the fused 2-gather read
-        # when SGLANG_UNIFIED_KV_FP8_ROPE8=1. Requires the fp8 backend gates set.
-        kv_fp8, scale = pack_mxfp8_rope8_dense(latent)
-        nope_fp8 = kv_fp8
-        rope_bf16 = scale  # [pages,16] uint8 (carried in the rope slot)
-        assert nope_fp8.shape == (pages, 512) and rope_bf16.shape == (pages, 16)
-
-    if layout == "combined":
-        # One contiguous [pages, 512 + 128] byte buffer: [0:512] NoPE pack,
-        # [512:640] RoPE bf16. Strided views keep dtype/shape but co-locate rows.
-        combined = torch.empty(pages, 512 + 2 * mxfp8.DIM_ROPE, dtype=torch.uint8,
-                               device=device)
-        combined[:, :512] = nope_fp8.view(torch.uint8)
-        combined[:, 512:] = rope_bf16.view(torch.uint8)
-        nope_fp8 = combined[:, :512].view(mxfp8.FP8_DTYPE)
-        rope_bf16 = combined[:, 512:].view(torch.bfloat16)
-        assert nope_fp8.shape == (pages, 512) and rope_bf16.shape == (pages, mxfp8.DIM_ROPE)
-        assert nope_fp8.stride(0) == 640 and rope_bf16.stride(0) == 320
 
     q = (torch.randn(T, H, _D, generator=g, device=device, dtype=torch.float32) * 0.1).to(
         torch.bfloat16
@@ -149,12 +117,6 @@ def main() -> None:
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--warmup", type=int, default=30)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--layout", choices=["split", "combined", "fp8rope"], default="split",
-                    help="fp8 pool layout: split (two buffers), combined "
-                         "(co-located NoPE+RoPE bf16 per row), or fp8rope "
-                         "(all-fp8 co-located NoPE+RoPE + E8M0 scale, fused read)")
-    ap.add_argument("--check", action="store_true",
-                    help="also report accuracy of the fp8 output vs the bf16 reference")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -163,23 +125,13 @@ def main() -> None:
     ablate = os.environ.get("SGLANG_UNIFIED_KV_FP8_ABLATE", "none")
     qk_native = os.environ.get("SGLANG_UNIFIED_KV_FP8_QK_NATIVE", "0")
 
-    inp = _build_inputs(args.batch, args.heads, args.kv_len, device, args.seed,
-                        layout=args.layout)
+    inp = _build_inputs(args.batch, args.heads, args.kv_len, device, args.seed)
     arch = torch.cuda.get_device_properties(0).gcnArchName
 
     print(
         f"arch={arch} T={args.batch} H={args.heads} kv_len={args.kv_len} D={_D} "
-        f"iters={args.iters} ablate={ablate} qk_native={qk_native} layout={args.layout}"
+        f"iters={args.iters} ablate={ablate} qk_native={qk_native}"
     )
-
-    if args.check:
-        out_ref = _call("bf16", inp).float()
-        out_fp8 = _call("fp8", inp).float()
-        cos = (out_ref.flatten() @ out_fp8.flatten()) / (
-            out_ref.norm() * out_fp8.norm() + 1e-30
-        )
-        rel = (out_fp8 - out_ref).norm() / (out_ref.norm() + 1e-30)
-        print(f"accuracy vs bf16: cosine={cos.item():.6f} rel_l2={rel.item():.6e}")
 
     modes = ["bf16", "fp8"] if args.mode == "all" else [args.mode]
     results = {}
