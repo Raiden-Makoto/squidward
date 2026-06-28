@@ -268,7 +268,10 @@ def pack_mxfp8_dense(
 # [pages,16] buffer would be a wasteful tiny-row scattered stream).
 ROPE8_NUM_BLOCKS = 16  # 512 / 32
 ROPE8_SCALE_OFF = 512  # byte offset of the E8M0 run within the combined row
-ROPE8_ROW_WIDTH = 528  # 512 fp8 + 16 E8M0
+# 512 fp8 + 16 E8M0 = 528, padded to 576 so the row stride stays a multiple of
+# the 64-byte cache line (a 528 stride drifts each slot's row off the line
+# boundary and wrecks gather coalescing).
+ROPE8_ROW_WIDTH = 576
 
 
 @triton.jit
