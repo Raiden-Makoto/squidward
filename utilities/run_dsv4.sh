@@ -56,7 +56,7 @@ if [ "$DP_MODE" = "tp8dp8" ]; then
     DP_ARGS="--dp 8 --enable-dp-attention"
 fi
 
-SGL_EXTRA_ARGS="--enable-prefill-delayer --prefill-delayer-max-delay-ms 5000"
+SGL_EXTRA_ARGS="--enable-prefill-delayer --prefill-delayer-max-delay-ms 5000 ${SGL_USER_EXTRA_ARGS:-}"
 
 set -x
 exec sglang serve \
