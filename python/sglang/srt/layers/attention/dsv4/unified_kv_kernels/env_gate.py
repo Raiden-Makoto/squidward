@@ -35,3 +35,21 @@ def unified_kv_use_fp8() -> bool:
     if not is_unified_kv_triton():
         return False
     return os.environ.get("SGLANG_UNIFIED_KV_FP8", "").strip().lower() in _TRUTHY
+
+
+@functools.lru_cache(maxsize=1)
+def unified_kv_fp8_qk_native() -> bool:
+    """Whether the fp8 unified-KV decode should run the QK dot as a native CDNA4
+    MXFP8 scaled MFMA (``tl.dot_scaled`` over the stored E8M0 NoPE pack) instead
+    of dequantizing the KV tile to bf16 first.
+
+    Strictly opt-in and default OFF. Returns True only when BOTH hold:
+      (a) the fp8 unified-KV pool is active (``unified_kv_use_fp8()``),
+      (b) ``SGLANG_UNIFIED_KV_FP8_QK_NATIVE`` is set truthy.
+
+    gfx950-only in practice: the MXFP8 NoPE pack itself asserts gfx950 (e4m3fn),
+    so this never engages on gfx942.
+    """
+    if not unified_kv_use_fp8():
+        return False
+    return envs.SGLANG_UNIFIED_KV_FP8_QK_NATIVE.get()

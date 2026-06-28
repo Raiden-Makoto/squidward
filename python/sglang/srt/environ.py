@@ -838,6 +838,9 @@ class Envs:
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+    # Opt-in: native CDNA4 MXFP8 scaled-MFMA (tl.dot_scaled) for the QK dot in the
+    # unified-KV fp8 decode kernels (gfx950 only). Requires SGLANG_UNIFIED_KV_FP8.
+    SGLANG_UNIFIED_KV_FP8_QK_NATIVE = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(False)
 
