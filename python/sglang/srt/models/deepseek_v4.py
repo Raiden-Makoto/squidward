@@ -514,6 +514,24 @@ class MQALayer(nn.Module):
         fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
         return q_out
 
+    def _compute_q_b_mxfp8(
+        self,
+        q: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """fp8 unified-KV prefill query producer: fold (per-head RMSNorm-self +
+        RoPE) and the MXFP8 NoPE pack into one Triton launch. Returns the packed
+        ``(q_nope [T,H,512] fp8, q_rope [T,H,64] bf16)`` consumed directly by the
+        OPUS fp8 prefill op -- byte-identical to ``_compute_q_b`` (bf16 q_out)
+        followed by ``pack_mxfp8_dense(q_out)``, minus the bf16 write + re-read."""
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.runtime import (
+            fused_q_norm_rope_mxfp8_pack,
+        )
+
+        q, _ = self.wq_b(q)
+        q = q.view(-1, self.n_local_heads, self.head_dim)
+        return fused_q_norm_rope_mxfp8_pack(q, self.eps, self.freqs_cis, positions)
+
     def _compute_kv_to_cache(
         self,
         x: torch.Tensor,
@@ -751,8 +769,12 @@ class MQALayer(nn.Module):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         x_linear = x_quant if x_quant is not None else x
+        # When set (fp8 unified-KV prefill), the (q_nope, q_rope) MXFP8 pack
+        # produced in-line by the fused q norm+rope+pack kernel; threaded to the
+        # backend so it skips the standalone q re-read/pack.
+        q_packed: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
             q_lora = qkv_a[..., : self.q_lora_rank]
@@ -883,7 +905,18 @@ class MQALayer(nn.Module):
                 q_out.copy_(q)
         else:
             q_lora = self.q_norm(q_lora)
-            q = self._compute_q_b(q_lora, positions, q_out)
+            # fp8 unified-KV prefill: produce the query directly in MXFP8 (fused
+            # norm+rope+pack), skipping the bf16 q_out write + standalone pack.
+            from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+                unified_kv_fp8_fused_q,
+            )
+
+            if unified and unified_kv_fp8_fused_q():
+                q_nope_p, q_rope_p = self._compute_q_b_mxfp8(q_lora, positions)
+                q = q_nope_p  # shape-carrier ([T,H,512] fp8) for the backend
+                q_packed = (q_nope_p, q_rope_p)
+            else:
+                q = self._compute_q_b(q_lora, positions, q_out)
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
@@ -939,7 +972,7 @@ class MQALayer(nn.Module):
                 self.compressor,
             )
 
-        return q, kv
+        return q, kv, q_packed
 
     def forward(
         self,
@@ -1016,8 +1049,9 @@ class MQALayer(nn.Module):
                     x_quant=x_quant,
                 )
             kv = None
+            q_packed = None
         else:
-            q, kv = self._forward_prepare(
+            q, kv, q_packed = self._forward_prepare(
                 x,
                 positions,
                 forward_batch,
@@ -1036,8 +1070,11 @@ class MQALayer(nn.Module):
         )
 
         if is_unified_kv_triton():
+            # fp8 fused-q prefill: ``q`` is the [T,H,512] fp8 NoPE shape-carrier;
+            # pass the pre-packed (q_nope, q_rope) so the backend skips the pack.
+            q_nope_kw, q_rope_kw = q_packed if q_packed is not None else (None, None)
             o = attn_backend.forward(
-                q=q_out if q_out is not None else q,
+                q=q if q_packed is not None else (q_out if q_out is not None else q),
                 k=attn_k,
                 v=attn_k,
                 layer=self.attn_mqa,
@@ -1045,6 +1082,8 @@ class MQALayer(nn.Module):
                 compress_ratio=self.compress_ratio,
                 attn_sink=self.attn_sink,
                 save_kv_cache=kv is not None,
+                q_nope=q_nope_kw,
+                q_rope=q_rope_kw,
             )
         else:
             attn_q = q_padded if q_padded is not None else q

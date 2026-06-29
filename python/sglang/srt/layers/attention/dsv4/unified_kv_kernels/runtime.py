@@ -262,6 +262,178 @@ def pack_mxfp8_dense(
     return nope, rope
 
 
+@triton.jit
+def _fused_q_norm_rope_mxfp8_pack_kernel(
+    q_in_ptr,  # [M*H, HEAD_DIM] raw wq_b output (pre norm+rope), any float dtype
+    freqs_real_ptr,  # [max_pos, DIM_ROPE] fp32 = view_as_real(freqs_cis).flatten(-2)
+    positions_ptr,  # [M] int absolute positions
+    nope_u8_ptr,  # [M*H, NOPE_WIDTH] uint8 (packed NoPE out viewed as uint8)
+    rope_ptr,  # [M*H, DIM_ROPE] bf16 (RoPE out)
+    n_rows,  # M * H
+    H,  # query heads per token (row -> token = row // H)
+    eps,
+    q_row_stride,
+    freq_row_stride,
+    DIM_NOPE: tl.constexpr,  # 448
+    DIM_ROPE: tl.constexpr,  # 64
+    HEAD_DIM: tl.constexpr,  # 512
+    NUM_BLOCKS: tl.constexpr,  # 14
+    FP8_BLK: tl.constexpr,  # 32
+    NOPE_WIDTH: tl.constexpr,  # 512
+    SCALE_OFF: tl.constexpr,  # 448
+    FP8_MAX: tl.constexpr,  # 448.0
+    HEAD_BLOCK: tl.constexpr,  # next_pow2(HEAD_DIM) == 512
+    HEAD_NUM_BLOCKS: tl.constexpr,  # HEAD_DIM // FP8_BLK == 16
+    ROPE_PAIRS: tl.constexpr,  # DIM_ROPE // 2 == 32
+    BLOCK_ROWS: tl.constexpr,
+):
+    """Single-launch fold of (per-head RMSNorm-self over head_dim, no weight) +
+    (complex/interleaved RoPE on the rope tail) + (MXFP8 E8M0-per-32-block NoPE
+    pack) + (bf16 RoPE write) for the prefill query.
+
+    Bit-exact replacement for ``fused_q_norm_rope(q) ; pack_mxfp8_dense(q_out)``:
+    the normed NoPE / roped tail are rounded to bf16 (matching the bf16 ``q_out``
+    the JIT producer writes and the standalone packer then re-reads) before the
+    E8M0 quant math. Saves the [M,H,512] bf16 q write + re-read plus a launch by
+    keeping the normed values in registers and packing them directly.
+
+    Each program packs a tile of ``BLOCK_ROWS`` flattened (token, head) rows."""
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)  # [BLOCK_ROWS]
+    rmask = rows < n_rows
+    token = rows // H
+
+    # ---- RMSNorm-self over the full head_dim (raw input, pre-rope, no weight) --
+    hoffs = tl.arange(0, HEAD_BLOCK)  # [HEAD_BLOCK] == [HEAD_DIM]
+    hmask = hoffs < HEAD_DIM
+    full_offs = rows[:, None] * q_row_stride + hoffs[None, :]
+    xfull = tl.load(
+        q_in_ptr + full_offs, mask=rmask[:, None] & hmask[None, :], other=0.0
+    ).to(tl.float32)
+    sum_sq = tl.sum(xfull * xfull, axis=1)  # [BLOCK_ROWS]
+    rms_inv = tl.rsqrt(sum_sq / HEAD_DIM + eps)  # [BLOCK_ROWS]
+    # Round to bf16 then widen: the JIT producer writes bf16 q_out and the
+    # standalone packer consumes q_out.bfloat16() -> match that rounding.
+    normed = (xfull * rms_inv[:, None]).to(tl.bfloat16).to(tl.float32)
+
+    # ---- NoPE: MXFP8 (E8M0 per-32-block) pack of the normed [:, :DIM_NOPE] -----
+    # Vectorized over all blocks at once (reshape [BR, HEAD_DIM] -> [BR, NB, 32]);
+    # the trailing rope-region blocks are computed but masked off on store. Quant
+    # math matches _mxfp8_pack_dense_kernel / mxfp8.pack_nope_mxfp8 bit-for-bit.
+    nope_blk = tl.reshape(normed, (BLOCK_ROWS, HEAD_NUM_BLOCKS, FP8_BLK))
+    amax = tl.max(tl.abs(nope_blk), axis=2)  # [BR, HEAD_NUM_BLOCKS]
+    amax_c = tl.maximum(amax, 1e-30)
+    e_unb = tl.ceil(tl.log2(amax_c / FP8_MAX))
+    e_unb = tl.where(amax == 0.0, 0.0, e_unb)
+    scale = tl.exp2(e_unb)
+    q = (nope_blk / scale[:, :, None]).to(tl.float8e4nv)
+    qb = tl.reshape(q.to(tl.uint8, bitcast=True), (BLOCK_ROWS, HEAD_DIM))
+    nope_cols = tl.arange(0, HEAD_DIM)
+    tl.store(
+        nope_u8_ptr + rows[:, None] * NOPE_WIDTH + nope_cols[None, :],
+        qb,
+        mask=rmask[:, None] & (nope_cols < DIM_NOPE)[None, :],
+    )
+    e_byte = e_unb.to(tl.int32) + 127
+    e_byte = tl.minimum(tl.maximum(e_byte, 0), 255).to(tl.uint8)
+    blk_ids = tl.arange(0, HEAD_NUM_BLOCKS)
+    tl.store(
+        nope_u8_ptr + rows[:, None] * NOPE_WIDTH + SCALE_OFF + blk_ids[None, :],
+        e_byte,
+        mask=rmask[:, None] & (blk_ids < NUM_BLOCKS)[None, :],
+    )
+
+    # ---- RoPE: complex/interleaved rotation on the rope tail -> bf16 ----------
+    # pair p covers cols (DIM_NOPE + 2p, DIM_NOPE + 2p + 1). The rope input is the
+    # bf16-rounded normed value (matches the JIT producer, which rounds to bf16
+    # before rotating). freqs_real is re/im interleaved: [pos, 2p]=real, [.,2p+1]=imag.
+    pcol = tl.arange(0, ROPE_PAIRS)  # [ROPE_PAIRS] pair index p
+    even = 2 * pcol  # local rope cols 0,2,...  (real)
+    odd = even + 1  # local rope cols 1,3,...  (imag)
+    pos = tl.load(positions_ptr + token, mask=rmask, other=0)
+    q_tail = q_in_ptr + rows[:, None] * q_row_stride + DIM_NOPE
+    xr = tl.load(q_tail + even[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
+    xi = tl.load(q_tail + odd[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
+    xr = (xr * rms_inv[:, None]).to(tl.bfloat16).to(tl.float32)
+    xi = (xi * rms_inv[:, None]).to(tl.bfloat16).to(tl.float32)
+    f_base = freqs_real_ptr + pos[:, None] * freq_row_stride
+    fr = tl.load(f_base + even[None, :], mask=rmask[:, None], other=0.0)
+    fi = tl.load(f_base + odd[None, :], mask=rmask[:, None], other=0.0)
+    out_real = xr * fr - xi * fi
+    out_imag = xr * fi + xi * fr
+    rope_base = rope_ptr + rows[:, None] * DIM_ROPE
+    tl.store(
+        rope_base + even[None, :],
+        out_real.to(rope_ptr.dtype.element_ty),
+        mask=rmask[:, None],
+    )
+    tl.store(
+        rope_base + odd[None, :],
+        out_imag.to(rope_ptr.dtype.element_ty),
+        mask=rmask[:, None],
+    )
+
+
+def fused_q_norm_rope_mxfp8_pack(
+    q_in: torch.Tensor,  # [M, H, head_dim] raw wq_b output (pre norm+rope)
+    eps: float,
+    freqs_cis: torch.Tensor,  # [max_pos, rope_dim//2] complex
+    positions: torch.Tensor,  # [M] int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused prefill-query producer: per-head RMSNorm-self + RoPE + MXFP8 dense
+    pack in one Triton launch. Returns the packed NoPE-fp8 ``[M, H, 512]`` buffer
+    + its bf16 RoPE ``[M, H, 64]`` companion, byte-identical to
+    ``fused_q_norm_rope(q_in -> q_out); pack_mxfp8_dense(q_out)``.
+
+    Replaces the JIT ``fused_q_norm_rope`` (bf16 q_out) + the standalone
+    ``pack_mxfp8_dense(q)`` re-read in the fp8 unified-kv prefill path (one launch
+    over the [M,H,512] tile instead of a bf16 write + a separate quant pass)."""
+    from sglang.srt.layers.attention.dsv4.unified_kv_kernels import mxfp8
+
+    assert q_in.shape[-1] == mxfp8.DIM_HEAD, (
+        f"fused_q_norm_rope_mxfp8_pack expects head_dim {mxfp8.DIM_HEAD}, got {q_in.shape[-1]}"
+    )
+    assert q_in.dim() == 3, f"expected [M, H, head_dim], got {tuple(q_in.shape)}"
+    M, H, _ = q_in.shape
+    flat = q_in.reshape(M * H, mxfp8.DIM_HEAD)
+    n_rows = flat.shape[0]
+    # re/im interleaved fp32 freq table (same view the JIT producer consumes).
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    nope = torch.zeros(n_rows, mxfp8.NOPE_PACKED_WIDTH, dtype=torch.uint8, device=q_in.device)
+    rope = torch.empty(n_rows, mxfp8.DIM_ROPE, dtype=torch.bfloat16, device=q_in.device)
+    if n_rows > 0:
+        BLOCK_ROWS = 8
+        grid = (triton.cdiv(n_rows, BLOCK_ROWS),)
+        _fused_q_norm_rope_mxfp8_pack_kernel[grid](
+            flat,
+            freqs_real,
+            positions,
+            nope,
+            rope,
+            n_rows,
+            H,
+            eps,
+            flat.stride(0),
+            freqs_real.stride(0),
+            DIM_NOPE=mxfp8.DIM_NOPE,
+            DIM_ROPE=mxfp8.DIM_ROPE,
+            HEAD_DIM=mxfp8.DIM_HEAD,
+            NUM_BLOCKS=mxfp8.NUM_NOPE_BLOCKS,
+            FP8_BLK=mxfp8.FP8_BLOCK,
+            NOPE_WIDTH=mxfp8.NOPE_PACKED_WIDTH,
+            SCALE_OFF=mxfp8.SCALE_OFFSET,
+            FP8_MAX=mxfp8.FP8_MAX,
+            HEAD_BLOCK=triton.next_power_of_2(mxfp8.DIM_HEAD),
+            HEAD_NUM_BLOCKS=mxfp8.DIM_HEAD // mxfp8.FP8_BLOCK,
+            ROPE_PAIRS=mxfp8.DIM_ROPE // 2,
+            BLOCK_ROWS=BLOCK_ROWS,
+            num_warps=4,
+        )
+    nope = nope.view(mxfp8.FP8_DTYPE).reshape(M, H, mxfp8.NOPE_PACKED_WIDTH)
+    rope = rope.reshape(M, H, mxfp8.DIM_ROPE)
+    return nope, rope
+
+
 def _launch_mxfp8_pack(
     *,
     kv: torch.Tensor,  # [T, head_dim]
@@ -987,6 +1159,8 @@ def prefill(
     unified_kv_rope: Optional[torch.Tensor] = None,  # [pages,64] bf16 (fp8 KV)
     kv_extend_nope: Optional[torch.Tensor] = None,  # [T,512] fp8 pre-packed extend
     kv_extend_rope: Optional[torch.Tensor] = None,  # [T,64] bf16 pre-packed extend
+    q_nope: Optional[torch.Tensor] = None,  # [T,H,512] fp8 pre-packed q (fused producer)
+    q_rope: Optional[torch.Tensor] = None,  # [T,H,64] bf16 pre-packed q (fused producer)
 ) -> torch.Tensor:
     return sparse_attn_v4_paged_prefill(
         q,
@@ -1001,4 +1175,6 @@ def prefill(
         unified_kv_rope=unified_kv_rope,
         kv_extend_nope=kv_extend_nope,
         kv_extend_rope=kv_extend_rope,
+        q_nope=q_nope,
+        q_rope=q_rope,
     )

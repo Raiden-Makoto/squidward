@@ -395,6 +395,8 @@ def sparse_attn_v4_paged_prefill(
     unified_kv_rope: torch.Tensor | None = None,
     kv_extend_nope: torch.Tensor | None = None,
     kv_extend_rope: torch.Tensor | None = None,
+    q_nope: torch.Tensor | None = None,
+    q_rope: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """V4 prefill sparse attention over two KV sources (paged unified_kv +
     flat per-fwd kv).
@@ -427,19 +429,22 @@ def sparse_attn_v4_paged_prefill(
     # (#3751). It consumes the pool's NoPE-fp8 / RoPE-bf16 buffers directly and
     # packs the per-step q + extend kv on the fly (no prefix repack).
     if quant_kv and _HAS_FP8_OPUS:
-        q = q.contiguous()
-        H = q.shape[1]
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels import runtime as _rt
+
+        # Fused MXFP8 pack of the per-step q + extend kv (one Triton launch each,
+        # replacing the eager split+pack+cast chains). The prefix pool is already
+        # native MXFP8, so only these per-call tensors are packed. The extend kv
+        # pack is reused by the SWA store when the caller pre-packs it. When the
+        # caller pre-packs q (fused q norm+rope+pack producer), reuse those bytes
+        # and skip the standalone q re-read/pack entirely.
+        if q_nope is None:
+            q = q.contiguous()
+            q_nope, q_rope = _rt.pack_mxfp8_dense(q)
+        H = q_nope.shape[1]
         sink = attn_sink
         if sink.shape[0] != H:
             sink = sink[:H]
         sink = sink.to(torch.float32).contiguous()
-        # Fused MXFP8 pack of the per-step q + extend kv (one Triton launch each,
-        # replacing the eager split+pack+cast chains). The prefix pool is already
-        # native MXFP8, so only these per-call tensors are packed. The extend kv
-        # pack is reused by the SWA store when the caller pre-packs it.
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels import runtime as _rt
-
-        q_nope, q_rope = _rt.pack_mxfp8_dense(q)
         if kv_extend_nope is not None:
             kv_nope, kv_rope = kv_extend_nope, kv_extend_rope
         else:

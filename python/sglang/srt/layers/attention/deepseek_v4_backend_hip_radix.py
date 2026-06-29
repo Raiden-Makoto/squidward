@@ -1117,8 +1117,15 @@ class DeepseekV4HipRadixBackend(
         attn_sink: torch.Tensor,
         core_attn_metadata: DSV4AttnMetadata,
         save_kv_cache: bool = True,
+        q_nope: Optional[torch.Tensor] = None,
+        q_rope: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """unified_kv paged-attention path over the bf16 unified_kv"""
+        """unified_kv paged-attention path over the bf16 unified_kv.
+
+        ``q_nope``/``q_rope``: optional pre-packed MXFP8 query (fused q
+        norm+rope+pack producer) for the fp8 prefill path. When set, ``q`` is a
+        shape-carrier only ([T,H,512] fp8 NoPE) and the standalone q pack is
+        skipped."""
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels import runtime
 
         pool = self.token_to_kv_pool
@@ -1281,6 +1288,8 @@ class DeepseekV4HipRadixBackend(
             unified_kv_rope=unified_rope,
             kv_extend_nope=kv_ext_nope,
             kv_extend_rope=kv_ext_rope,
+            q_nope=q_nope,
+            q_rope=q_rope,
         )
 
         # write this chunk's SWA K into the ring for future chunks / decode
@@ -1406,6 +1415,8 @@ class DeepseekV4HipRadixBackend(
         compress_ratio: Literal[0, 4, 128],
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
+        q_nope: Optional[torch.Tensor] = None,
+        q_rope: Optional[torch.Tensor] = None,
         **_,
     ) -> torch.Tensor:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
@@ -1434,6 +1445,8 @@ class DeepseekV4HipRadixBackend(
                 attn_sink=attn_sink,
                 core_attn_metadata=core_attn_metadata,
                 save_kv_cache=save_kv_cache,
+                q_nope=q_nope,
+                q_rope=q_rope,
             )
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
