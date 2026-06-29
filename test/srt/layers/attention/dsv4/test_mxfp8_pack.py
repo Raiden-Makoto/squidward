@@ -81,6 +81,42 @@ def test_dense_pack_bit_parity(rows, scale):
     assert torch.equal(rope, x[:, mxfp8.DIM_NOPE :].to(torch.bfloat16))
 
 
+@pytest.mark.parametrize(
+    "tokens,heads,scale", [(1, 16, 1.0), (64, 16, 1.0), (257, 16, 8.0), (33, 128, 0.01)]
+)
+def test_fused_q_norm_rope_pack_parity(tokens, heads, scale):
+    """The fused prefill-q producer (``runtime.fused_q_norm_rope_mxfp8_pack``)
+    must be byte-identical to the JIT ``fused_q_norm_rope`` (bf16 q_out) followed
+    by the standalone ``pack_mxfp8_dense(q_out)`` it replaces."""
+    from sglang.jit_kernel.dsv4.elementwise import fused_q_norm_rope
+    from sglang.srt.layers.attention.dsv4.unified_kv_kernels import runtime
+
+    torch.manual_seed(4)
+    eps = 1e-6
+    max_pos = 4096
+    rope_pairs = mxfp8.DIM_ROPE // 2  # 32
+    q_in = (
+        torch.randn(tokens, heads, mxfp8.DIM_HEAD, device="cuda", dtype=torch.bfloat16)
+        * scale
+    ).contiguous()
+    positions = torch.randint(0, max_pos, (tokens,), device="cuda", dtype=torch.int64)
+    freqs_cis = torch.randn(
+        max_pos, rope_pairs, 2, device="cuda", dtype=torch.float32
+    )
+    freqs_cis = torch.view_as_complex(freqs_cis)
+
+    # Reference: JIT norm+rope -> bf16 q_out, then standalone MXFP8 dense pack.
+    q_out = torch.empty_like(q_in)
+    fused_q_norm_rope(q_in, q_out, eps, freqs_cis, positions)
+    ref_nope, ref_rope = runtime.pack_mxfp8_dense(q_out)
+
+    # Ours: single fused launch over the raw (pre norm+rope) q.
+    nope, rope = runtime.fused_q_norm_rope_mxfp8_pack(q_in, eps, freqs_cis, positions)
+
+    assert torch.equal(nope.view(torch.uint8), ref_nope.view(torch.uint8))
+    assert torch.equal(rope, ref_rope)
+
+
 @pytest.mark.parametrize("rows", [1, 64, 257])
 def test_copy_scatter_matches_quant_scatter(rows):
     """The copy-by-loc store (reusing pre-packed bytes) must yield pool bytes
