@@ -133,27 +133,6 @@ def _time_us(mode: str, inp: dict, iters: int, warmup: int) -> float:
     return _time_fn(lambda: _call(mode, inp), iters, warmup)
 
 
-def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
-    a32 = a.to(torch.float32).reshape(-1)
-    b32 = b.to(torch.float32).reshape(-1)
-    return float(
-        torch.dot(a32, b32) / (a32.norm() * b32.norm()).clamp_min(1e-30)
-    )
-
-
-def _check(inp: dict) -> None:
-    """Correctness gate: fp8 decode (with whatever fp8 path the env selects --
-    QK/PV native or the bf16-reconstruction default) vs the bf16 pool reference.
-    Reports cosine similarity + max abs error over the full output."""
-    ref = _call("bf16", inp)
-    got = _call("fp8", inp)
-    cos = _cosine(got, ref)
-    max_abs = float((got.to(torch.float32) - ref.to(torch.float32)).abs().max())
-    rel = max_abs / float(ref.to(torch.float32).abs().max().clamp_min(1e-30))
-    print(f"  cosine(fp8, bf16) = {cos:.6f}")
-    print(f"  max_abs_err       = {max_abs:.6e}  (rel {rel:.4%})")
-
-
 def _sweep(inp: dict, iters: int, warmup: int) -> None:
     """Grid over the fp8 decode tuning knobs to see if a config beats the
     'safe-to-fit' default (block_k=32, num_k_stages=2). Configs that overflow
@@ -191,9 +170,7 @@ def _sweep(inp: dict, iters: int, warmup: int) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--mode", choices=["bf16", "fp8", "all", "sweep", "check"], default="all"
-    )
+    ap.add_argument("--mode", choices=["bf16", "fp8", "all", "sweep"], default="all")
     ap.add_argument("--batch", type=int, default=16, help="T (decode tokens)")
     ap.add_argument("--heads", type=int, default=16, help="H (q heads per rank)")
     ap.add_argument("--kv-len", type=int, default=8192)
@@ -220,20 +197,14 @@ def main() -> None:
     device = "cuda"
     ablate = os.environ.get("SGLANG_UNIFIED_KV_FP8_ABLATE", "none")
     qk_native = os.environ.get("SGLANG_UNIFIED_KV_FP8_QK_NATIVE", "0")
-    pv_native = os.environ.get("SGLANG_UNIFIED_KV_FP8_PV_NATIVE", "0")
 
     inp = _build_inputs(args.batch, args.heads, args.kv_len, device, args.seed)
     arch = torch.cuda.get_device_properties(0).gcnArchName
 
     print(
         f"arch={arch} T={args.batch} H={args.heads} kv_len={args.kv_len} D={_D} "
-        f"iters={args.iters} ablate={ablate} qk_native={qk_native} "
-        f"pv_native={pv_native}"
+        f"iters={args.iters} ablate={ablate} qk_native={qk_native}"
     )
-
-    if args.mode == "check":
-        _check(inp)
-        return
 
     if args.mode == "sweep":
         _sweep(inp, args.iters, args.warmup)

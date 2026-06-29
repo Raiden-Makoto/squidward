@@ -53,22 +53,3 @@ def unified_kv_fp8_qk_native() -> bool:
     if not unified_kv_use_fp8():
         return False
     return envs.SGLANG_UNIFIED_KV_FP8_QK_NATIVE.get()
-
-
-@functools.lru_cache(maxsize=1)
-def unified_kv_fp8_pv_native() -> bool:
-    """Whether the fp8 unified-KV decode should run the PV dot natively in fp8
-    (single fp8 MFMA over the stored NoPE pack + a small bf16 RoPE dot) instead
-    of reconstructing the bf16 KV tile for an fp32/bf16 PV dot.
-
-    Strictly opt-in and default OFF. Returns True only when BOTH hold:
-      (a) the fp8 unified-KV pool is active (``unified_kv_use_fp8()``),
-      (b) ``SGLANG_UNIFIED_KV_FP8_PV_NATIVE`` is set truthy.
-
-    PV-native implies QK-native: both consume the same single fp8 tile read, so
-    the score path runs as a native MXFP8 ``dot_scaled`` rather than dequanting.
-    gfx950-only in practice (the MXFP8 NoPE pack asserts gfx950 / e4m3fn).
-    """
-    if not unified_kv_use_fp8():
-        return False
-    return envs.SGLANG_UNIFIED_KV_FP8_PV_NATIVE.get()

@@ -76,7 +76,6 @@ _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
 # (q[:448]·k_nope + q[448:]·k_rope folds into the single 512-wide dot).
 from sglang.srt.layers.attention.dsv4.unified_kv_kernels import mxfp8 as _mxfp8
 from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
-    unified_kv_fp8_pv_native,
     unified_kv_fp8_qk_native,
 )
 
@@ -288,118 +287,6 @@ def _qk_native_tile(
     return scores, kv
 
 
-@triton.jit
-def _qk_native_scores_tile(
-    q_fp8,  # [BLOCK_H, 512] fp8 e4m3 (NoPE quantized + zero pad), loop-invariant
-    q_scale,  # [BLOCK_H, 16] uint8 E8M0, loop-invariant
-    q_rope,  # [BLOCK_H, ROPE] bf16 (RoPE half of q), loop-invariant
-    unified_fp8_ptr,  # [pages, 512] fp8 (stored MXFP8 NoPE pack)
-    unified_u8_ptr,  # same buffer as uint8 (E8M0 bytes)
-    rope_ptr,  # [pages, 64] bf16
-    slot,  # [BLOCK_K] int page rows
-    valid,  # [BLOCK_K] bool
-    d_offs,  # [BLOCK_D] int (BLOCK_D == 512)
-    kv_stride_n,
-    rope_stride_n,
-    NOPE: tl.constexpr,  # 448
-    FP8_BLK: tl.constexpr,  # 32
-    BLOCK_K: tl.constexpr,
-    BLOCK_D: tl.constexpr,  # 512
-):
-    """Native CDNA4 MXFP8 QK for one KV tile WITHOUT a bf16 reconstruction.
-
-    Loads the raw fp8 NoPE tile + E8M0 scales + bf16 RoPE once, runs the score
-    path natively (``dot_scaled`` NoPE + bf16 RoPE dot), and returns the loaded
-    fp8 tile/scales/rope so the (native) PV step can consume them directly.
-
-    Returns ``(scores_unscaled [BLOCK_H, BLOCK_K], k_fp8 [BLOCK_K, BLOCK_D] fp8,
-    k_scale [BLOCK_K, NUM_GROUPS] uint8, k_rope [BLOCK_K, ROPE] bf16)``; the
-    caller applies ``qk_scale``.
-    """
-    NUM_GROUPS: tl.constexpr = BLOCK_D // FP8_BLK  # 16
-    NOPE_GROUPS: tl.constexpr = NOPE // FP8_BLK  # 14
-    ROPE: tl.constexpr = BLOCK_D - NOPE  # 64
-    nope_mask = d_offs < NOPE
-
-    k_fp8 = tl.load(
-        unified_fp8_ptr + slot[:, None] * kv_stride_n + d_offs[None, :],
-        mask=valid[:, None] & nope_mask[None, :],
-        other=0.0,
-    )
-    g_offs = tl.arange(0, NUM_GROUPS)
-    k_scale = tl.load(
-        unified_u8_ptr + slot[:, None] * kv_stride_n + (NOPE + g_offs)[None, :],
-        mask=valid[:, None] & (g_offs < NOPE_GROUPS)[None, :],
-        other=0,
-    ).to(tl.uint8)
-    rope_offs = tl.arange(0, ROPE)
-    k_rope = tl.load(
-        rope_ptr + slot[:, None] * rope_stride_n + rope_offs[None, :],
-        mask=valid[:, None],
-        other=0.0,
-    )
-
-    s_nope = tl.dot_scaled(q_fp8, q_scale, "e4m3", tl.trans(k_fp8), k_scale, "e4m3")
-    s_rope = tl.dot(q_rope, tl.trans(k_rope))
-    scores = s_nope + s_rope
-    return scores, k_fp8, k_scale, k_rope
-
-
-@triton.jit
-def _pv_native_tile(
-    p,  # [BLOCK_H, BLOCK_K] fp32 softmax weights for this tile
-    k_fp8,  # [BLOCK_K, BLOCK_D] fp8 (raw stored NoPE bytes, cols >= NOPE = 0)
-    k_scale,  # [BLOCK_K, NUM_GROUPS] uint8 E8M0 (pad groups = 0)
-    k_rope,  # [BLOCK_K, ROPE] bf16
-    NOPE: tl.constexpr,  # 448
-    FP8_BLK: tl.constexpr,  # 32
-    BLOCK_K: tl.constexpr,
-    BLOCK_D: tl.constexpr,  # 512
-):
-    """Native fp8 PV for one KV tile (no bf16 KV reconstruction).
-
-    The stored V[k,d] = vq[k,d] * 2^(e[k,d//32]-127) has a d-grouped scale that
-    sits inside the PV k-contraction, so it cannot be a single MX scaled-MFMA.
-    Refactor it via a per-token common exponent:
-        E_k = max_g e[k,g];  S_k = 2^(E_k-127);  t[k,g] = 2^(e[k,g]-E_k) <= 1
-        V[k,d] = (vq[k,d] * t[k,g(d)]) * S_k
-        acc[h,d] = sum_k (p[h,k]*S_k) * (vq[k,d]*t[k,g])
-    so V' = vq*t stays fp8 (pow2 <=1 rescale, no bf16 tile) and p' = p*S_k is
-    quantized once to fp8 with a per-row scale. NoPE PV is then a single fp8 MFMA;
-    RoPE (bf16) is a narrow separate dot.
-
-    Returns ``(acc_nope [BLOCK_H, BLOCK_D] (cols >= NOPE == 0), acc_rope
-    [BLOCK_H, ROPE])``.
-    """
-    NUM_GROUPS: tl.constexpr = BLOCK_D // FP8_BLK  # 16
-    ROPE: tl.constexpr = BLOCK_D - NOPE  # 64
-
-    e = k_scale.to(tl.int32)  # [BLOCK_K, NUM_GROUPS]; pad groups = 0 <= real bytes
-    e_max = tl.max(e, axis=1)  # [BLOCK_K] per-token common exponent E_k
-    # Residual t[k,g] = 2^(e-E_k) in (0,1]; SFU exp2 over the narrow [BLOCK_K,16].
-    t = tl.exp2((e - e_max[:, None]).to(tl.float32))  # [BLOCK_K, NUM_GROUPS]
-    scale_t = tl.reshape(
-        tl.broadcast_to(t[:, :, None], (BLOCK_K, NUM_GROUPS, FP8_BLK)),
-        (BLOCK_K, BLOCK_D),
-    )
-    v_prime = (k_fp8.to(tl.float32) * scale_t).to(k_fp8.dtype)  # fp8 [BLOCK_K, BLOCK_D]
-
-    # p' = p * S_k, S_k = 2^(E_k-127) (pow2, exact). Quantize p' to fp8 per-row.
-    s_k = tl.exp2((e_max - 127).to(tl.float32))  # [BLOCK_K]
-    p_prime = p * s_k[None, :]  # [BLOCK_H, BLOCK_K]
-    p_amax = tl.maximum(tl.max(tl.abs(p_prime), axis=1), 1e-30)  # [BLOCK_H]
-    p_descale = p_amax / 448.0
-    p_q = tl.clamp(p_prime / p_descale[:, None], -448.0, 448.0).to(k_fp8.dtype)
-
-    acc_nope = (
-        tl.dot(p_q, v_prime, out_dtype=tl.float32) * p_descale[:, None]
-    )  # [BLOCK_H, BLOCK_D]
-    acc_rope = tl.dot(
-        p.to(k_rope.dtype), k_rope, out_dtype=tl.float32
-    )  # [BLOCK_H, ROPE]
-    return acc_nope, acc_rope
-
-
 def _quant_q_nope_mxfp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Pre-quantize the NoPE half of decode q into a padded MXFP8 (fp8 + E8M0)
     layout for the native QK ``dot_scaled``.
@@ -572,7 +459,6 @@ def _paged_decode_fused_kernel(
     BLOCK_K: tl.constexpr,
     QUANT_KV: tl.constexpr,  # True → MXFP8 dequant (E8M0 NoPE + bf16 RoPE)
     QK_NATIVE: tl.constexpr,  # True → native MXFP8 dot_scaled QK (implies QUANT_KV)
-    PV_NATIVE: tl.constexpr,  # True → native fp8 PV (implies QK_NATIVE); no bf16 tile
     NOPE: tl.constexpr,  # NoPE dim (448) when QUANT_KV
     FP8_BLK: tl.constexpr,  # MXFP8 block width (32) when QUANT_KV
     NUM_K_STAGES: tl.constexpr,  # SW-pipeline depth of the inner K loop
@@ -636,16 +522,10 @@ def _paged_decode_fused_kernel(
             other=0.0,
         )
 
-    ROPE_DIM: tl.constexpr = BLOCK_D - NOPE  # 64 (RoPE tail) when QUANT_KV
     neg_large = -3.4028234663852886e38
     m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
-    if PV_NATIVE:
-        # Native PV keeps NoPE (acc) and RoPE (acc_rope) in separate accumulators
-        # so the bf16 RoPE dot stays narrow (64-wide) instead of a wasteful
-        # 512-wide dot over a mostly-zero tile.
-        acc_rope = tl.zeros((BLOCK_H, ROPE_DIM), dtype=tl.float32)
 
     k_offs = tl.arange(0, BLOCK_K)
     # NUM_K_STAGES sets the inner K loop's SW-pipeline depth (3 for bf16, 2
@@ -662,27 +542,7 @@ def _paged_decode_fused_kernel(
             other=0,  # any in-bounds slot; the read is masked out below
         )
 
-        if PV_NATIVE:
-            # Native QK + native fp8 PV: load the fp8 tile once, no bf16 rebuild.
-            scores, k_fp8, k_scale, k_rope = _qk_native_scores_tile(
-                q_fp8,
-                q_scale,
-                q_rope,
-                unified_kv_ptr,
-                unified_u8_ptr,
-                rope_ptr,
-                slot,
-                valid,
-                d_offs,
-                kv_stride_n,
-                rope_stride_n,
-                NOPE,
-                FP8_BLK,
-                BLOCK_K,
-                BLOCK_D,
-            )
-            scores = scores * qk_scale
-        elif QK_NATIVE:
+        if QK_NATIVE:
             # Native CDNA4 MXFP8 scaled MFMA for QK; reuse the loaded fp8 to
             # rebuild the bf16 kv tile the (unchanged) PV dot below needs.
             scores, kv = _qk_native_tile(
@@ -748,14 +608,7 @@ def _paged_decode_fused_kernel(
         p = tl.exp2(scores - m_new[:, None])
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
-        if PV_NATIVE:
-            acc_nope_d, acc_rope_d = _pv_native_tile(
-                p, k_fp8, k_scale, k_rope, NOPE, FP8_BLK, BLOCK_K, BLOCK_D
-            )
-            acc = acc * alpha[:, None] + acc_nope_d
-            acc_rope = acc_rope * alpha[:, None] + acc_rope_d
-        else:
-            acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
         m_i = m_new
         l_i = l_new
 
@@ -771,41 +624,17 @@ def _paged_decode_fused_kernel(
     l_final = l_i * alpha_kv + alpha_sink
 
     denom = tl.maximum(l_final, 1.0e-30)
-    if PV_NATIVE:
-        # Two-accumulator store: NoPE (acc, cols [0,NOPE)) + RoPE (acc_rope,
-        # cols [NOPE,NOPE+ROPE_DIM)=[448,512)). Together they cover all D.
-        norm = tl.where(l_final > 0.0, alpha_kv / denom, 0.0)  # [BLOCK_H]
-        out_nope = (acc * norm[:, None]).to(out_ptr.dtype.element_ty)
-        tl.store(
-            out_ptr
-            + t * out_stride_t
-            + h_offs[:, None] * out_stride_h
-            + d_offs[None, :] * out_stride_d,
-            out_nope,
-            mask=h_mask[:, None] & (d_offs < NOPE)[None, :],
-        )
-        rope_offs = tl.arange(0, ROPE_DIM)
-        out_rope = (acc_rope * norm[:, None]).to(out_ptr.dtype.element_ty)
-        tl.store(
-            out_ptr
-            + t * out_stride_t
-            + h_offs[:, None] * out_stride_h
-            + (NOPE + rope_offs)[None, :] * out_stride_d,
-            out_rope,
-            mask=h_mask[:, None],
-        )
-    else:
-        out = tl.where(
-            l_final[:, None] > 0.0, (acc * alpha_kv[:, None]) / denom[:, None], 0.0
-        )
-        tl.store(
-            out_ptr
-            + t * out_stride_t
-            + h_offs[:, None] * out_stride_h
-            + d_offs[None, :] * out_stride_d,
-            out.to(out_ptr.dtype.element_ty),
-            mask=h_mask[:, None] & d_mask[None, :],
-        )
+    out = tl.where(
+        l_final[:, None] > 0.0, (acc * alpha_kv[:, None]) / denom[:, None], 0.0
+    )
+    tl.store(
+        out_ptr
+        + t * out_stride_t
+        + h_offs[:, None] * out_stride_h
+        + d_offs[None, :] * out_stride_d,
+        out.to(out_ptr.dtype.element_ty),
+        mask=h_mask[:, None] & d_mask[None, :],
+    )
 
 
 @triton.jit
@@ -850,7 +679,6 @@ def _paged_decode_split_kernel(
     BLOCK_K: tl.constexpr,
     QUANT_KV: tl.constexpr,  # True → MXFP8 dequant (E8M0 NoPE + bf16 RoPE)
     QK_NATIVE: tl.constexpr,  # True → native MXFP8 dot_scaled QK (implies QUANT_KV)
-    PV_NATIVE: tl.constexpr,  # True → native fp8 PV (implies QK_NATIVE); no bf16 tile
     NOPE: tl.constexpr,  # NoPE dim (448) when QUANT_KV
     FP8_BLK: tl.constexpr,  # MXFP8 block width (32) when QUANT_KV
     NUM_K_STAGES: tl.constexpr,  # SW-pipeline depth of the inner K loop
@@ -927,13 +755,10 @@ def _paged_decode_split_kernel(
     tile_start = pid_k * tiles_per_segment
     tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
 
-    ROPE_DIM: tl.constexpr = BLOCK_D - NOPE  # 64 (RoPE tail) when QUANT_KV
     neg_large = -3.4028234663852886e38
     m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
-    if PV_NATIVE:
-        acc_rope = tl.zeros((BLOCK_H, ROPE_DIM), dtype=tl.float32)
 
     k_offs = tl.arange(0, BLOCK_K)
     # NUM_K_STAGES (see fused kernel comment for rationale).
@@ -947,26 +772,7 @@ def _paged_decode_split_kernel(
             other=0,  # any in-bounds slot; masked out below
         )
 
-        if PV_NATIVE:
-            scores, k_fp8, k_scale, k_rope = _qk_native_scores_tile(
-                q_fp8,
-                q_scale,
-                q_rope,
-                unified_kv_ptr,
-                unified_u8_ptr,
-                rope_ptr,
-                slot,
-                valid,
-                d_offs,
-                kv_stride_n,
-                rope_stride_n,
-                NOPE,
-                FP8_BLK,
-                BLOCK_K,
-                BLOCK_D,
-            )
-            scores = scores * qk_scale
-        elif QK_NATIVE:
+        if QK_NATIVE:
             scores, kv = _qk_native_tile(
                 q_fp8,
                 q_scale,
@@ -1022,14 +828,7 @@ def _paged_decode_split_kernel(
         p = tl.exp2(scores - m_new[:, None])
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
-        if PV_NATIVE:
-            acc_nope_d, acc_rope_d = _pv_native_tile(
-                p, k_fp8, k_scale, k_rope, NOPE, FP8_BLK, BLOCK_K, BLOCK_D
-            )
-            acc = acc * alpha[:, None] + acc_nope_d
-            acc_rope = acc_rope * alpha[:, None] + acc_rope_d
-        else:
-            acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
         m_i = m_new
         l_i = l_new
 
@@ -1038,35 +837,14 @@ def _paged_decode_split_kernel(
     l_base = t * lp_stride_t + pid_k * lp_stride_k
     tl.store(l_partial_ptr + l_base + h_offs * lp_stride_h, l_i, mask=h_mask)
     a_base = t * ap_stride_t + pid_k * ap_stride_k
-    if PV_NATIVE:
-        # NoPE partial (cols [0,NOPE)) + RoPE partial (cols [NOPE,NOPE+ROPE_DIM)).
-        # Pre-sink raw acc; the reduce kernel reads the full-D partial unchanged.
-        tl.store(
-            acc_partial_ptr
-            + a_base
-            + h_offs[:, None] * ap_stride_h
-            + d_offs[None, :] * ap_stride_d,
-            acc,
-            mask=h_mask[:, None] & (d_offs < NOPE)[None, :],
-        )
-        rope_offs = tl.arange(0, ROPE_DIM)
-        tl.store(
-            acc_partial_ptr
-            + a_base
-            + h_offs[:, None] * ap_stride_h
-            + (NOPE + rope_offs)[None, :] * ap_stride_d,
-            acc_rope,
-            mask=h_mask[:, None],
-        )
-    else:
-        tl.store(
-            acc_partial_ptr
-            + a_base
-            + h_offs[:, None] * ap_stride_h
-            + d_offs[None, :] * ap_stride_d,
-            acc,
-            mask=h_mask[:, None] & d_mask[None, :],
-        )
+    tl.store(
+        acc_partial_ptr
+        + a_base
+        + h_offs[:, None] * ap_stride_h
+        + d_offs[None, :] * ap_stride_d,
+        acc,
+        mask=h_mask[:, None] & d_mask[None, :],
+    )
 
 
 @triton.jit
@@ -1305,9 +1083,6 @@ def _sparse_attn_v4_paged_decode_triton(
 
     qk_scale = float(softmax_scale) * LOG2E
     _bk, num_warps, num_stages = _kernel_config(block_h)
-    # Native fp8 PV (and implied native QK): consume the fp8 tile directly, no
-    # bf16 reconstruction. Forces qk_native on (both share the single fp8 read).
-    pv_native = quant_kv and unified_kv_fp8_pv_native()
     if block_k is None:
         # fp8 uses the SAME BLOCK_K=16 as bf16. A microbench sweep over
         # {16,32,64} x {2,3} stages (gfx950, T>=16, D=512) found the earlier
@@ -1316,11 +1091,6 @@ def _sparse_attn_v4_paged_decode_triton(
         # narrow tile keeps register/LDS footprint low enough for deeper
         # pipelining and better occupancy, which dominates the per-tile dequant.
         block_k = _bk
-        # Native fp8 PV wants BLOCK_K=32: the PV contraction is BLOCK_K, and the
-        # fp8 MFMA needs K%32==0 to avoid padding the contraction (which would
-        # negate fp8's throughput edge). Microbench may refine via the env knob.
-        if pv_native:
-            block_k = 32
         _env_bk = envs.SGLANG_UNIFIED_KV_FP8_BLOCK_K.get()
         if quant_kv and _env_bk > 0:
             block_k = _env_bk
@@ -1335,9 +1105,8 @@ def _sparse_attn_v4_paged_decode_triton(
 
     # Native QK: opt-in MXFP8 dot_scaled for the score path (gfx950). Pre-quantize
     # the NoPE half of q to a padded fp8 + E8M0 layout once per decode call so
-    # split-K CTAs sharing a token's q don't each re-quantize. PV-native implies
-    # QK-native (the fp8 tile is read once and feeds both dots).
-    qk_native = (quant_kv and unified_kv_fp8_qk_native()) or pv_native
+    # split-K CTAs sharing a token's q don't each re-quantize.
+    qk_native = quant_kv and unified_kv_fp8_qk_native()
     if qk_native:
         q_fp8, q_scale = _quant_q_nope_mxfp8(q)
         q_fp8_arg = q_fp8
@@ -1410,7 +1179,6 @@ def _sparse_attn_v4_paged_decode_triton(
             BLOCK_K=block_k,
             QUANT_KV=quant_kv,
             QK_NATIVE=qk_native,
-            PV_NATIVE=pv_native,
             NOPE=_MXFP8_NOPE,
             FP8_BLK=_MXFP8_BLK,
             NUM_K_STAGES=num_k_stages,
@@ -1473,7 +1241,6 @@ def _sparse_attn_v4_paged_decode_triton(
         BLOCK_K=block_k,
         QUANT_KV=quant_kv,
         QK_NATIVE=qk_native,
-        PV_NATIVE=pv_native,
         NOPE=_MXFP8_NOPE,
         FP8_BLK=_MXFP8_BLK,
         NUM_K_STAGES=num_k_stages,
