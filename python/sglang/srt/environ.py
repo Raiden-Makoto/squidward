@@ -841,6 +841,10 @@ class Envs:
     # Opt-in: native CDNA4 MXFP8 scaled-MFMA (tl.dot_scaled) for the QK dot in the
     # unified-KV fp8 decode kernels (gfx950 only). Requires SGLANG_UNIFIED_KV_FP8.
     SGLANG_UNIFIED_KV_FP8_QK_NATIVE = EnvBool(False)
+    # Opt-in: native fp8 PV dot in the unified-KV fp8 decode kernels (gfx950 only).
+    # Consumes the fp8 NoPE tile directly (single fp8 MFMA + bf16 RoPE dot) instead
+    # of reconstructing a bf16 KV tile. Implies QK_NATIVE. Requires SGLANG_UNIFIED_KV_FP8.
+    SGLANG_UNIFIED_KV_FP8_PV_NATIVE = EnvBool(False)
     # Tuning overrides for the fp8 unified-KV decode kernel (0 = use heuristic).
     # Escape hatches for A/B tuning without code edits; production leaves at 0.
     SGLANG_UNIFIED_KV_FP8_BLOCK_K = EnvInt(0)
