@@ -115,14 +115,15 @@ def test_fused_q_norm_rope_pack_parity(tokens, heads, scale):
 
     # NoPE (the fp8 stream this fusion targets) is byte-exact.
     assert torch.equal(nope.view(torch.uint8), ref_nope.view(torch.uint8))
-    # RoPE is bf16 and can differ by <=1 ULP vs the JIT kernel: the complex
+    # RoPE is bf16 and can differ from the JIT kernel by ~1 ULP: the complex
     # rotation ``xr*fr - xi*fi`` rounds differently under the HIP intrinsic's
-    # fma contraction vs Triton's separate mul/sub. This is codegen rounding
-    # noise (~2^-8 relative), well below attention's own bf16 noise; assert a
-    # tight 1-ULP bound rather than exact bytes.
-    torch.testing.assert_close(
-        rope.float(), ref_rope.float(), rtol=2**-7, atol=2**-7
-    )
+    # fma contraction vs Triton's separate mul/sub. For near-zero results from
+    # catastrophic cancellation the absolute gap is ~1 ULP of the operands'
+    # magnitude, so bound by 1 bf16 ULP (2^-8) of the largest rope value -- this
+    # is codegen rounding noise, well below attention's own bf16 noise.
+    tol = (2**-8) * ref_rope.float().abs().amax().clamp(min=1.0)
+    max_abs = (rope.float() - ref_rope.float()).abs().amax()
+    assert max_abs <= tol, f"rope max abs diff {max_abs:.3e} > 1-ULP bound {tol:.3e}"
 
 
 @pytest.mark.parametrize("rows", [1, 64, 257])
