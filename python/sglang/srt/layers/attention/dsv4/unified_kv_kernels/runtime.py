@@ -537,8 +537,12 @@ def _fused_kv_norm_rope_mxfp8_pack_kernel(
     w_imag = tl.load(
         weight_ptr + imag_cols, mask=pair_offs < (DIM_ROPE // 2), other=1.0
     ).to(tl.float32)
-    x_real = x_real * rms_inv[:, None] * w_real[None, :]
-    x_imag = x_imag * rms_inv[:, None] * w_imag[None, :]
+    # Round the normed (norm*weight) rope value to bf16 BEFORE rotating: the JIT
+    # ``fused_norm_rope_inplace`` writes the normed tail as bf16 and rotates that
+    # rounded value (mirrors the q producer). Rotating in fp32 here diverges by
+    # ~1 bf16 ULP, amplified by the (randn-scale) weight. Match the JIT instead.
+    x_real = (x_real * rms_inv[:, None] * w_real[None, :]).to(tl.bfloat16).to(tl.float32)
+    x_imag = (x_imag * rms_inv[:, None] * w_imag[None, :]).to(tl.bfloat16).to(tl.float32)
 
     positions = tl.load(positions_ptr + rows, mask=rmask, other=0).to(tl.int64)
     freq_base = positions[:, None] * freq_row_stride
