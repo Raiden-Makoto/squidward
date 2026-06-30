@@ -51,3 +51,20 @@ def unified_kv_fp8_fused_q() -> bool:
     if not unified_kv_use_fp8():
         return False
     return os.environ.get("SGLANG_UNIFIED_KV_FP8_FUSED_Q", "1").strip().lower() in _TRUTHY
+
+
+@functools.lru_cache(maxsize=1)
+def unified_kv_fp8_fused_kv() -> bool:
+    """Whether the fp8 unified-KV *prefill* extend-KV input is produced by the
+    fused norm+rope+MXFP8-pack Triton kernel (one launch) instead of the JIT
+    ``fused_norm_rope_inplace`` (bf16 kv) followed by a standalone
+    ``pack_mxfp8_dense(kv)`` re-read inside the attention backend.
+
+    Default ON when the fp8 unified-KV pool is active; kill-switch via
+    ``SGLANG_UNIFIED_KV_FP8_FUSED_KV=0``. gfx950-only in practice (the MXFP8 pack
+    asserts e4m3fn / gfx950), matching ``unified_kv_use_fp8()``. Disabled under
+    DSA prefill-CP by the caller (the all-gather needs the full bf16 KV).
+    """
+    if not unified_kv_use_fp8():
+        return False
+    return os.environ.get("SGLANG_UNIFIED_KV_FP8_FUSED_KV", "1").strip().lower() in _TRUTHY

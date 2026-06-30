@@ -1119,13 +1119,21 @@ class DeepseekV4HipRadixBackend(
         save_kv_cache: bool = True,
         q_nope: Optional[torch.Tensor] = None,
         q_rope: Optional[torch.Tensor] = None,
+        kv_nope: Optional[torch.Tensor] = None,
+        kv_rope: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """unified_kv paged-attention path over the bf16 unified_kv.
 
         ``q_nope``/``q_rope``: optional pre-packed MXFP8 query (fused q
         norm+rope+pack producer) for the fp8 prefill path. When set, ``q`` is a
         shape-carrier only ([T,H,512] fp8 NoPE) and the standalone q pack is
-        skipped."""
+        skipped.
+
+        ``kv_nope``/``kv_rope``: optional pre-packed MXFP8 extend KV (fused kv
+        norm+rope+pack producer) for the fp8 prefill path. When set, ``kv`` is a
+        shape-carrier only ([T,512] fp8 NoPE) and the standalone
+        ``pack_mxfp8_dense(kv)`` is skipped (bytes feed both the extend attn input
+        and the SWA ring store)."""
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels import runtime
 
         pool = self.token_to_kv_pool
@@ -1271,10 +1279,15 @@ class DeepseekV4HipRadixBackend(
             kext_p = torch.cat([kext_p, kext_p[-1:].expand(pad)])
         # fp8 (MXFP8) path: pack this chunk's extend kv ONCE. The packed bytes
         # feed the prefill attention input and are reused by the SWA ring store
-        # below (no second quant). bf16 path leaves these None.
+        # below (no second quant). bf16 path leaves these None. When the model
+        # produced the pack in-line (fused kv norm+rope+pack), reuse those bytes
+        # and skip the standalone pack entirely (``kv`` is then a fp8 shape-carrier).
         kv_ext_nope = kv_ext_rope = None
         if unified_rope is not None:
-            kv_ext_nope, kv_ext_rope = runtime.pack_mxfp8_dense(kv)
+            if kv_nope is not None:
+                kv_ext_nope, kv_ext_rope = kv_nope, kv_rope
+            else:
+                kv_ext_nope, kv_ext_rope = runtime.pack_mxfp8_dense(kv)
         o = runtime.prefill(
             q=q,
             unified_kv=unified,
@@ -1417,6 +1430,8 @@ class DeepseekV4HipRadixBackend(
         attn_sink: Optional[torch.Tensor] = None,
         q_nope: Optional[torch.Tensor] = None,
         q_rope: Optional[torch.Tensor] = None,
+        kv_nope: Optional[torch.Tensor] = None,
+        kv_rope: Optional[torch.Tensor] = None,
         **_,
     ) -> torch.Tensor:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
@@ -1447,6 +1462,8 @@ class DeepseekV4HipRadixBackend(
                 save_kv_cache=save_kv_cache,
                 q_nope=q_nope,
                 q_rope=q_rope,
+                kv_nope=kv_nope,
+                kv_rope=kv_rope,
             )
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):

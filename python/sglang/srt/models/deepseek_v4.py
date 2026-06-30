@@ -583,6 +583,35 @@ class MQALayer(nn.Module):
         )
         return kv
 
+    def _compute_kv_mxfp8(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        qkv_a: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """fp8 unified-KV prefill extend-KV producer: fold (RMSNorm + RoPE) and
+        the MXFP8 NoPE pack into one Triton launch. Returns the packed
+        ``(kv_nope [T,512] fp8, kv_rope [T,64] bf16)`` consumed directly by the
+        OPUS fp8 prefill op + reused by the SWA ring store -- byte-identical to
+        ``_compute_kv_bf16`` followed by ``pack_mxfp8_dense(kv)``, minus the bf16
+        write + re-read. KV analog of ``_compute_q_b_mxfp8``."""
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.runtime import (
+            fused_kv_norm_rope_mxfp8_pack,
+        )
+
+        if qkv_a is not None:
+            kv = qkv_a[..., self.q_lora_rank :]
+        else:
+            kv, _ = self.wkv(x)
+        kv = kv.contiguous()
+        return fused_kv_norm_rope_mxfp8_pack(
+            kv,
+            self.kv_norm.weight.data,
+            self.eps,
+            self.freqs_cis,
+            positions,
+        )
+
     def _forward_prepare_multi_stream(
         self,
         x: torch.Tensor,
@@ -769,12 +798,21 @@ class MQALayer(nn.Module):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[Tuple[torch.Tensor, torch.Tensor]],
+        Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ]:
         x_linear = x_quant if x_quant is not None else x
         # When set (fp8 unified-KV prefill), the (q_nope, q_rope) MXFP8 pack
         # produced in-line by the fused q norm+rope+pack kernel; threaded to the
         # backend so it skips the standalone q re-read/pack.
         q_packed: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        # Likewise for the extend KV: the (kv_nope, kv_rope) MXFP8 pack produced
+        # in-line by the fused kv norm+rope+pack kernel (skips the bf16 kv write
+        # + the backend's standalone pack_mxfp8_dense(kv)).
+        kv_packed: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
             q_lora = qkv_a[..., : self.q_lora_rank]
@@ -920,20 +958,36 @@ class MQALayer(nn.Module):
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
-                kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
                 # HIP/ROCm-only: the unified_kv 2-source prefill path is exclusive
                 # to DeepseekV4HipRadixBackend. Guard with _is_hip so this CP
                 # all-gather never enters the NVIDIA (DeepseekV4AttnBackend) path.
-                if use_cp and _is_hip:
-                    # unified_kv + DSA CP: the 2-source prefill path needs the
-                    # FULL current-chunk KV (extend source + ring write), so
-                    # all-gather the per-rank bf16 KV across the CP group.
-                    kv = cp_all_gather_rerange_output(
-                        kv.contiguous(),
-                        self.cp_size,
-                        forward_batch,
-                        torch.cuda.current_stream(),
+                from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+                    unified_kv_fp8_fused_kv,
+                )
+
+                if not (use_cp and _is_hip) and unified_kv_fp8_fused_kv():
+                    # fp8 unified-KV prefill (no CP): produce the extend KV directly
+                    # in MXFP8 (fused norm+rope+pack), skipping the bf16 kv write +
+                    # the backend's standalone pack. ``kv`` carries the [T,512] fp8
+                    # NoPE shape-carrier; the pre-packed (kv_nope, kv_rope) is
+                    # threaded to the backend (extend attn input + ring store).
+                    kv_nope_p, kv_rope_p = self._compute_kv_mxfp8(
+                        x_linear, positions, qkv_a=qkv_a
                     )
+                    kv = kv_nope_p
+                    kv_packed = (kv_nope_p, kv_rope_p)
+                else:
+                    kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
+                    if use_cp and _is_hip:
+                        # unified_kv + DSA CP: the 2-source prefill path needs the
+                        # FULL current-chunk KV (extend source + ring write), so
+                        # all-gather the per-rank bf16 KV across the CP group.
+                        kv = cp_all_gather_rerange_output(
+                            kv.contiguous(),
+                            self.cp_size,
+                            forward_batch,
+                            torch.cuda.current_stream(),
+                        )
             elif use_cp:
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
@@ -972,7 +1026,7 @@ class MQALayer(nn.Module):
                 self.compressor,
             )
 
-        return q, kv, q_packed
+        return q, kv, q_packed, kv_packed
 
     def forward(
         self,
@@ -1050,8 +1104,9 @@ class MQALayer(nn.Module):
                 )
             kv = None
             q_packed = None
+            kv_packed = None
         else:
-            q, kv, q_packed = self._forward_prepare(
+            q, kv, q_packed, kv_packed = self._forward_prepare(
                 x,
                 positions,
                 forward_batch,
@@ -1073,6 +1128,10 @@ class MQALayer(nn.Module):
             # fp8 fused-q prefill: ``q`` is the [T,H,512] fp8 NoPE shape-carrier;
             # pass the pre-packed (q_nope, q_rope) so the backend skips the pack.
             q_nope_kw, q_rope_kw = q_packed if q_packed is not None else (None, None)
+            # fp8 fused-kv prefill: ``attn_k`` is the [T,512] fp8 NoPE shape-carrier;
+            # pass the pre-packed (kv_nope, kv_rope) so the backend skips the
+            # standalone pack_mxfp8_dense(kv) (extend attn input + ring store).
+            kv_nope_kw, kv_rope_kw = kv_packed if kv_packed is not None else (None, None)
             o = attn_backend.forward(
                 q=q if q_packed is not None else (q_out if q_out is not None else q),
                 k=attn_k,
@@ -1084,6 +1143,8 @@ class MQALayer(nn.Module):
                 save_kv_cache=kv is not None,
                 q_nope=q_nope_kw,
                 q_rope=q_rope_kw,
+                kv_nope=kv_nope_kw,
+                kv_rope=kv_rope_kw,
             )
         else:
             attn_q = q_padded if q_padded is not None else q

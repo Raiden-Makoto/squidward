@@ -136,6 +136,56 @@ def test_fused_q_norm_rope_pack_parity(tokens, heads, scale):
     assert nope_mismatch < 1e-3, f"NoPE byte-mismatch frac {nope_mismatch:.3e} too high"
 
 
+@pytest.mark.parametrize("tokens,scale", [(1, 1.0), (64, 1.0), (257, 8.0), (33, 0.01)])
+def test_fused_kv_norm_rope_pack_parity(tokens, scale):
+    """The fused prefill extend-KV producer
+    (``runtime.fused_kv_norm_rope_mxfp8_pack``) must be numerically equivalent
+    (to within RMSNorm reduction-order rounding noise) to the JIT
+    ``fused_norm_rope_inplace`` (bf16 kv) followed by the standalone
+    ``pack_mxfp8_dense(kv)`` it replaces."""
+    from sglang.jit_kernel.dsv4 import fused_norm_rope_inplace
+    from sglang.srt.layers.attention.dsv4.unified_kv_kernels import runtime
+
+    torch.manual_seed(4)
+    eps = 1e-6
+    max_pos = 4096
+    rope_pairs = mxfp8.DIM_ROPE // 2  # 32
+    kv_in = (
+        torch.randn(tokens, mxfp8.DIM_HEAD, device="cuda", dtype=torch.bfloat16) * scale
+    ).contiguous()
+    weight = torch.randn(mxfp8.DIM_HEAD, device="cuda", dtype=torch.bfloat16)
+    positions = torch.randint(0, max_pos, (tokens,), device="cuda", dtype=torch.int64)
+    freqs_cis = torch.randn(max_pos, rope_pairs, 2, device="cuda", dtype=torch.float32)
+    freqs_cis = torch.view_as_complex(freqs_cis)
+
+    # Reference: JIT in-place norm+rope -> bf16 kv, then standalone MXFP8 pack.
+    kv_out = kv_in.clone()
+    fused_norm_rope_inplace(kv_out, weight, eps, freqs_cis, positions)
+    ref_nope, ref_rope = runtime.pack_mxfp8_dense(kv_out)
+
+    # Ours: single fused launch over the raw (pre norm+rope) kv.
+    nope, rope = runtime.fused_kv_norm_rope_mxfp8_pack(
+        kv_in, weight, eps, freqs_cis, positions
+    )
+
+    # As with the q producer, the in-register fp32 RMSNorm reduction order differs
+    # from the JIT warp-reduce, so a few elements land on a different bf16/fp8
+    # rounding boundary. Assert numerical equivalence of the reconstructed KV (deq
+    # NoPE + bf16 RoPE) to within reduction-order rounding noise.
+    deq_ref = torch.cat(
+        [mxfp8.dequant_nope_mxfp8(ref_nope).float(), ref_rope.float()], dim=-1
+    )
+    deq_our = torch.cat(
+        [mxfp8.dequant_nope_mxfp8(nope).float(), rope.float()], dim=-1
+    )
+    rel = (deq_our - deq_ref).norm() / deq_ref.norm().clamp(min=1e-12)
+    assert rel < 1e-3, f"reconstructed-kv relative error {rel:.3e} >= 1e-3"
+    nope_mismatch = (
+        nope.view(torch.uint8).int() != ref_nope.view(torch.uint8).int()
+    ).float().mean()
+    assert nope_mismatch < 1e-3, f"NoPE byte-mismatch frac {nope_mismatch:.3e} too high"
+
+
 @pytest.mark.parametrize("rows", [1, 64, 257])
 def test_copy_scatter_matches_quant_scatter(rows):
     """The copy-by-loc store (reusing pre-packed bytes) must yield pool bytes
