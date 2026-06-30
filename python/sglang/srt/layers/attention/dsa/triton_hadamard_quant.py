@@ -152,38 +152,3 @@ def fused_hadamard_act_quant(
     if fuse_weights:
         return y, s, w_out.view(*weights.shape, 1)
     return y, s
-
-
-# Standalone correctness check vs act_quant(rotate_activation(x)).
-# Run on the box: PYTHONPATH=python python3 -m sglang.srt.layers.attention.dsa.triton_hadamard_quant
-if __name__ == "__main__":
-    from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
-    from sglang.srt.layers.attention.dsa.tilelang_kernel import act_quant
-
-    torch.manual_seed(0)
-    softmax_scale = 0.1337
-    for shape in [(8, 32, 128), (4096, 32, 128), (1, 8, 128)]:
-        x = (torch.randn(*shape, device="cuda", dtype=torch.bfloat16) * 0.3).contiguous()
-        y_ref, s_ref = act_quant(rotate_activation(x.clone()), 128, None)
-        y_f, s_f = fused_hadamard_act_quant(x.clone(), 128, None)
-        # compare fp8 bytes and scales
-        same_fp8 = (y_ref.view(torch.uint8) == y_f.view(torch.uint8)).float().mean().item()
-        s_maxrel = ((s_ref - s_f).abs() / (s_ref.abs() + 1e-9)).max().item()
-        # dequantized cosine
-        dq_ref = y_ref.float() * s_ref.float()
-        dq_f = y_f.float() * s_f.float()
-        cos = torch.nn.functional.cosine_similarity(
-            dq_ref.flatten(), dq_f.flatten(), dim=0
-        ).item()
-        # weights fold vs _apply_q_scale_and_softmax_scale
-        w = (torch.randn(*shape[:-1], device="cuda", dtype=torch.bfloat16)).contiguous()
-        w_ref = w.unsqueeze(-1) * s_f * softmax_scale
-        _, _, w_fused = fused_hadamard_act_quant(
-            x.clone(), 128, None, weights=w, softmax_scale=softmax_scale
-        )
-        w_maxabs = (w_ref.float() - w_fused.float()).abs().max().item()
-        print(
-            f"shape={shape}: fp8_exact_frac={same_fp8:.5f} "
-            f"scale_maxrel={s_maxrel:.3e} dequant_cos={cos:.6f} "
-            f"weights_fold_maxabs={w_maxabs:.3e}"
-        )
