@@ -109,7 +109,16 @@ class DeepseekModelNextN(nn.Module):
                 config.hidden_size,
                 bias=False,
                 quant_config=quant_config,
-                prefix=add_prefix("eh_proj", prefix),
+                # Use the layer-indexed prefix the checkpoint's quark `exclude`
+                # list is keyed on (e.g. "model.layers.78.eh_proj") so the
+                # per-module exclude check resolves correctly. The bare "eh_proj"
+                # prefix never matches the exclude, so eh_proj would wrongly be
+                # quantized while the checkpoint keeps it bf16 (the MTP layer is
+                # excluded from quant). The param name is unaffected (set by the
+                # module path); prefix only drives the quant-method lookup.
+                prefix=add_prefix(
+                    f"layers.{config.num_hidden_layers}.eh_proj", prefix
+                ),
             )
         else:
             self.eh_proj = nn.Linear(
