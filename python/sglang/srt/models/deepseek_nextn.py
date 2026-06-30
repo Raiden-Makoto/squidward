@@ -308,7 +308,12 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 should_ignore_layer,
             )
 
-            ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
+            # Probe a concrete excluded sub-module (eh_proj) rather than the bare
+            # layer prefix: the quark `exclude` list is keyed on full module names
+            # (e.g. "model.layers.78.eh_proj"), and should_ignore_layer does an
+            # exact/regex match, so the bare "model.layers.78" never matches and the
+            # whole-MTP-excluded case (GLM-5.2-MXFP4: layer N kept bf16) was missed.
+            ckpt_prefix = f"model.layers.{config.num_hidden_layers}.eh_proj"
             mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
             if should_ignore_layer(mapped_prefix, nextn_quant_config.exclude_layers):
                 nextn_quant_config = None
