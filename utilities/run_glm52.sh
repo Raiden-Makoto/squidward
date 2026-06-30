@@ -8,11 +8,13 @@
 # failure. On 5.12.1 the config resolves qk_rope_head_dim=64 natively; if you
 # must run on an older-transformers image, add:
 #   --json-model-override-args '{"qk_rope_head_dim": 64}'
-# NOTE: EAGLE/--spec still trips on the nextn MTP-layer quark-quant exclude.
 export PYTHONPATH=/sgl-workspace/squidward/python:${PYTHONPATH}
 MODEL=${HF_HOME:-/root/hf_home}/hub/models--amd--GLM-5.2-MXFP4/snapshots/386bd0e4ec821f7b07975701cec3c3b953a5576a
 
 export SAFETENSORS_FAST_GPU=1
+# gfx950 Triton fp8 sparse-MLA prefill (validated on GLM-5.2-MXFP4: 312 hits,
+# GSM8K 0.950). Opt-in upstream; we default it on for this gfx950 launcher.
+export SGLANG_DSA_TRITON_PREFILL=1
 
 PROFILE_ARGS=""
 SPEC_ARGS=""
