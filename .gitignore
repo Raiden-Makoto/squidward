@@ -291,3 +291,8 @@ utilities/dsv4_guard*
 # Cursor MCP config holds a (read-only) GitHub PAT - never commit
 .cursor/mcp.json
 **/.cursor/mcp.json
+
+# Profiling traces (large binaries, disposable artifacts) - never commit
+*.trace.json
+*.trace.json.gz
+*.trace.json.gz.*

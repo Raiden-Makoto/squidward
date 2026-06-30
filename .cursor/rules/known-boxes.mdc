@@ -5,20 +5,28 @@ alwaysApply: true
 
 # Known Remote GPU Boxes
 
-Two remote boxes are in use. Both run a `dsv4` container. SSH form:
+Remote GPU boxes in use. SSH form:
 `ssh -o ConnectTimeout=25 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null macui@<HOST> '<cmd>'`
-Container exec: `docker exec dsv4 bash -lc "..."`. Always export
+Container exec: `docker exec <CONTAINER> bash -lc "..."`. Always export
 `PYTHONPATH=/sgl-workspace/squidward/python:${PYTHONPATH}` for python; the fork lives at
 `/sgl-workspace/squidward`.
+
+**Container name does NOT imply workstream — always verify the running container, its
+branch, and its live server before acting; do not assume `dsv4`.** A box can host
+several containers on different branches.
 
 ## quanta box — gfx942 / CDNA3 (MI300X/MI325X, mi30x)
 - Host: `quanta-ccs-aus-f11-40.cs-aus.dcgpu`
 - Container `dsv4`, image `rocm/sgl-dev:...-rocm720-mi30x-...`
 - This is the fp8 **e4m3fnuz** box (the gfx942 fp8 fixes target this arch).
 
-## gbt box — gfx950 / CDNA4 (MI350X/MI355X, mi35x)
+## gbt box — gfx950 / CDNA4 (MI350X/MI355X, mi35x)  ← THE GLM-5.1 BOX
 - Host: `gbt350-odcdh2-b13-1.png-odc.dcgpu`
-- Container `dsv4`, image `rocm/sgl-dev:v0.5.13-rocm720-mi35x-20260612`
+- **GLM-5.1 work runs in the `glm5` container** (NOT `dsv4`): fork on branch
+  `RM/glm51`, image `rocm/sgl-dev:v0.5.13.post1-rocm720-mi35x-20260618`, GLM-5.1-MXFP4
+  server on port 8552 (`docker exec glm5 bash -lc "..."`).
+- The `dsv4` container on this same box is a DIFFERENT workstream (branch
+  `gfx950-fp8-unified-kv-main`, no GLM server) — do not use it for GLM-5.1.
 - This is the fp8 **e4m3fn** box (gfx950). Our gfx942 fixes are arch-gated, so gfx950 is unaffected.
 
 Follow `remote-box-rules.mdc` for all box-safety constraints (no upstream edits, no pip install,
