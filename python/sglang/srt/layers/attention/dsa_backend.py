@@ -731,11 +731,15 @@ class DeepseekSparseAttnBackend(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
             )
         elif forward_batch.forward_mode.is_draft_extend_v2():
+            # This branch only consumes extend_seq_lens(_cpu) below; it does NOT use
+            # extend_prefix_lens_cpu (that is only read in the is_extend() branch).
+            # On the gpu_only draft-extend path (base_spec_worker.prepare_for_draft_extend)
+            # extend_prefix_lens_cpu is intentionally left None to avoid a per-iter D2H of
+            # the prefix lengths, so requiring it here wrongly crashes DSA + EAGLE MTP.
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens is not None
-                and forward_batch.extend_prefix_lens_cpu is not None
-            ), "All of them must not be None"
+            ), "extend_seq_lens(_cpu) must not be None for draft_extend_v2"
 
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             assert forward_batch.extend_seq_lens is not None
