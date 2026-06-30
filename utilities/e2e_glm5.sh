@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Consolidated E2E throughput/latency sweep for GLM-5.1-MXFP4 (TP4, no DP)
+# against a server already running (launch with run_glm5.sh first).
+#
+# GLM5 is TP4-only (no DP attention), so unlike the dsv4 low/high scripts this
+# runs the FULL concurrency sweep in one shot.
+#
+# NOTE on profiling: --profile only writes traces if the SERVER was launched
+# with SGLANG_TORCH_PROFILER_DIR set to a matching dir.
+#
+# Usage:
+#   bash e2e_glm5.sh [INPUT_LEN] [OUTPUT_LEN] [ENABLE_PROFILE]
+#   PORT=8553 OUT_DIR=/root/glm5-bench-flag bash e2e_glm5.sh   # e.g. flag server
+#   CONCURRENCY="1 2 4 8 16 32 64" bash e2e_glm5.sh            # override sweep
+
+# ===== Default parameters =====
+INPUT_LEN=${1:-8192}
+OUTPUT_LEN=${2:-1024}
+ENABLE_PROFILE=${3:-0}   # 1 = enable profile, 0 = disable
+
+# ===== Server / sweep config (override via env) =====
+# PORT is configurable so the sweep can target either server when running two
+# TP4 servers at once (e.g. baseline on 8552, flag-on on 8553 via run_glm5_ab.sh).
+PORT=${PORT:-8552}
+# Leading "2" is duplicated on purpose: the first run pays JIT/compile + warmup
+# and each point is averaged over only (concurrency*4) prompts, so the first
+# c=2 is heavily skewed and discarded; the second c=2 is the real measurement.
+CONCURRENCY=${CONCURRENCY:-"2 2 4 8 16 32 64"}
+
+# ===== Output directory (override with OUT_DIR=...) =====
+OUT_DIR=${OUT_DIR:-/sgl-workspace/squidward/results/glm5-bench}
+mkdir -p "${OUT_DIR}"
+
+# ===== Timestamp =====
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+
+# Profile traces (when --profile is used) land here
+export SGLANG_TORCH_PROFILER_DIR="${SGLANG_TORCH_PROFILER_DIR:-${OUT_DIR}/${TIMESTAMP}_traces}"
+if [ "${ENABLE_PROFILE}" -eq 1 ]; then
+    mkdir -p "${SGLANG_TORCH_PROFILER_DIR}"
+fi
+
+echo "MODEL=GLM-5.1-MXFP4 (TP4)"
+echo "PORT=${PORT}"
+echo "INPUT_LEN=${INPUT_LEN}"
+echo "OUTPUT_LEN=${OUTPUT_LEN}"
+echo "CONCURRENCY=${CONCURRENCY}"
+echo "PROFILE=${ENABLE_PROFILE}"
+echo "TIMESTAMP=${TIMESTAMP}"
+echo "OUT_DIR=${OUT_DIR}"
+[ "${ENABLE_PROFILE}" -eq 1 ] && echo "PROFILER_DIR=${SGLANG_TORCH_PROFILER_DIR}"
+
+for concurrency in ${CONCURRENCY}
+do
+    prompt=$((concurrency * 4))
+
+    LOG_FILE="${OUT_DIR}/glm5_${INPUT_LEN}_${OUTPUT_LEN}_tp4_c-${concurrency}_${TIMESTAMP}.log"
+
+    CMD="PYTHONPATH=/sgl-workspace/squidward/python:\${PYTHONPATH} python3 -m sglang.bench_serving \
+        --backend sglang \
+        --port ${PORT} \
+        --dataset-name random \
+        --random-input-len ${INPUT_LEN} \
+        --random-output-len ${OUTPUT_LEN} \
+        --random-range-ratio 1 \
+        --max-concurrency ${concurrency} \
+        --num-prompts ${prompt}"
+
+    # ===== Optional profile =====
+    if [ "${ENABLE_PROFILE}" -eq 1 ]; then
+        CMD="${CMD} --profile --profile-num-steps 4 --profile-by-stage"
+    fi
+
+    echo "Running: ${CMD}"
+    echo "Log: ${LOG_FILE}"
+
+    eval ${CMD} 2>&1 | tee "${LOG_FILE}"
+done
