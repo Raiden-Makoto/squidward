@@ -110,6 +110,17 @@ class EagleDraftWorkerBase(ABC):
         extend_num_tokens = bs * num_draft_tokens
         # When seq_lens_cpu is absent, stay on GPU-only path -- no .tolist()/.cpu().
         gpu_only = batch.seq_lens_cpu is None
+        # DSA (DeepSeek-sparse-attention) draft-extend reads forward_batch.seq_lens_cpu
+        # and the extend_*_cpu mirrors throughout the indexer / topk / sparse-attn
+        # paths; the gpu_only fast path leaves them None and crashes EAGLE MTP. For a
+        # DSA draft model, materialize the CPU seq-len mirror (one D2H/step) so the
+        # CPU-mirror path populates extend_seq_lens_cpu / extend_prefix_lens_cpu.
+        if gpu_only:
+            from sglang.srt.configs.model_config import is_deepseek_dsa
+
+            if is_deepseek_dsa(draft_model_runner.model_config.hf_config):
+                batch.seq_lens_cpu = batch.seq_lens.cpu()
+                gpu_only = False
 
         batch.spec_info = draft_extend_input
         # Do NOT cast predict dtype here. The caller (e.g., _draft_extend_for_decode)
