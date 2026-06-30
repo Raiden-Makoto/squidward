@@ -196,14 +196,13 @@ def main() -> None:
         raise SystemExit("CUDA/HIP device required")
     device = "cuda"
     ablate = os.environ.get("SGLANG_UNIFIED_KV_FP8_ABLATE", "none")
-    qk_native = os.environ.get("SGLANG_UNIFIED_KV_FP8_QK_NATIVE", "0")
 
     inp = _build_inputs(args.batch, args.heads, args.kv_len, device, args.seed)
     arch = torch.cuda.get_device_properties(0).gcnArchName
 
     print(
         f"arch={arch} T={args.batch} H={args.heads} kv_len={args.kv_len} D={_D} "
-        f"iters={args.iters} ablate={ablate} qk_native={qk_native}"
+        f"iters={args.iters} ablate={ablate}"
     )
 
     if args.mode == "sweep":
