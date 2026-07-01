@@ -1,0 +1,51 @@
+---
+description: GLM-5.2-MXFP4 decode optimization log on gfx950 (MI355X). Decode profile vs B200, ranked perf-opt TODO, and results. Read before profiling or optimizing GLM-5.2 decode.
+alwaysApply: false
+---
+
+# GLM-5.2-MXFP4 decode perf-opt (gfx950 / MI355X)
+
+## Profile (2026-07-01)
+`utilities/glm52_decode_prof_0701.csv` — GLM-5.2 decode, in1024/out1024, conc4, TP0,
+graph-ON Σdur; MI355X mxfp4 vs B200 nvfp4.
+
+CAVEAT: this MI355X run did NOT use our faster Triton DSA prefill/indexer kernel
+(`SGLANG_DSA_TRITON_PREFILL`) — it is the stock tilelang/aiter indexer path, so the
+indexer gaps below are an UPPER bound. Re-profile with the Triton kernel ON to get
+the true baseline before/after any indexer work.
+
+Per-forward Σdur (3 dense A-layers + 75 MoE B-layers): MI355X 15,153us vs B200
+11,742us (B200 = 77%, MI355X ~1.29x slower). Overlap: MI355X 1.00x vs B200 1.33x
+(structural — wall-clock/TPOT loses further).
+
+Section gap (×75 MoE layers; ratio = B200/MI355X, lower = MI355X slower):
+
+| Section | MI355X us | B200 us | ratio | overall opportunity |
+|---|---|---|---|---|
+| DeepseekV2AttentionMLA | 6588 | 4242 | 64% | 15.5%  (BIGGEST) |
+| DeepseekV2MoE | 6234 | 5912 | 95% | 2.1%  (parity, SKIP) |
+| prepare_mlp (AllReduce) | 1285 | 575 | 45% | 4.7% |
+| prepare_attn | 371 | 575 | 155% | MI355X already faster |
+
+MoE is at PARITY. The gap is ATTENTION + AllReduce.
+
+Inside attention: the core sparse-MLA `main_kernel` (9.22us) is ON PAR with B200
+`fmhaSm100fKernel` (9.52us) — NOT the problem. The MI355X cost is the DSA Indexer's
+many small UNFUSED kernels that B200 fuses (its RopeQuantizeKernel does rope+quant
+in 2.89us):
+- Indexer RotaryEmbedding 9.16us vs 2.16us  (4.2x slower)  <- worst single item
+- Indexer LayerNorm       5.51us vs 1.83us  (3x)
+- separate: act_quant 5.78, indexer_k_quant_and_cache 5.80, hadamard 4.81,
+  topk_transform 5.78, _get_logits_head_gate gemm 6.83 + mul 5.47
+- RowParallelLinear 12.85us  (large bf16 GEMM, likely untuned)
+- prepare_mlp AllReduce cross_device_reduce_1stage 12.18us vs trtllm 7.67us
+
+## PERF-OPT TODO — ranked (do in this order)
+1. **DSA Indexer fusion** (rope+quant / layernorm / hadamard / k-cache store / logits
+   gemm+mul / topk). Biggest lever (~15.5% of forward). Rope alone 9.16->~2us = 4x.
+   FIRST re-profile with `SGLANG_DSA_TRITON_PREFILL=1` for the true post-Triton baseline.
+2. **RowParallelLinear / bf16 GEMM efficiency** (12.85us) — write/select a better GEMM,
+   not tuning.
+3. **AllReduce** (12.18->7.67us, 2.2x) — collective-bound, vendor kernel; harder.
+4. **Cross-stream overlap** (MI355X 1.00x vs B200 1.33x) — structural; only after 1-3.
+5. Core `main_kernel` — already competitive; DO NOT prioritize.
