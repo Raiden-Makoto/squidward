@@ -36,7 +36,7 @@ exec sglang serve \
   --model-path "${MODEL}" \
   ${PROFILE_ARGS} \
   ${SPEC_ARGS} \
-  --tp 8 \
+  --tp 4 \
   --host localhost \
   --port 8552 \
   --trust-remote-code \
