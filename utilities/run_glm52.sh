@@ -36,7 +36,7 @@ exec sglang serve \
   --model-path "${MODEL}" \
   ${PROFILE_ARGS} \
   ${SPEC_ARGS} \
-  --tp 4 \
+  --tp 8 \
   --host localhost \
   --port 8552 \
   --trust-remote-code \
@@ -47,4 +47,5 @@ exec sglang serve \
   --disable-radix-cache \
   --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' \
   --kv-cache-dtype fp8_e4m3 \
-  --tokenizer-worker-num 8
+  --tokenizer-worker-num 8 \
+  --chunked-prefill-size 131072
