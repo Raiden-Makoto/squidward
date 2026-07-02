@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GLM-5.2-MXFP4 launcher (gfx950). Based on run_glm5.sh (GLM-5.1).
+# GLM-5.2-MXFP4 launcher (gfx950).
 #
 # Requires transformers >= 5.12.x (image v0.5.14-rocm720-mi35x-20260630+). Older
 # transformers (5.8.1) had a GlmMoeDsaConfig alias bug ("head_dim":

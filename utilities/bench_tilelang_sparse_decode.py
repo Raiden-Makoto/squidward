@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated bench/PMC driver for the GLM-5.1 sparse-MLA decode TileLang kernel.
+"""Isolated bench/PMC driver for the GLM-5.1/5.2 sparse-MLA decode TileLang kernel.
 
 The GLM-5 FP4 decode attention `main_kernel` (profile: tilelang_kernel.py:1333
 `tilelang_sparse_fwd` -> `sparse_mla_fwd_decode_partial_fp8`) is the dominant
@@ -7,7 +7,7 @@ decode attention cost (~8.6us/call, the biggest addressable gap vs B200's single
 `fmhaSm100fKernel`). This drives that exact two-stage kernel (partial + combine)
 standalone for timing and rocprofv3 PMC counter collection.
 
-Shapes (GLM-5.1, tp4): num_heads=16/GPU, qk=576 (d_v=512 + rope_tail=64),
+Shapes (GLM-5.1/5.2, tp4): num_heads=16/GPU, qk=576 (d_v=512 + rope_tail=64),
 topk=2048, page_size=1, fp8_e4m3 q+kv.
 
 Timing:
@@ -23,7 +23,7 @@ import statistics
 
 import torch
 
-NUM_HEADS = 16  # GLM-5.1 64 heads / tp4
+NUM_HEADS = 16  # GLM-5.1/5.2 64 heads / tp4
 DIM = 576  # kv_lora_rank(512) + qk_rope(64)
 D_V = 512
 TOPK = 2048

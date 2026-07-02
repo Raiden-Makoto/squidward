@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Consolidated E2E throughput/latency sweep for GLM-5.1-MXFP4 (TP4, no DP)
-# against a server already running (launch with run_glm5.sh first).
+# Consolidated E2E throughput/latency sweep for GLM-5.2-MXFP4 (TP4, no DP)
+# against a server already running (launch with run_glm52.sh first).
 #
 # GLM5 is TP4-only (no DP attention), so unlike the dsv4 low/high scripts this
 # runs the FULL concurrency sweep in one shot.
@@ -40,7 +40,7 @@ if [ "${ENABLE_PROFILE}" -eq 1 ]; then
     mkdir -p "${SGLANG_TORCH_PROFILER_DIR}"
 fi
 
-echo "MODEL=GLM-5.1-MXFP4 (TP4)"
+echo "MODEL=GLM-5.2-MXFP4 (TP4)"
 echo "PORT=${PORT}"
 echo "INPUT_LEN=${INPUT_LEN}"
 echo "OUTPUT_LEN=${OUTPUT_LEN}"
