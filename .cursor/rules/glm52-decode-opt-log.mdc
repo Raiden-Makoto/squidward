@@ -11,8 +11,7 @@ graph-ON Σdur; MI355X mxfp4 vs B200 nvfp4.
 
 CAVEAT: this MI355X run did NOT use our faster Triton DSA prefill/indexer kernel
 (`SGLANG_DSA_TRITON_PREFILL`) — it is the stock tilelang/aiter indexer path, so the
-indexer gaps below are an UPPER bound. Re-profile with the Triton kernel ON to get
-the true baseline before/after any indexer work.
+indexer gaps below are an UPPER bound (not reprofiling; build against these gaps).
 
 Per-forward Σdur (3 dense A-layers + 75 MoE B-layers): MI355X 15,153us vs B200
 11,742us (B200 = 77%, MI355X ~1.29x slower). Overlap: MI355X 1.00x vs B200 1.33x
@@ -43,7 +42,7 @@ in 2.89us):
 ## PERF-OPT TODO — ranked (do in this order)
 1. **DSA Indexer fusion** (rope+quant / layernorm / hadamard / k-cache store / logits
    gemm+mul / topk). Biggest lever (~15.5% of forward). Rope alone 9.16->~2us = 4x.
-   FIRST re-profile with `SGLANG_DSA_TRITON_PREFILL=1` for the true post-Triton baseline.
+   (Profile used stock indexer; do NOT reprofile — build against these gaps directly.)
 2. **RowParallelLinear / bf16 GEMM efficiency** (12.85us) — write/select a better GEMM,
    not tuning.
 3. **AllReduce** (12.18->7.67us, 2.2x) — collective-bound, vendor kernel; harder.
