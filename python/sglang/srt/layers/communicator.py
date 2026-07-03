@@ -75,6 +75,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_bool_env_var,
+    get_int_env_var,
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
@@ -89,6 +90,14 @@ _is_flashinfer_available = is_flashinfer_available()
 _is_sm90_supported = _is_cuda and is_sm90_supported()
 _is_sm100_supported = _is_cuda and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+# aiter AllReduce+RMSNorm fusion is a net decode win only at small batch sizes
+# (GLM-5.2 gfx950 A/B: +1.8..3.5% tput at bs<=8, ~1% loss at bs>=16). Gate the
+# fusion on batch/token count so it engages only where it helps; above this it
+# falls back to plain AR + norm. Tune via SGLANG_AITER_ALLREDUCE_FUSION_MAX_TOKENS
+# (set very large to always fuse, matching the pre-threshold behavior).
+_AITER_AR_FUSION_MAX_TOKENS = get_int_env_var(
+    "SGLANG_AITER_ALLREDUCE_FUSION_MAX_TOKENS", 8
+)
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
@@ -182,6 +191,7 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
         _use_aiter
         and total_bytes > 0
         and n <= 16384
+        and input_tensor.shape[0] <= _AITER_AR_FUSION_MAX_TOKENS
         and total_bytes <= 8 * 1024 * 8192
         and get_parallel().tp_size != 6
         and not is_dp_attention_enabled()
@@ -795,6 +805,7 @@ class LayerCommunicator:
                 or (
                     _use_aiter
                     and batch_size > 0
+                    and batch_size <= _AITER_AR_FUSION_MAX_TOKENS
                     and get_parallel().tp_size != 6
                     and not is_dp_attention_enabled()
                     and get_moe_a2a_backend().is_none()
