@@ -125,12 +125,21 @@ individual kernels. Fix these first:
        16    19.48     19.70     5598      5566   (ITL +1.1%, tot -0.6%)
        32    22.99     23.26     8178      8098   (ITL +1.2%, tot -1.0%)
        64    29.02     29.31     10705     10710  (ITL +1.0%, tot  0%)
-     VERDICT: real WIN at low concurrency (c<=8: +2.5..4.6% tput, best lever
-     found so far), slight LOSS at high concurrency (c>=16: ~1%). CONFOUNDED:
-     requires SGLANG_USE_AITER=1 (flips all aiter paths), so deltas are
-     aiter+fusion vs canonical, not AR-fusion isolated. The high-conc regression
-     may be some other aiter kernel. TODO to de-confound: SGLANG_USE_AITER=1
-     WITHOUT the fusion flag vs WITH. Recommend for latency-bound (low-conc)
-     serving; not a clean win for throughput-bound.
+   - DE-CONFOUNDED (2026-07-03, 3-way, all graph-ON 8192/1024 TP4):
+     (a) canonical vs SGLANG_USE_AITER=1 no-fusion = NEUTRAL (ITL identical
+         within noise at every conc) -> global aiter flip is NOT the cause.
+     (b) aiter-only vs aiter+fusion (isolates the AR fusion):
+           conc  itl_delta  tput_delta
+           2     -3.6%      +3.5%
+           4     -3.0%      +1.8%
+           8     -3.5%      +2.6%
+           16    +1.0%      -0.9%
+           32    +1.1%      -1.1%
+           64    +1.4%      -1.0%
+     VERDICT: the AR fusion ITSELF causes both the low-conc WIN (c<=8:
+     +1.8..3.5% tput from removing the serial AR+residual+RMSNorm and
+     cross-layer overlap) and the high-conc LOSS (c>=16: ~1%). Clean,
+     concurrency-dependent tradeoff. Enable for latency-bound (low-conc)
+     serving; leave off for throughput-bound. Best decode lever found so far.
 5. **Cross-stream overlap** (MI355X 1.00x vs B200 1.33x) — structural; only after 1-4.
 6. Core `main_kernel` — already competitive; DO NOT prioritize.
