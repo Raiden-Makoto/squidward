@@ -151,8 +151,17 @@ individual kernels. Fix these first:
            16     0.0%      +0.3%
            32     0.0%      -0.2%
            64    -0.1%      +0.4%
-     -> low-conc win preserved, high-conc loss GONE. `--enable-aiter-allreduce-
-     fusion` (+SGLANG_USE_AITER=1) is now a STRICT improvement (never worse than
-     canonical, up to +4.8% tput at low conc). Best decode lever found. DONE.
+     -> low-conc win preserved, high-conc loss GONE (gate makes it never worse
+     than canonical).
+   FINAL VERDICT: DO NOT ENABLE for production. The win exists ONLY at bs<=8,
+   which production throughput serving never runs at (bs 32-256). The gate just
+   prevents the ~1% high-conc loss; it does not create a high-conc win. And it's
+   structural: the fusion only helps when AR->residual->norm serial LATENCY
+   dominates (small batch, latency-bound, nothing overlaps the AR); at
+   production batch the AR is bandwidth-bound and already overlapped with
+   compute, so there is nothing to gain. Keep default OFF. The gate code stays
+   (harmless, opt-in) but this is a niche latency-SLA-only lever, NOT a
+   throughput lever. For production AR, the real target is a faster LARGE-message
+   allreduce (2-stage / quantized), not this fusion. DONE (rejected for prod).
 5. **Cross-stream overlap** (MI355X 1.00x vs B200 1.33x) — structural; only after 1-4.
 6. Core `main_kernel` — already competitive; DO NOT prioritize.
