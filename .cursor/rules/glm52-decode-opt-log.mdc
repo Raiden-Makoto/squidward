@@ -82,7 +82,24 @@ individual kernels. Fix these first:
        32    23.04     22.87       8156      8191
        64    29.01     28.83       10759     10813
    VERDICT: correct + net-positive -> safe to enable. DONE.
-2. **Speed up the indexer LayerNorm kernel** (5.51->~2us target, ck_tile config).
+2. **Speed up the indexer LayerNorm kernel** (5.51->~2us target).
+   IMPLEMENTED (8113ff1a58, RM/glm51): opt-in `SGLANG_DSA_JIT_LAYERNORM=1` routes
+   true LayerNorm (mean+var+bias) through a portable warp/CTA JIT kernel
+   (jit_kernel/layernorm.cuh, fp32 accum / bf16 IO) instead of aiter ck_tile
+   Layernorm2dFwd. gfx950-gated, supported hidden sizes (warp: mult-of-32 in
+   [32,512); CTA: mult-of-512). VALIDATED on box (gbt350, 2026-07-03):
+   - Byte-compare: BIT-EXACT (0.0e0) vs both F.layer_norm and aiter
+     layernorm2d_fwd at 128-dim bf16, T in {1,4,17,64}. GSM8K 1319 = 0.930 (in
+     baseline noise band, as expected for a bit-exact kernel).
+   - Isolation microbench: jit ~1.1-1.2x faster than aiter (~1us/call at the
+     Python/launch level; real kernel delta smaller).
+   - graph-ON e2e A/B (8192/1024 TP4, one at a time): NEUTRAL. ITL flat within
+     noise at every concurrency (14.00->14.02, 16.41->16.38, 29.02->29.02),
+     throughput within ~0.5%.
+   VERDICT: correct + faster-in-isolation but e2e-NEUTRAL -> the LayerNorm is NOT
+   on the decode critical path (overlapped, and ~1us is nothing vs the 14-29ms
+   step). The profile's 3x "gap" was CUDA-graph-off Sigma-dur, not a real e2e
+   opportunity. Leave default OFF. Do NOT pursue LayerNorm further. DONE.
 3. **RowParallelLinear / bf16 GEMM efficiency** (12.85us) — write/select a better GEMM,
    not tuning.
 4. **AllReduce** (12.18->7.67us, 2.2x) — collective-bound, vendor kernel; harder.
