@@ -110,6 +110,27 @@ individual kernels. Fix these first:
    cached-position GATHER kernel = real graphed GPU time -> ~1% e2e win. DONE.
 3. **RowParallelLinear / bf16 GEMM efficiency** (12.85us) — write/select a better GEMM,
    not tuning.
-4. **AllReduce** (12.18->7.67us, 2.2x) — collective-bound, vendor kernel; harder.
+4. **AllReduce** (prepare_mlp cross_device_reduce_1stage, one-shot IPC, on the
+   SERIAL attn->mlp critical path at decode; small msg <512KiB @ TP4).
+   - mscclpp: NOT installed in container + no pip on box -> dead end.
+   - ROCM_QUICK_REDUCE_QUANTIZATION=INT4 (in launcher): NO-OP for decode (QR only
+     engages >=16MiB; custom AR wins the small tensor). Only matters for prefill.
+   - TESTED (2026-07-03): `SGLANG_USE_AITER=1 --enable-aiter-allreduce-fusion`
+     (fuses AR+residual+RMSNorm, enables cross-layer deferral) vs canonical.
+     GSM8K 0.925 (no regression). graph-ON e2e A/B (8192/1024 TP4):
+       conc  base_itl  fuse_itl  base_tot  fuse_tot
+       2     14.00     13.49     1200      1249   (ITL -3.6%, tot +4.1%)
+       4     14.58     14.14     2201      2256   (ITL -3.0%, tot +2.5%)
+       8     16.41     15.77     3630      3796   (ITL -3.9%, tot +4.6%)
+       16    19.48     19.70     5598      5566   (ITL +1.1%, tot -0.6%)
+       32    22.99     23.26     8178      8098   (ITL +1.2%, tot -1.0%)
+       64    29.02     29.31     10705     10710  (ITL +1.0%, tot  0%)
+     VERDICT: real WIN at low concurrency (c<=8: +2.5..4.6% tput, best lever
+     found so far), slight LOSS at high concurrency (c>=16: ~1%). CONFOUNDED:
+     requires SGLANG_USE_AITER=1 (flips all aiter paths), so deltas are
+     aiter+fusion vs canonical, not AR-fusion isolated. The high-conc regression
+     may be some other aiter kernel. TODO to de-confound: SGLANG_USE_AITER=1
+     WITHOUT the fusion flag vs WITH. Recommend for latency-bound (low-conc)
+     serving; not a clean win for throughput-bound.
 5. **Cross-stream overlap** (MI355X 1.00x vs B200 1.33x) — structural; only after 1-4.
 6. Core `main_kernel` — already competitive; DO NOT prioritize.
