@@ -39,26 +39,17 @@ in 2.89us):
 - RowParallelLinear 12.85us  (large bf16 GEMM, likely untuned)
 - prepare_mlp AllReduce cross_device_reduce_1stage 12.18us vs trtllm 7.67us
 
-## ROOT CAUSE of the indexer gap (2026-07-03)
-The fused indexer kernels (`fused_q_indexer_rope_first_quant`,
-`fused_k_indexer_norm_rope`, `fused_k_indexer_norm_rope_store` from
-`sglang.jit_kernel.dsv4`/`dsv32`) are gated behind `if _is_cuda:`
-(dsa_indexer.py:153) — NVIDIA-only. On HIP/gfx950 they never import, so the
-indexer runs UNFUSED (_get_q_k_bf16 -> separate rotary_emb@602 + layernorm +
-quant + store), which is exactly the profile's fragmented kernels. B200 fuses
-them (RopeQuantizeKernel 2.89us) -> the ~1.5x indexer gap.
-Standalone fused-rope was tried TWICE and reverted e2e-neutral (586aff9350,
-5c5288dfe5) — the win is the MEGA-fusion (rope+quant+store), not rope alone.
-The HIP megafusion already exists: aiter `indexer_qk_rope_quant_and_cache`
-behind `SGLANG_DSA_FUSE_INDEXER_QK` (built+validated byte-exact+GSM8K earlier),
-UNWIRED from decode because it was e2e-neutral on GLM-5.1's COLLECTIVE-bound
-decode. GLM-5.2 profile shows the indexer is now the RAW gap -> revisit here.
+## ROOT CAUSE of the indexer gap (2026-07-03) — GLM-5.2
+On HIP/gfx950 the indexer runs each primitive as its own kernel (_get_q_k_bf16
+-> rotary_emb + layernorm + quant + store), and each of those kernels is itself
+3-4x slower than B200 on tiny work. This is KERNEL INEFFICIENCY (launch/occupancy,
+the aiter indirect cached-position gather), NOT missing fusion. The 5.2 A/B
+proves it: swapping ONLY the rope kernel (no fusion) is already a consistent
+net decode win (see TODO #1). Fusion is explicitly NOT the direction for 5.2.
 
-## DIRECTION (2026-07-03): fix the SLOW PRIMITIVES, not fusion.
-Fusing slow kernels just bundles the slowness. The indexer's individual ops are
-themselves 3-4x slower than B200 on tiny work -> kernel inefficiency
-(launch/occupancy or the aiter indirect cached-position gather), not fusion
-overhead. Fix these first:
+## DIRECTION (2026-07-03): fix the SLOW PRIMITIVES, one kernel at a time.
+Each indexer primitive is 3-4x slower than B200 on tiny work -> replace/tune the
+individual kernels. Fix these first:
 - Indexer RotaryEmbedding: aiter kn_entry_2c_sbhd_cached_indirect_inplace 9.16us
   vs B200 fused_rope 2.16us (4.2x). Tiny work (16 heads x 64 rope dims) -> absurd.
 - Indexer LayerNorm: ck_tile Layernorm2dFwd 5.51us vs B200 1.83us (3x). 128-dim.
@@ -69,9 +60,7 @@ overhead. Fix these first:
    indexer q/k rope through jit_kernel/rope.py `apply_rope_inplace` (hipified
    rope.cuh, the same fast path B200 uses) instead of aiter's slow cached-rope.
    gfx950-gated, handles interleaved (is_neox=False), covers _get_q_k_bf16 +
-   key-only _get_k_bf16. In-place semantics + attrs audited sound (matches prior
-   validated art 638563f0dc+92b0a8bb5a+e9265e78eb, reverted only b/c 5.1 was
-   collective-bound). VALIDATED CORRECT on box (gbt350, 2026-07-03):
+   key-only _get_k_bf16. VALIDATED on box (gbt350, 2026-07-03):
    - Byte-compare: apply_rope_inplace(is_neox=False) matches aiter's GPT-J
      interleaved convention exactly (aiter _rotate_gptj/_apply_rotary_emb ==
      torch ref == kernel, ~7e-3 bf16). cos_cache (mp,1,1,32)->cache (mp,64)
@@ -81,8 +70,18 @@ overhead. Fix these first:
      (no runtime grow) so the lazy fp32 cache is safe.
    - GSM8K 1319 A/B: baseline aiter 0.925 vs fused-rope 0.936 (fused AHEAD; no
      regression). The earlier "0.925 vs 0.950 / 2.5pt drop" was n=200 sampling
-     noise (95% CI ~+/-3pt); NOT a rope-math bug. Fused-rope is safe to enable.
-   TODO: graph-on perf A/B to quantify the 9.16->~2us decode win.
+     noise (95% CI ~+/-3pt); NOT a rope-math bug.
+   - graph-ON e2e A/B (8192/1024 TP4, one server at a time): fused-rope is a
+     consistent net win at every concurrency — median ITL down 0.6-1.2%, total
+     throughput up 0.4-1.5%:
+       conc  base_itl  fused_itl   base_tot  fused_tot
+       2     14.02     13.89       1205      1215
+       4     14.64     14.47       2206      2238
+       8     16.42     16.25       3680      3717
+       16    19.54     19.36       5575      5641
+       32    23.04     22.87       8156      8191
+       64    29.01     28.83       10759     10813
+   VERDICT: correct + net-positive -> safe to enable. DONE.
 2. **Speed up the indexer LayerNorm kernel** (5.51->~2us target, ck_tile config).
 3. **RowParallelLinear / bf16 GEMM efficiency** (12.85us) — write/select a better GEMM,
    not tuning.
