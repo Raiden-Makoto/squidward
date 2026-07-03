@@ -54,14 +54,22 @@ behind `SGLANG_DSA_FUSE_INDEXER_QK` (built+validated byte-exact+GSM8K earlier),
 UNWIRED from decode because it was e2e-neutral on GLM-5.1's COLLECTIVE-bound
 decode. GLM-5.2 profile shows the indexer is now the RAW gap -> revisit here.
 
+## DIRECTION (2026-07-03): fix the SLOW PRIMITIVES, not fusion.
+Fusing slow kernels just bundles the slowness. The indexer's individual ops are
+themselves 3-4x slower than B200 on tiny work -> kernel inefficiency
+(launch/occupancy or the aiter indirect cached-position gather), not fusion
+overhead. Fix these first:
+- Indexer RotaryEmbedding: aiter kn_entry_2c_sbhd_cached_indirect_inplace 9.16us
+  vs B200 fused_rope 2.16us (4.2x). Tiny work (16 heads x 64 rope dims) -> absurd.
+- Indexer LayerNorm: ck_tile Layernorm2dFwd 5.51us vs B200 1.83us (3x). 128-dim.
+
 ## PERF-OPT TODO — ranked (do in this order)
-1. **DSA Indexer fusion = bring the CUDA `_is_cuda`-gated fused indexer path to HIP**
-   (re-wire/validate the aiter `indexer_qk_rope_quant_and_cache` megafusion, +
-   the fused query rope+quant `SGLANG_DSA_FUSE_HADAMARD_QUANT`). Biggest lever
-   (~15.5%). NOT fused-rope-alone (known e2e-neutral). Gate on graph-on e2e A/B.
-   (Profile used stock indexer; do NOT reprofile — build against these gaps directly.)
-2. **RowParallelLinear / bf16 GEMM efficiency** (12.85us) — write/select a better GEMM,
+1. **Speed up the indexer RotaryEmbedding kernel** (9.16->~2us target). Investigate
+   why aiter kn_entry_2c_sbhd_cached_indirect_inplace is 4.2x slow for this shape
+   (occupancy / indirect gather / launch); replace or re-config. Gate on graph-on e2e A/B.
+2. **Speed up the indexer LayerNorm kernel** (5.51->~2us target, ck_tile config).
+3. **RowParallelLinear / bf16 GEMM efficiency** (12.85us) — write/select a better GEMM,
    not tuning.
-3. **AllReduce** (12.18->7.67us, 2.2x) — collective-bound, vendor kernel; harder.
-4. **Cross-stream overlap** (MI355X 1.00x vs B200 1.33x) — structural; only after 1-3.
-5. Core `main_kernel` — already competitive; DO NOT prioritize.
+4. **AllReduce** (12.18->7.67us, 2.2x) — collective-bound, vendor kernel; harder.
+5. **Cross-stream overlap** (MI355X 1.00x vs B200 1.33x) — structural; only after 1-4.
+6. Core `main_kernel` — already competitive; DO NOT prioritize.
