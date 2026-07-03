@@ -139,7 +139,20 @@ individual kernels. Fix these first:
      VERDICT: the AR fusion ITSELF causes both the low-conc WIN (c<=8:
      +1.8..3.5% tput from removing the serial AR+residual+RMSNorm and
      cross-layer overlap) and the high-conc LOSS (c>=16: ~1%). Clean,
-     concurrency-dependent tradeoff. Enable for latency-bound (low-conc)
-     serving; leave off for throughput-bound. Best decode lever found so far.
+     concurrency-dependent tradeoff.
+   - SHIPPED (134937d4a8): batch-size gate SGLANG_AITER_ALLREDUCE_FUSION_MAX_TOKENS
+     (default 8) on both apply_aiter_all_reduce_fusion + the cross-layer deferral
+     (CUDA-graph-safe, decision per captured bs). Fuse only when bs<=threshold,
+     else plain AR+norm. VALIDATED vs canonical (graph-ON 8192/1024 TP4):
+           conc  itl_delta  tput_delta
+           2     -3.5%      +3.4%
+           4     -3.3%      +3.6%
+           8     -4.1%      +4.8%
+           16     0.0%      +0.3%
+           32     0.0%      -0.2%
+           64    -0.1%      +0.4%
+     -> low-conc win preserved, high-conc loss GONE. `--enable-aiter-allreduce-
+     fusion` (+SGLANG_USE_AITER=1) is now a STRICT improvement (never worse than
+     canonical, up to +4.8% tput at low conc). Best decode lever found. DONE.
 5. **Cross-stream overlap** (MI355X 1.00x vs B200 1.33x) — structural; only after 1-4.
 6. Core `main_kernel` — already competitive; DO NOT prioritize.
