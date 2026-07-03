@@ -82,6 +82,26 @@ individual kernels. Fix these first:
        32    23.04     22.87       8156      8191
        64    29.01     28.83       10759     10813
    VERDICT: correct + net-positive -> safe to enable. DONE.
+   - BF16 CACHE (39b2cb0c27, SGLANG_DSA_FUSED_ROPE_BF16_CACHE default on): the
+     fp32 cos_sin_cache is this kernel's DOMINANT traffic (~2x the q/k bytes:
+     per work 512B fp32 cache vs 256B q rw). Templatized kernel CacheType
+     (default float, CUDA/neox byte-unchanged); interleaved path takes bf16
+     cache -> halves cache traffic. Byte-correct (9.8e-3 vs ref = aiter's own
+     bf16-cache precision). e2e A/B (bf16-cache fused-rope vs canonical):
+       conc  itl_delta  tput_delta
+       2     -0.7%      +1.3%
+       4     -0.7%      +1.4%
+       8     -1.0%      +2.3%
+       16    -0.8%      +0.6%
+       32    -0.8%      +0.1%
+       64    -0.7%      +1.2%
+     = SAME ~1% as fp32-cache fused-rope -> bf16 cache is e2e-NEUTRAL vs fp32.
+     The bandwidth saving doesn't materialize because the rope kernel is
+     OCCUPANCY-bound at decode (bs=1 -> ~2 blocks on ~256 CUs; 17*T works,
+     needed_blocks=ceil(17T/16)), not bandwidth-bound. Kept default (harmless,
+     aiter-precision, lighter in theory) but it is NOT an additional decode win.
+     No more gains available in this kernel at decode: it's launch/occupancy
+     capped once aiter's slow gather is replaced. DONE.
 2. **Speed up the indexer LayerNorm kernel** (5.51->~2us target).
    IMPLEMENTED (8113ff1a58, RM/glm51): opt-in `SGLANG_DSA_JIT_LAYERNORM=1` routes
    true LayerNorm (mean+var+bias) through a portable warp/CTA JIT kernel
