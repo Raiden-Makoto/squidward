@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -51,6 +52,13 @@ _is_hip = is_hip()
 _is_musa = is_musa()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_gfx95_supported = is_gfx95_supported()
+# Opt-in (gfx950): route true LayerNorm (mean + bias) through the portable
+# sglang JIT warp/CTA kernel (jit_kernel/layernorm.py -> layernorm.cuh) instead
+# of aiter's ck_tile Layernorm2dFwd, which the GLM-5.2 decode profile shows ~3x
+# slower than B200 (5.51us vs 1.83us) for the tiny indexer k_norm. Enable with
+# SGLANG_DSA_JIT_LAYERNORM=1.
+_DSA_JIT_LAYERNORM = get_bool_env_var("SGLANG_DSA_JIT_LAYERNORM")
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
@@ -630,6 +638,25 @@ class LayerNorm(MultiPlatformOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+        if (
+            _DSA_JIT_LAYERNORM
+            and _is_gfx95_supported
+            and self.use_bias
+            and self.elementwise_affine
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and x.dtype == self.dtype
+        ):
+            from sglang.jit_kernel.layernorm import (
+                is_supported_layernorm_hidden_size,
+                layernorm as jit_layernorm,
+            )
+
+            if is_supported_layernorm_hidden_size(self.hidden_size):
+                orig_shape = x.shape
+                x = x.reshape(-1, self.hidden_size)
+                return jit_layernorm(
+                    x, self.weight, self.bias, self.variance_epsilon
+                ).view(orig_shape)
         if (
             _has_aiter_layer_norm
             and x.dtype in (torch.bfloat16, torch.float16)
