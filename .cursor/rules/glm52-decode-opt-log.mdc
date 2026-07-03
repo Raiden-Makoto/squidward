@@ -71,9 +71,18 @@ overhead. Fix these first:
    gfx950-gated, handles interleaved (is_neox=False), covers _get_q_k_bf16 +
    key-only _get_k_bf16. In-place semantics + attrs audited sound (matches prior
    validated art 638563f0dc+92b0a8bb5a+e9265e78eb, reverted only b/c 5.1 was
-   collective-bound). PENDING box validation: byte-compare vs aiter rope +
-   GSM8K + graph-on A/B (run_glm5_ab.sh FEATURE_ENV="SGLANG_DSA_FUSED_ROPE=1").
-   (gbt box was DNS-unreachable 2026-07-03; rerun when back.)
+   collective-bound). VALIDATED CORRECT on box (gbt350, 2026-07-03):
+   - Byte-compare: apply_rope_inplace(is_neox=False) matches aiter's GPT-J
+     interleaved convention exactly (aiter _rotate_gptj/_apply_rotary_emb ==
+     torch ref == kernel, ~7e-3 bf16). cos_cache (mp,1,1,32)->cache (mp,64)
+     [cos32|sin32] correct; strided q_rope=query[...,:64] handled fine. Fused
+     builds fp32 cos/sin (HIGHER precision than aiter's bf16 cos_cache, which
+     defaults to torch.get_default_dtype()=bf16). aiter cos_cache is fixed-size
+     (no runtime grow) so the lazy fp32 cache is safe.
+   - GSM8K 1319 A/B: baseline aiter 0.925 vs fused-rope 0.936 (fused AHEAD; no
+     regression). The earlier "0.925 vs 0.950 / 2.5pt drop" was n=200 sampling
+     noise (95% CI ~+/-3pt); NOT a rope-math bug. Fused-rope is safe to enable.
+   TODO: graph-on perf A/B to quantify the 9.16->~2us decode win.
 2. **Speed up the indexer LayerNorm kernel** (5.51->~2us target, ck_tile config).
 3. **RowParallelLinear / bf16 GEMM efficiency** (12.85us) — write/select a better GEMM,
    not tuning.
