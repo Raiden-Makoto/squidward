@@ -96,11 +96,18 @@ individual kernels. Fix these first:
    - graph-ON e2e A/B (8192/1024 TP4, one at a time): NEUTRAL. ITL flat within
      noise at every concurrency (14.00->14.02, 16.41->16.38, 29.02->29.02),
      throughput within ~0.5%.
-   VERDICT (measured only): correct + faster-in-isolation but e2e-NEUTRAL.
-   Leave default OFF. NOT re-profiled with the flag on, so the REASON for the
-   neutral e2e is unknown/unverified (could be off critical path, overlapped, or
-   the isolation win not materializing under graph) — do not claim a cause
-   without a graph-on profile. If pursuing further, re-profile first. DONE for now.
+   VERDICT: correct + faster-in-isolation but e2e-NEUTRAL. Leave default OFF.
+   WHY neutral (from the microbench data, not profiling): the isolation times are
+   FLAT across token count (T=1: jit 6.96/aiter 7.22us; T=256: 6.41/7.69us — 256x
+   work, same time), i.e. both are pinned at a ~6-7us Python/tvm_ffi dispatch +
+   launch FLOOR; the actual [<=64,128] bf16 LayerNorm GPU compute is sub-us and
+   invisible under that floor. So the ~1us jit "win" is a fixed per-call
+   dispatch/launch delta, NOT compute. Decode runs under CUDA graph (logs:
+   "cuda graph: True"), which removes per-call launch overhead entirely -> the
+   thing jit was faster at does not exist in the graphed path. Residual GPU-time
+   delta across ~78 layers is <1% of the 14-29ms step (below the ~0.5% e2e noise
+   floor). Contrast rope (TODO#1), which replaced aiter's heavier indirect
+   cached-position GATHER kernel = real graphed GPU time -> ~1% e2e win. DONE.
 3. **RowParallelLinear / bf16 GEMM efficiency** (12.85us) — write/select a better GEMM,
    not tuning.
 4. **AllReduce** (12.18->7.67us, 2.2x) — collective-bound, vendor kernel; harder.
