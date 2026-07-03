@@ -39,9 +39,26 @@ in 2.89us):
 - RowParallelLinear 12.85us  (large bf16 GEMM, likely untuned)
 - prepare_mlp AllReduce cross_device_reduce_1stage 12.18us vs trtllm 7.67us
 
+## ROOT CAUSE of the indexer gap (2026-07-03)
+The fused indexer kernels (`fused_q_indexer_rope_first_quant`,
+`fused_k_indexer_norm_rope`, `fused_k_indexer_norm_rope_store` from
+`sglang.jit_kernel.dsv4`/`dsv32`) are gated behind `if _is_cuda:`
+(dsa_indexer.py:153) — NVIDIA-only. On HIP/gfx950 they never import, so the
+indexer runs UNFUSED (_get_q_k_bf16 -> separate rotary_emb@602 + layernorm +
+quant + store), which is exactly the profile's fragmented kernels. B200 fuses
+them (RopeQuantizeKernel 2.89us) -> the ~1.5x indexer gap.
+Standalone fused-rope was tried TWICE and reverted e2e-neutral (586aff9350,
+5c5288dfe5) — the win is the MEGA-fusion (rope+quant+store), not rope alone.
+The HIP megafusion already exists: aiter `indexer_qk_rope_quant_and_cache`
+behind `SGLANG_DSA_FUSE_INDEXER_QK` (built+validated byte-exact+GSM8K earlier),
+UNWIRED from decode because it was e2e-neutral on GLM-5.1's COLLECTIVE-bound
+decode. GLM-5.2 profile shows the indexer is now the RAW gap -> revisit here.
+
 ## PERF-OPT TODO — ranked (do in this order)
-1. **DSA Indexer fusion** (rope+quant / layernorm / hadamard / k-cache store / logits
-   gemm+mul / topk). Biggest lever (~15.5% of forward). Rope alone 9.16->~2us = 4x.
+1. **DSA Indexer fusion = bring the CUDA `_is_cuda`-gated fused indexer path to HIP**
+   (re-wire/validate the aiter `indexer_qk_rope_quant_and_cache` megafusion, +
+   the fused query rope+quant `SGLANG_DSA_FUSE_HADAMARD_QUANT`). Biggest lever
+   (~15.5%). NOT fused-rope-alone (known e2e-neutral). Gate on graph-on e2e A/B.
    (Profile used stock indexer; do NOT reprofile — build against these gaps directly.)
 2. **RowParallelLinear / bf16 GEMM efficiency** (12.85us) — write/select a better GEMM,
    not tuning.
