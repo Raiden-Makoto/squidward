@@ -64,9 +64,16 @@ overhead. Fix these first:
 - Indexer LayerNorm: ck_tile Layernorm2dFwd 5.51us vs B200 1.83us (3x). 128-dim.
 
 ## PERF-OPT TODO — ranked (do in this order)
-1. **Speed up the indexer RotaryEmbedding kernel** (9.16->~2us target). Investigate
-   why aiter kn_entry_2c_sbhd_cached_indirect_inplace is 4.2x slow for this shape
-   (occupancy / indirect gather / launch); replace or re-config. Gate on graph-on e2e A/B.
+1. **Speed up the indexer RotaryEmbedding kernel** (9.16->~2us target).
+   IMPLEMENTED (2b17289f12, RM/glm51): opt-in `SGLANG_DSA_FUSED_ROPE=1` routes the
+   indexer q/k rope through jit_kernel/rope.py `apply_rope_inplace` (hipified
+   rope.cuh, the same fast path B200 uses) instead of aiter's slow cached-rope.
+   gfx950-gated, handles interleaved (is_neox=False), covers _get_q_k_bf16 +
+   key-only _get_k_bf16. In-place semantics + attrs audited sound (matches prior
+   validated art 638563f0dc+92b0a8bb5a+e9265e78eb, reverted only b/c 5.1 was
+   collective-bound). PENDING box validation: byte-compare vs aiter rope +
+   GSM8K + graph-on A/B (run_glm5_ab.sh FEATURE_ENV="SGLANG_DSA_FUSED_ROPE=1").
+   (gbt box was DNS-unreachable 2026-07-03; rerun when back.)
 2. **Speed up the indexer LayerNorm kernel** (5.51->~2us target, ck_tile config).
 3. **RowParallelLinear / bf16 GEMM efficiency** (12.85us) — write/select a better GEMM,
    not tuning.
