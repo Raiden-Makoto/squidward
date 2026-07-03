@@ -96,10 +96,11 @@ individual kernels. Fix these first:
    - graph-ON e2e A/B (8192/1024 TP4, one at a time): NEUTRAL. ITL flat within
      noise at every concurrency (14.00->14.02, 16.41->16.38, 29.02->29.02),
      throughput within ~0.5%.
-   VERDICT: correct + faster-in-isolation but e2e-NEUTRAL -> the LayerNorm is NOT
-   on the decode critical path (overlapped, and ~1us is nothing vs the 14-29ms
-   step). The profile's 3x "gap" was CUDA-graph-off Sigma-dur, not a real e2e
-   opportunity. Leave default OFF. Do NOT pursue LayerNorm further. DONE.
+   VERDICT (measured only): correct + faster-in-isolation but e2e-NEUTRAL.
+   Leave default OFF. NOT re-profiled with the flag on, so the REASON for the
+   neutral e2e is unknown/unverified (could be off critical path, overlapped, or
+   the isolation win not materializing under graph) — do not claim a cause
+   without a graph-on profile. If pursuing further, re-profile first. DONE for now.
 3. **RowParallelLinear / bf16 GEMM efficiency** (12.85us) — write/select a better GEMM,
    not tuning.
 4. **AllReduce** (12.18->7.67us, 2.2x) — collective-bound, vendor kernel; harder.
