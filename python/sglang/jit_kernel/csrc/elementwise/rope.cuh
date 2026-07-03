@@ -46,11 +46,20 @@ constexpr auto next_pow2(uint32_t target, uint32_t factor = 1) {
   return power;
 }
 
-template <bool kIsNeox, int64_t kRopeDim, bool kUsePDL, typename DType, typename IdType, uint32_t kWorkThreads>
+template <
+    bool kIsNeox,
+    int64_t kRopeDim,
+    bool kUsePDL,
+    typename DType,
+    typename IdType,
+    uint32_t kWorkThreads,
+    typename CacheType = float>
 __global__ void fused_rope_kernel(const __grid_constant__ FusedRopeParams params) {
   using namespace device;
+  static_assert(kIsNeox ? std::is_same_v<CacheType, float> : true,
+                "bf16 cos_sin_cache is only supported for the interleaved (non-neox) path");
 
-  constexpr int64_t kCosSinStrideBytes = kRopeDim * sizeof(float);
+  constexpr int64_t kCosSinStrideBytes = kRopeDim * sizeof(CacheType);
   constexpr int64_t kVecSize = next_pow2(kRopeDim, (2 * kWorkThreads * (1 + kIsNeox)));
   using DType2 = packed_t<DType>;
   using InputStorage = AlignedVector<DType2, kVecSize>;
@@ -114,15 +123,15 @@ __global__ void fused_rope_kernel(const __grid_constant__ FusedRopeParams params
       store_as<InputStorage>(input_x, input_vec_x, lane_id);
       store_as<InputStorage>(input_y, input_vec_y, lane_id);
     } else {
-      using CacheStorage = AlignedVector<float, kVecSize>;
+      using CacheStorage = AlignedVector<CacheType, kVecSize>;
       auto input_vec = load_as<InputStorage>(input, lane_id);
       const auto cos_vec = load_as<CacheStorage>(cos_ptr, lane_id);
       const auto sin_vec = load_as<CacheStorage>(sin_ptr, lane_id);
 #pragma unroll
       for (int64_t j = 0; j < kVecSize; ++j) {
         const auto [x, y] = cast<fp32x2_t>(input_vec[j]);
-        const auto cos = cos_vec[j];
-        const auto sin = sin_vec[j];
+        const auto cos = static_cast<float>(cos_vec[j]);
+        const auto sin = static_cast<float>(sin_vec[j]);
         const auto out_x = x * cos - y * sin;
         const auto out_y = x * sin + y * cos;
         input_vec[j] = cast<DType2, fp32x2_t>({out_x, out_y});
@@ -247,7 +256,7 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <bool kIsNeox, int64_t kRopeDim, bool kUsePDL, typename DType>
+template <bool kIsNeox, int64_t kRopeDim, bool kUsePDL, typename DType, typename CacheType = float>
 struct FusedRopeKernel {
   static constexpr uint32_t kDimPerThread = std::gcd(16 / sizeof(DType), kRopeDim);
   static constexpr uint32_t kWorkThreads = next_pow2(kRopeDim, kDimPerThread);
@@ -256,7 +265,8 @@ struct FusedRopeKernel {
   static_assert(kBlockSize % kWorkThreads == 0);
 
   template <typename IdType>
-  static constexpr auto _kernel_0 = fused_rope_kernel<kIsNeox, kRopeDim, kUsePDL, DType, IdType, kWorkThreads>;
+  static constexpr auto _kernel_0 =
+      fused_rope_kernel<kIsNeox, kRopeDim, kUsePDL, DType, IdType, kWorkThreads, CacheType>;
   template <typename IdType>
   static constexpr auto _kernel_1 = fused_rope_store_kernel<kIsNeox, kRopeDim, kUsePDL, DType, IdType, kWorkThreads>;
 
@@ -293,7 +303,7 @@ struct FusedRopeKernel {
         .with_device(device)
         .verify(k);
     TensorMatcher({-1, D})  // cos_sin_cache
-        .with_dtype<float>()
+        .with_dtype<CacheType>()
         .with_device(device)
         .verify(cos_sin_cache);
     TensorMatcher({N})  // positions

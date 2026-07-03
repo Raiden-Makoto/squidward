@@ -27,8 +27,13 @@ def _jit_rotary_embedding_module() -> Module:
 
 
 @cache_once
-def _jit_fused_rope_module(is_neox: bool, rope_dim: int, dtype: torch.dtype) -> Module:
-    args = make_cpp_args(is_neox, rope_dim, is_arch_support_pdl(), dtype)
+def _jit_fused_rope_module(
+    is_neox: bool,
+    rope_dim: int,
+    dtype: torch.dtype,
+    cache_dtype: torch.dtype = torch.float32,
+) -> Module:
+    args = make_cpp_args(is_neox, rope_dim, is_arch_support_pdl(), dtype, cache_dtype)
     return load_jit(
         "fused_rope",
         *args,
@@ -127,13 +132,15 @@ def apply_rope_inplace(
         k: Key tensor of shape [num_tokens, num_kv_heads, rope_dim].
         cos_sin_cache: Cosine/sine cache of shape [max_position, rope_dim],
             where the first half along dim=-1 is cos and the second half is sin.
-            Must be float32.
+            float32, or bfloat16 for the interleaved (is_neox=False) path — a
+            bf16 cache halves this kernel's dominant memory traffic (the fp32
+            cache is ~2x the q/k bytes).
         positions: Position indices of shape [num_tokens], int32 or int64.
         is_neox: Whether to use GPT-NeoX style (True) or GPT-J interleaved style (False).
         rope_dim: Rotary embedding dimension. Defaults to cos_sin_cache.size(-1).
     """
     rope_dim = rope_dim or cos_sin_cache.size(-1)
-    module = _jit_fused_rope_module(is_neox, rope_dim, q.dtype)
+    module = _jit_fused_rope_module(is_neox, rope_dim, q.dtype, cos_sin_cache.dtype)
     module.run_rope(q, k, cos_sin_cache, positions)
 
 

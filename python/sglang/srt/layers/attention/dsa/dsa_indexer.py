@@ -68,6 +68,14 @@ _DSA_FUSE_HADAMARD_QUANT = get_bool_env_var("SGLANG_DSA_FUSE_HADAMARD_QUANT")
 # in the GLM-5.2 decode profile). gfx950; handles neox + interleaved via is_neox.
 # Enable with SGLANG_DSA_FUSED_ROPE=1.
 _DSA_FUSED_ROPE = get_bool_env_var("SGLANG_DSA_FUSED_ROPE")
+# For the fused-rope path, feed the JIT kernel a bf16 cos_sin cache (interleaved
+# path only). The fp32 cache is ~2x the q/k bytes and is this kernel's dominant
+# memory traffic; bf16 halves it (aiter's own rope already uses a bf16 cache, so
+# accuracy is unaffected). Default on; set SGLANG_DSA_FUSED_ROPE_BF16_CACHE=0 to
+# A/B against the fp32 cache.
+_DSA_FUSED_ROPE_BF16_CACHE = get_bool_env_var(
+    "SGLANG_DSA_FUSED_ROPE_BF16_CACHE", "true"
+)
 # Whether the aiter preshuffle paged-MQA path (page_size=64 + Preshuffle=True +
 # KVBlockSize=64) can be used. Falls back to the legacy page_size=1 / KVBlockSize=1
 # path when the gluon kernel is unavailable (Triton<3.5 and no AOT bundle).
@@ -849,13 +857,24 @@ class Indexer(MultiPlatformOp):
         # first half cos and the second half sin. Built once, lazily.
         if self._fused_rope_cos_sin is None:
             mp = self.rotary_emb.cos_cache.shape[0]
-            self._fused_rope_cos_sin = torch.cat(
-                [
-                    self.rotary_emb.cos_cache.reshape(mp, -1).float(),
-                    self.rotary_emb.sin_cache.reshape(mp, -1).float(),
-                ],
-                dim=-1,
-            ).contiguous()
+            # bf16 cache halves this kernel's dominant traffic; only valid for the
+            # interleaved (non-neox) path (the neox JIT kernel requires fp32).
+            cache_dtype = (
+                torch.bfloat16
+                if _DSA_FUSED_ROPE_BF16_CACHE and not self.rotary_emb.is_neox_style
+                else torch.float32
+            )
+            self._fused_rope_cos_sin = (
+                torch.cat(
+                    [
+                        self.rotary_emb.cos_cache.reshape(mp, -1),
+                        self.rotary_emb.sin_cache.reshape(mp, -1),
+                    ],
+                    dim=-1,
+                )
+                .to(cache_dtype)
+                .contiguous()
+            )
         return self._fused_rope_cos_sin
 
     @staticmethod
