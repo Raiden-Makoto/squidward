@@ -62,6 +62,12 @@ _is_gfx95_supported = is_gfx95_supported()
 # Opt-in: fuse the indexer query's hadamard (rotate_activation) + fp8 act_quant
 # into one Triton kernel (gfx950). Enable with SGLANG_DSA_FUSE_HADAMARD_QUANT=1.
 _DSA_FUSE_HADAMARD_QUANT = get_bool_env_var("SGLANG_DSA_FUSE_HADAMARD_QUANT")
+# Opt-in: route the indexer q/k RoPE through the portable sglang fused-rope JIT
+# kernel (jit_kernel/rope.py -> rope.cuh, hipified for gfx950) instead of aiter's
+# slower cached-rope (kn_entry_2c_sbhd_cached, ~4.2x slower vs the B200 fused_rope
+# in the GLM-5.2 decode profile). gfx950; handles neox + interleaved via is_neox.
+# Enable with SGLANG_DSA_FUSED_ROPE=1.
+_DSA_FUSED_ROPE = get_bool_env_var("SGLANG_DSA_FUSED_ROPE")
 # Whether the aiter preshuffle paged-MQA path (page_size=64 + Preshuffle=True +
 # KVBlockSize=64) can be used. Falls back to the legacy page_size=1 / KVBlockSize=1
 # path when the gluon kernel is unavailable (Triton<3.5 and no AOT bundle).
@@ -436,6 +442,13 @@ class Indexer(MultiPlatformOp):
             and self.head_dim == self.block_size
             and (self.head_dim & (self.head_dim - 1)) == 0
         )
+        # Opt-in fused-rope path (gfx950): replace aiter's cached-rope with the
+        # portable sglang fused-rope JIT kernel (matches the CUDA/B200 path, which
+        # also uses apply_rope_inplace). Handles both neox and interleaved (GLM-5.2
+        # uses interleaved, is_neox_style=False) via the is_neox arg. cos_sin_cache
+        # is lazily built as fp32 (what the kernel expects).
+        self.fused_rope = _DSA_FUSED_ROPE and _is_hip and _is_gfx95_supported
+        self._fused_rope_cos_sin = None
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
@@ -599,7 +612,22 @@ class Indexer(MultiPlatformOp):
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
 
-        q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+        if self.fused_rope:
+            from sglang.jit_kernel.rope import apply_rope_inplace
+
+            # q_rope [l,h,rope] and k_rope [l,rope] are views into query/key, so
+            # the in-place rotation updates them directly (k as [l,1,rope]). The
+            # guarded write-back below self-aliases and no-ops.
+            apply_rope_inplace(
+                q_rope,
+                k_rope.unsqueeze(1),
+                self._fused_rope_cos_sin_cache(),
+                positions,
+                is_neox=self.rotary_emb.is_neox_style,
+                rope_dim=self.rope_head_dim,
+            )
+        else:
+            q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
         self._update_rope_guarded(query[..., : self.rope_head_dim], q_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
@@ -661,7 +689,22 @@ class Indexer(MultiPlatformOp):
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
 
-        _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
+        if self.fused_rope:
+            from sglang.jit_kernel.rope import apply_rope_inplace
+
+            # Key-only rope: apply_rope_inplace mutates both q and k, so pass a
+            # throwaway clone as q and the real k_rope view ([l,1,rope]) as k.
+            k3 = k_rope.unsqueeze(1)
+            apply_rope_inplace(
+                k3.clone(),
+                k3,
+                self._fused_rope_cos_sin_cache(),
+                positions,
+                is_neox=self.rotary_emb.is_neox_style,
+                rope_dim=self.rope_head_dim,
+            )
+        else:
+            _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
         key = rotate_activation(key)
 
@@ -799,6 +842,21 @@ class Indexer(MultiPlatformOp):
 
         current_stream.wait_stream(self.alt_stream)
         return q_fp8, weights
+
+    def _fused_rope_cos_sin_cache(self) -> torch.Tensor:
+        # aiter's rope stores cos/sin separately as [max_pos, 1, 1, rope/2];
+        # apply_rope_inplace wants a single [max_pos, rope] fp32 cache with the
+        # first half cos and the second half sin. Built once, lazily.
+        if self._fused_rope_cos_sin is None:
+            mp = self.rotary_emb.cos_cache.shape[0]
+            self._fused_rope_cos_sin = torch.cat(
+                [
+                    self.rotary_emb.cos_cache.reshape(mp, -1).float(),
+                    self.rotary_emb.sin_cache.reshape(mp, -1).float(),
+                ],
+                dim=-1,
+            ).contiguous()
+        return self._fused_rope_cos_sin
 
     @staticmethod
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:
