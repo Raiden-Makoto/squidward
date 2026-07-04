@@ -96,12 +96,21 @@ individual kernels. Fix these first:
        32    -0.8%      +0.1%
        64    -0.7%      +1.2%
      = SAME ~1% as fp32-cache fused-rope -> bf16 cache is e2e-NEUTRAL vs fp32.
-     The bandwidth saving doesn't materialize because the rope kernel is
-     OCCUPANCY-bound at decode (bs=1 -> ~2 blocks on ~256 CUs; 17*T works,
-     needed_blocks=ceil(17T/16)), not bandwidth-bound. Kept default (harmless,
-     aiter-precision, lighter in theory) but it is NOT an additional decode win.
-     No more gains available in this kernel at decode: it's launch/occupancy
-     capped once aiter's slow gather is replaced. DONE.
+     Kept default (harmless, aiter-precision) but NOT an additional decode win.
+   - PROFILED (rocprofv3, real kernel GPU duration, HIP_VISIBLE_DEVICES=7):
+       T(bs)  blocks  fp32_ns  bf16_ns
+       1      2       1523     -
+       8      9       2388     -
+       64     68      2399     2378
+     Flat T=8->64 (8x work, same ~2.4us) = FIXED launch/overhead bound, NOT
+     compute or bandwidth. bf16==fp32 at kernel level confirms not bw-bound.
+     ~2.4us ~= B200 fused_rope 2.16us -> already at NV parity (aiter was 9.16us).
+     CONCLUSION (measured, not inferred): the rope kernel is at a ~2.4us fixed
+     launch/prologue floor at B200 parity. The residual is kernel-BOUNDARY
+     overhead (launch+PDL+prologue), not rope math. Only lever below this is
+     ELIMINATING the standalone launch (fuse rope into the adjacent quant/store,
+     a targeted 2-kernel fusion). No further gain from optimizing the rope
+     kernel itself. DONE.
 2. **Speed up the indexer LayerNorm kernel** (5.51->~2us target).
    IMPLEMENTED (8113ff1a58, RM/glm51): opt-in `SGLANG_DSA_JIT_LAYERNORM=1` routes
    true LayerNorm (mean+var+bias) through a portable warp/CTA JIT kernel
