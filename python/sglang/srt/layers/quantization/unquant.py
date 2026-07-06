@@ -180,6 +180,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 aiter_w8a8_block_fp8_linear,
             )
 
+            # The MLA forward pre-quantizes the activation (fused RMSNorm + FP8
+            # group-quant) and passes a (fp8_act, scale) tuple when the weight is
+            # FP8 — feed that straight into the CK GEMM via input_scale. Fall
+            # back to bf16 activation (kernel quantizes internally) otherwise.
+            if isinstance(x, tuple):
+                x_q, x_scale = x
+                return aiter_w8a8_block_fp8_linear(
+                    x_q,
+                    layer.weight,
+                    [128, 128],
+                    layer.weight_scale_inv,
+                    input_scale=x_scale,
+                    bias=bias,
+                )
             out = aiter_w8a8_block_fp8_linear(
                 x.view(-1, x.shape[-1]),
                 layer.weight,
