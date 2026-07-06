@@ -216,6 +216,26 @@ aiter_per1x128_quant). Gated by an opt-in flag, gfx950 + these excluded MLA
 projections only. Accuracy risk = bf16->FP8 weight + FP8 activation (ATOM ships
 these projections in FP8, so precedent it holds); verify GSM8K.
 
+RESULT (2026-07-06, SGLANG_DSA_FP8_PROJ_GEMM, e0d1a2f041): IMPLEMENTED +
+validated on box (gfx950). q_b_proj/o_proj bf16 -> FP8 e4m3 block repack at
+load (quant_weight_ue8m0 + shuffle_weight(16,16)); apply consumes the MLA
+forward's (fp8_act, scale) tuple via aiter_w8a8_block_fp8_linear. Standalone
+byte-compare cos>0.9994; GSM8K 1319 = 0.936 (no regression).
+graph-ON decode A/B (8192/1024 TP4) vs canonical bf16 baseline:
+    conc  itl_delta  tput_delta
+    2     +6.4%      -6.0%
+    4     +6.4%      -6.1%
+    8     +5.4%      -5.0%
+    16    +4.5%      -4.0%
+    32    +2.5%      -2.5%
+VERDICT: REGRESSION at decode (2.5-6% slower). Structural: decode projection
+GEMMs are small-M (M=batch) -> latency/memory-bound, not compute-bound; FP8's
+throughput edge needs large M, and the activation-quant overhead exceeds the
+tiny bf16 GEMM saving. Gap shrinks as concurrency (M) grows -> FP8 projections
+are a PREFILL/large-M lever, not a decode lever. DO NOT enable for decode.
+Code + flag left in tree (default off). ATOM's ~20% FP8 edge does not transfer
+to GLM-5.2 decode via dense-projection FP8.
+
 WHAT TO COPY FROM ATOM (ROCm/ATOM):
 - atom/model_ops/linear.py — LinearBase quantized-linear dispatch (selects
   gemm_a8w8_blockscale_bpreshuffle, weight/scale layout). Mirror the wiring.
