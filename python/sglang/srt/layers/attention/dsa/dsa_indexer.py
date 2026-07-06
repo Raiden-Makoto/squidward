@@ -1904,13 +1904,17 @@ class Indexer(MultiPlatformOp):
 
         elif (
             self.fuse_indexer_qk
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
             and not in_piecewise_or_breakable_cuda_graph
             and forward_batch.attn_cp_metadata is None
             and not enable_dual_stream
             and not weights_proj_lora
             and not isinstance(x, tuple)
         ):
-            # Increment 1: eager/prefill only (graph-decode handled separately).
+            # Increment 1: eager prefill/extend only (not graph-captured);
+            # decode/verify/draft (CUDA-graph) still use the fragmented path.
             q_fp8, weights = self._fused_indexer_qk_prepare_and_store(
                 q_lora, x, positions, forward_batch, layer_id
             )
