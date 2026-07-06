@@ -67,6 +67,13 @@ _DSA_FUSE_HADAMARD_QUANT = get_bool_env_var("SGLANG_DSA_FUSE_HADAMARD_QUANT")
 # in the GLM-5.2 decode profile). gfx950; handles neox + interleaved via is_neox.
 # Enable with SGLANG_DSA_FUSED_ROPE=1.
 _DSA_FUSED_ROPE = get_bool_env_var("SGLANG_DSA_FUSED_ROPE")
+# Opt-in (gfx950): fuse the indexer q/k rope + k-norm + fp8 quant + index-K cache
+# store into aiter's indexer_qk_rope_quant_and_cache (ONE kernel), matching ATOM
+# (ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION). Collapses the fragmented rope +
+# act_quant + k_quant_and_cache (+ k-norm) kernels. Supersedes SGLANG_DSA_FUSED_
+# ROPE + SGLANG_DSA_FUSE_HADAMARD_QUANT on the flag-on path. Enable with
+# SGLANG_DSA_FUSE_INDEXER_QK=1.
+_DSA_FUSE_INDEXER_QK = get_bool_env_var("SGLANG_DSA_FUSE_INDEXER_QK")
 # For the fused-rope path, feed the JIT kernel a bf16 cos_sin cache (interleaved
 # path only). The fp32 cache is ~2x the q/k bytes and is this kernel's dominant
 # memory traffic; bf16 halves it (aiter's own rope already uses a bf16 cache, so
@@ -93,6 +100,13 @@ if _is_cuda:
 
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
+
+    try:
+        from aiter import indexer_qk_rope_quant_and_cache
+    except ImportError:
+        indexer_qk_rope_quant_and_cache = None
+else:
+    indexer_qk_rope_quant_and_cache = None
 
 if is_npu():
     import torch_npu
@@ -461,6 +475,16 @@ class Indexer(MultiPlatformOp):
         # is lazily built as fp32 (what the kernel expects).
         self.fused_rope = _DSA_FUSED_ROPE and _is_hip and _is_gfx95_supported
         self._fused_rope_cos_sin = None
+        # Opt-in (gfx950): fuse q/k rope + k-norm + quant + index-K store into one
+        # aiter kernel (indexer_qk_rope_quant_and_cache). Supersedes fused_rope +
+        # hadamard-quant on the flag-on path.
+        self.fuse_indexer_qk = (
+            _DSA_FUSE_INDEXER_QK
+            and _is_hip
+            and _is_gfx95_supported
+            and not self.use_dsa_indexer_fusion
+            and indexer_qk_rope_quant_and_cache is not None
+        )
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
@@ -570,6 +594,58 @@ class Indexer(MultiPlatformOp):
             max_kv_len = forward_batch.seq_lens_cpu.max().item()
             return max_kv_len <= self.index_topk
         return False
+
+    def _fused_indexer_qk_prepare_and_store(
+        self,
+        q_lora: torch.Tensor,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+    ):
+        # One aiter kernel: q/k rope + k-norm + fp8 quant + index-K cache store
+        # (ATOM's indexer_qk_rope_quant_and_cache). Returns q_fp8 [L,H,D] and the
+        # fully-scaled weights [L,H,1]; writes the FP8 index-K cache in place.
+        query, _ = self.wq_b(q_lora)
+        query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
+        key, _ = self.wk(x)
+        weights, _ = self.weights_proj(x)
+        q_fp8 = torch.empty_like(query, dtype=fp8_dtype)
+        weights_out = torch.empty(
+            weights.shape, device=weights.device, dtype=torch.float32
+        )
+        pool = get_token_to_kv_pool()
+        page_size = pool.page_size
+        kv_cache = (
+            pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            .view(-1, page_size, 132)
+            .view(fp8_dtype)
+        )
+        out_loc = forward_batch.out_cache_loc
+        if not out_loc.is_contiguous():
+            out_loc = out_loc.contiguous()
+        weights_scale = self.n_heads**-0.5 * self.softmax_scale
+        indexer_qk_rope_quant_and_cache(
+            query,
+            q_fp8,
+            weights,
+            weights_out,
+            key,
+            kv_cache,
+            out_loc,
+            self.k_norm.weight,
+            self.k_norm.bias,
+            positions,
+            self.rotary_emb.cos_cache,
+            self.rotary_emb.sin_cache,
+            self.k_norm.variance_epsilon,
+            self.block_size,
+            self.scale_fmt,
+            weights_scale,
+            preshuffle=_use_aiter_preshuffle,
+            is_neox=self.rotary_emb.is_neox_style,
+        )
+        return q_fp8, weights_out.unsqueeze(-1)
 
     def _get_q_k_bf16(
         self,
@@ -1826,6 +1902,18 @@ class Indexer(MultiPlatformOp):
             )
             return maybe_capture_indexer_topk(layer_id, result)
 
+        elif (
+            self.fuse_indexer_qk
+            and not in_piecewise_or_breakable_cuda_graph
+            and forward_batch.attn_cp_metadata is None
+            and not enable_dual_stream
+            and not weights_proj_lora
+            and not isinstance(x, tuple)
+        ):
+            # Increment 1: eager/prefill only (graph-decode handled separately).
+            q_fp8, weights = self._fused_indexer_qk_prepare_and_store(
+                q_lora, x, positions, forward_batch, layer_id
+            )
         elif enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
