@@ -485,6 +485,12 @@ class Indexer(MultiPlatformOp):
             and not self.use_dsa_indexer_fusion
             and indexer_qk_rope_quant_and_cache is not None
         )
+        # Lazily-built [max_pos, rope/2] on-device cos/sin for the fused indexer
+        # kernel (aiter stores them 4D as [max_pos, 1, 1, rope/2], and only
+        # migrates them to GPU inside rotary_emb.forward, which the fused path
+        # bypasses).
+        self._fused_indexer_cos_2d = None
+        self._fused_indexer_sin_2d = None
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
@@ -625,6 +631,7 @@ class Indexer(MultiPlatformOp):
         if not out_loc.is_contiguous():
             out_loc = out_loc.contiguous()
         weights_scale = self.n_heads**-0.5 * self.softmax_scale
+        cos_2d, sin_2d = self._fused_indexer_cos_sin_2d(query.device)
         indexer_qk_rope_quant_and_cache(
             query,
             q_fp8,
@@ -636,8 +643,8 @@ class Indexer(MultiPlatformOp):
             self.k_norm.weight,
             self.k_norm.bias,
             positions,
-            self.rotary_emb.cos_cache,
-            self.rotary_emb.sin_cache,
+            cos_2d,
+            sin_2d,
             self.k_norm.variance_epsilon,
             self.block_size,
             self.scale_fmt,
@@ -955,6 +962,21 @@ class Indexer(MultiPlatformOp):
                 .contiguous()
             )
         return self._fused_rope_cos_sin
+
+    def _fused_indexer_cos_sin_2d(self, device: torch.device):
+        # aiter's indexer_qk_rope_quant_and_cache wants cos/sin as
+        # [max_pos, rope/2] on the query's device; the rope wrapper keeps them
+        # 4D ([max_pos, 1, 1, rope/2]) and only migrates them to GPU inside
+        # forward (which this fused path skips). Reshape + move once.
+        if self._fused_indexer_cos_2d is None:
+            mp = self.rotary_emb.cos_cache.shape[0]
+            self._fused_indexer_cos_2d = (
+                self.rotary_emb.cos_cache.reshape(mp, -1).to(device).contiguous()
+            )
+            self._fused_indexer_sin_2d = (
+                self.rotary_emb.sin_cache.reshape(mp, -1).to(device).contiguous()
+            )
+        return self._fused_indexer_cos_2d, self._fused_indexer_sin_2d
 
     @staticmethod
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:
