@@ -228,13 +228,18 @@ graph-ON decode A/B (8192/1024 TP4) vs canonical bf16 baseline:
     8     +5.4%      -5.0%
     16    +4.5%      -4.0%
     32    +2.5%      -2.5%
-VERDICT: REGRESSION at decode (2.5-6% slower). Structural: decode projection
-GEMMs are small-M (M=batch) -> latency/memory-bound, not compute-bound; FP8's
-throughput edge needs large M, and the activation-quant overhead exceeds the
-tiny bf16 GEMM saving. Gap shrinks as concurrency (M) grows -> FP8 projections
-are a PREFILL/large-M lever, not a decode lever. DO NOT enable for decode.
-Code + flag left in tree (default off). ATOM's ~20% FP8 edge does not transfer
-to GLM-5.2 decode via dense-projection FP8.
+VERDICT: REGRESSION across the board on the e2e_glm5.sh sweep. ITL +2.5..6.4%
+AND TTFT also worse (e.g. c=4 1221->1452, c=32 6623->7226) -> not a decode win
+and not a prefill/TTFT win either, for these GLM-5.2 projection shapes on
+gfx950 (the aiter CK FP8 GEMM + fused fp8 act-quant does not beat the bf16
+tgemm here). DO NOT enable. Code + flag left in tree (default off). ATOM's ~20%
+FP8 edge does not transfer to GLM-5.2 via dense-projection FP8 at our operating
+points.
+
+BENCHMARK DISCIPLINE: the ONLY perf measurement is utilities/e2e_glm5.sh (one
+server at a time, canonical config). Its table already carries TTFT (prefill/
+large-M), TPOT/ITL (decode), and throughput. Do NOT invent bench_serving
+variants or "prefill A/B" runs.
 
 WHAT TO COPY FROM ATOM (ROCm/ATOM):
 - atom/model_ops/linear.py — LinearBase quantized-linear dispatch (selects
