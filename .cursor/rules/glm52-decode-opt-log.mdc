@@ -203,14 +203,18 @@ for its dense projections.
 OUT OF SCOPE (colleague's territory — do NOT touch): GLM MLA absorbed bmm in
 fp8 (w_kc/w_vc), and switching decode to the aiter fp8 MLA decode kernel.
 
-FORMAT BRIDGE (MXFP4 weight -> FP8 GEMM): our checkpoint stores the projections
-in MXFP4; ATOM's are already FP8, so ATOM has no bridge to copy — we build it.
-Bridge A (chosen): load-time repack MXFP4 weight -> FP8 e4m3 (dequant_mxfp4 ->
-requant, regroup block scales 32 -> 128), quantize activations bf16 -> FP8 at
-runtime, call the existing CK GEMM. Doubles VRAM only on these (small)
-projection weights; accuracy-safe (FP8 e4m3 strictly more precise than the FP4
-it came from). Bridge B (keep FP4 weight, w4a8 mixed GEMM) avoids the memory
-cost but needs a gfx950 w4a8 kernel that isn't wired — deferred.
+FORMAT (verified from amd/GLM-5.2-MXFP4 config.json): the MLA dense projections
+(q_a_proj, q_b_proj, kv_a_proj_with_mqa, kv_b_proj, o_proj) are in the quark
+`exclude` list for EVERY layer -> stored BF16, run via UnquantizedLinearMethod
+-> tgemm.mm (hgemm_bf16). Only the MoE experts are fp4. So there is NO
+MXFP4->FP8 bridge: the weights are already bf16.
+PLAN: at load (process_weights_after_loading), block-quant the bf16 projection
+weight -> FP8 e4m3 + 128x128 UE8M0 scales (fp8_utils.quant_weight_ue8m0) +
+shuffle_weight for bpreshuffle; stash on layer. At apply, route through
+aiter_w8a8_block_fp8_linear (activations quantized to FP8 at runtime via
+aiter_per1x128_quant). Gated by an opt-in flag, gfx950 + these excluded MLA
+projections only. Accuracy risk = bf16->FP8 weight + FP8 activation (ATOM ships
+these projections in FP8, so precedent it holds); verify GSM8K.
 
 WHAT TO COPY FROM ATOM (ROCm/ATOM):
 - atom/model_ops/linear.py — LinearBase quantized-linear dispatch (selects

@@ -33,6 +33,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
+    is_gfx95_supported,
     is_hip,
     is_npu,
     set_weight_attrs,
@@ -53,6 +54,20 @@ _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_gfx95_supported = is_gfx95_supported()
+# Opt-in (gfx950): run bf16 dense projections that carry a `_fp8_proj_gemm`
+# marker (the quark-excluded GLM-5.2 MLA q_a/q_b/o_proj) on the aiter FP8 CK GEMM
+# instead of the bf16 tgemm. Load-time block-quant bf16 -> FP8 e4m3 + 128x128
+# scale (+ bpreshuffle); activations quantized to FP8 at apply. Default off.
+_DSA_FP8_PROJ_GEMM = get_bool_env_var("SGLANG_DSA_FP8_PROJ_GEMM")
+
+
+def _fp8_proj_gemm_enabled(layer: torch.nn.Module) -> bool:
+    return (
+        _DSA_FP8_PROJ_GEMM
+        and _is_gfx95_supported
+        and getattr(layer, "_fp8_proj_gemm", False)
+    )
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -126,8 +141,33 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _fp8_proj_gemm_enabled(layer):
+            self._repack_bf16_to_fp8_block(layer)
+            return
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+
+    @staticmethod
+    def _repack_bf16_to_fp8_block(layer: torch.nn.Module) -> None:
+        # Block-quant a bf16 dense projection weight to FP8 e4m3 (+128x128 UE8M0
+        # scale), matching the aiter CK bpreshuffle w8a8-block path. Validated on
+        # gfx950: CK output matches the torch block-fp8 reference to cos>0.9994.
+        from aiter.ops.shuffle import shuffle_weight
+
+        from sglang.srt.layers.quantization.fp8_utils import (
+            _use_aiter_bpreshuffle_gfx95,
+            quant_weight_ue8m0,
+        )
+
+        w = layer.weight.data
+        if w.dtype != torch.bfloat16 or w.dim() != 2:
+            return
+        fp8_w, w_scale = quant_weight_ue8m0(w, [128, 128])
+        if _use_aiter_bpreshuffle_gfx95:
+            fp8_w = shuffle_weight(fp8_w, (16, 16))
+        layer.weight = Parameter(fp8_w.contiguous(), requires_grad=False)
+        layer.weight_scale_inv = Parameter(w_scale.contiguous(), requires_grad=False)
+        layer._fp8_proj_ready = True
 
     def apply(
         self,
@@ -135,6 +175,21 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if getattr(layer, "_fp8_proj_ready", False):
+            from sglang.srt.layers.quantization.fp8_utils import (
+                aiter_w8a8_block_fp8_linear,
+            )
+
+            out = aiter_w8a8_block_fp8_linear(
+                x.view(-1, x.shape[-1]),
+                layer.weight,
+                [128, 128],
+                layer.weight_scale_inv,
+                input_scale=None,
+                bias=bias,
+            )
+            return out.view(*x.shape[:-1], -1)
+
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:
