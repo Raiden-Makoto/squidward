@@ -249,3 +249,26 @@ WHAT TO COPY FROM ATOM (ROCm/ATOM):
 - ref map: atom/docs/model_ops_guide.md.
 The aiter GEMM kernel itself is already available (fp8_utils.py); copy the
 dispatch/quant wiring, not the kernel. The MXFP4->FP8 repack is ours to write.
+
+## DSA indexer fusion (2026-07-06) — the AttentionMLA lever that is OURS
+Profile (GLM(GLM5.csv): AttentionMLA is the only real gap (15.5% overall).
+Colleague owns the absorbed bmm + the fp8 MLA decode kernel; the part that is
+OURS is the DSA indexer's fragmented kernels. On HIP/gfx950 the indexer runs
+these SEPARATELY (profile, per layer): rope 9.16 + act_quant 5.78 +
+indexer_k_quant_and_cache 5.80 + k-LayerNorm 5.51 (~26us) — because the fused
+indexer mega-kernels (fused_q_indexer_rope_first_quant / fused_k_indexer_norm_
+rope[_store]) are gated `if _is_cuda:` (dsa_indexer.py:166), NVIDIA-only.
+
+LEVER: aiter's `indexer_qk_rope_quant_and_cache` fuses q-rope + q-fp8-quant +
+k-norm + k-rope + k-fp8-quant + cache-store + weights-scale into ONE kernel.
+CONFIRMED available in our aiter on the box (HAS_FUSED=True). ATOM enables it by
+default on gfx950 (ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION=1). ATOM call
+(atom/plugin/sglang/attention_backend/sparse_mla_indexer.py):
+  indexer_qk_rope_quant_and_cache(q_bf16, q_fp8, weights, weights_out, k,
+    kv_cache, slot_mapping, k_norm_weight, k_norm_bias, positions, cos_cache,
+    sin_cache, k_norm_eps, quant_block_size, scale_fmt, weights_scale,
+    preshuffle=preshuffle_cache, is_neox=is_neox_style)
+PLAN: wire this into the indexer q/k prepare+store behind a flag (gfx950),
+replacing the fragmented rope/norm/quant/store; validate byte-exact + GSM8K +
+e2e_glm5.sh (TTFT + TPOT + throughput). Supersedes the standalone fused-rope +
+FUSE_HADAMARD_QUANT (they become subsets of this one kernel).
