@@ -272,3 +272,22 @@ PLAN: wire this into the indexer q/k prepare+store behind a flag (gfx950),
 replacing the fragmented rope/norm/quant/store; validate byte-exact + GSM8K +
 e2e_glm5.sh (TTFT + TPOT + throughput). Supersedes the standalone fused-rope +
 FUSE_HADAMARD_QUANT (they become subsets of this one kernel).
+
+STATUS (2026-07-06, SGLANG_DSA_FUSE_INDEXER_QK, 2bfda65396):
+- Increment 1 (eager EXTEND/prefill only; decode+graph still fragmented):
+  `_fused_indexer_qk_prepare_and_store` calls aiter indexer_qk_rope_quant_and_cache
+  with the ATOM arg order. gfx950-gated, default off, fallback preserved.
+- Correct on SHORT prefill: GSM8K 400 = 0.943 (no regression). The rope_head_dim
+  worry was unfounded — kernel handles it.
+- BUT CRASHES on large-context prefill: e2e_glm5.sh (input 8192) aborts the
+  scheduler with a fatal signal inside the kernel on the big extend batch (short
+  GSM8K prefills are fine). Root cause TBD — likely the extend/large-M prefill
+  shape or slot_mapping/positions layout; ATOM's PREFILL path actually uses a
+  DIFFERENT sequence (top_k_per_row_prefill + cp_gather_indexer_k_quant_cache),
+  not the same decode-style call — our wiring reused the decode-style call for
+  prefill. NOTE the profile gap is at DECODE, so the real win needs increment 2
+  (graph decode) anyway; increment 1 only proves the kernel call.
+- NEXT: either (a) restrict fused path to the decode-shaped extend and match
+  ATOM's prefill sequence for big extends, or (b) skip prefill and go straight
+  to increment 2 (graph-captured decode), which is where the 15.5% lever is.
+  Flag default-off so main is unaffected.
