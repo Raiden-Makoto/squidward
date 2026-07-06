@@ -192,3 +192,31 @@ individual kernels. Fix these first:
    allreduce (2-stage / quantized), not this fusion. DONE (rejected for prod).
 5. **Cross-stream overlap** (MI355X 1.00x vs B200 1.33x) — structural; only after 1-4.
 6. Core `main_kernel` — already competitive; DO NOT prioritize.
+
+## GEMM optimization (2026-07-06)
+WHAT WE ARE WORKING ON: run GLM-5.2-MXFP4's dense projection linears — o_proj,
+q_a, q_b — on the FP8 GEMM instead of bf16. They currently run hgemm_bf16
+(MXFP4 weight dequant -> bf16, bf16 GEMM); route them onto the aiter FP8 CK
+GEMM `gemm_a8w8_blockscale_bpreshuffle` (already in fp8_utils.py) that ATOM uses
+for its dense projections.
+
+OUT OF SCOPE (colleague's territory — do NOT touch): GLM MLA absorbed bmm in
+fp8 (w_kc/w_vc), and switching decode to the aiter fp8 MLA decode kernel.
+
+FORMAT BRIDGE (MXFP4 weight -> FP8 GEMM): our checkpoint stores the projections
+in MXFP4; ATOM's are already FP8, so ATOM has no bridge to copy — we build it.
+Bridge A (chosen): load-time repack MXFP4 weight -> FP8 e4m3 (dequant_mxfp4 ->
+requant, regroup block scales 32 -> 128), quantize activations bf16 -> FP8 at
+runtime, call the existing CK GEMM. Doubles VRAM only on these (small)
+projection weights; accuracy-safe (FP8 e4m3 strictly more precise than the FP4
+it came from). Bridge B (keep FP4 weight, w4a8 mixed GEMM) avoids the memory
+cost but needs a gfx950 w4a8 kernel that isn't wired — deferred.
+
+WHAT TO COPY FROM ATOM (ROCm/ATOM):
+- atom/model_ops/linear.py — LinearBase quantized-linear dispatch (selects
+  gemm_a8w8_blockscale_bpreshuffle, weight/scale layout). Mirror the wiring.
+- atom/model_ops/quant_v4.py — activation -> FP8 quant feeding the GEMM.
+- atom/models/deepseek_v4.py / deepseek_v2.py — how those linears wire in.
+- ref map: atom/docs/model_ops_guide.md.
+The aiter GEMM kernel itself is already available (fp8_utils.py); copy the
+dispatch/quant wiring, not the kernel. The MXFP4->FP8 repack is ours to write.
