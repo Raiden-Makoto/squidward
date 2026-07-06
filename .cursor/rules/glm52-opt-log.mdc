@@ -1,13 +1,13 @@
 ---
-description: GLM-5.2-MXFP4 decode optimization log on gfx950 (MI355X). Decode profile vs B200, ranked perf-opt TODO, and results. Read before profiling or optimizing GLM-5.2 decode.
+description: GLM-5.2-MXFP4 optimization log on gfx950 (MI355X). Profile vs B200, ranked perf-opt TODO, and results. Read before optimizing GLM-5.2.
 alwaysApply: false
 ---
 
-# GLM-5.2-MXFP4 decode perf-opt (gfx950 / MI355X)
+# GLM-5.2-MXFP4 perf-opt (gfx950 / MI355X)
 
-## Profile (2026-07-01)
-`utilities/glm52_decode_prof_0701.csv` — GLM-5.2 decode, in1024/out1024, conc4, TP0,
-graph-ON Σdur; MI355X mxfp4 vs B200 nvfp4.
+## Profile
+`utilities/GLM(GLM5.csv` — GLM-5.2 in1024/out1024, conc4, TP0, graph-ON Σdur;
+MI355X mxfp4 vs B200 nvfp4.
 
 CAVEAT: this MI355X run did NOT use our faster Triton DSA prefill/indexer kernel
 (`SGLANG_DSA_TRITON_PREFILL`) — it is the stock tilelang/aiter indexer path, so the
