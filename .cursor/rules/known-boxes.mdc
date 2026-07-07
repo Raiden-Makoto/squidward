@@ -20,14 +20,30 @@ several containers on different branches.
 - Container `dsv4`, image `rocm/sgl-dev:...-rocm720-mi30x-...`
 - This is the fp8 **e4m3fnuz** box (the gfx942 fp8 fixes target this arch).
 
-## gbt box — gfx950 / CDNA4 (MI350X/MI355X, mi35x)  ← THE GLM-5.1 BOX
+## gbt box — gfx950 / CDNA4 (MI350X/MI355X, mi35x)  ← A GLM-5.2 BOX
 - Host: `gbt350-odcdh2-b13-1.png-odc.dcgpu`
-- **GLM-5.1 work runs in the `glm5` container** (NOT `dsv4`): fork on branch
-  `RM/glm51`, image `rocm/sgl-dev:v0.5.13.post1-rocm720-mi35x-20260618`, GLM-5.1-MXFP4
+- **GLM-5.2 work runs in the `glm5` container** (NOT `dsv4`): fork on branch
+  `RM/glm51`, image `rocm/sgl-dev:v0.5.14-rocm720-mi35x-20260706`, GLM-5.2-MXFP4
   server on port 8552 (`docker exec glm5 bash -lc "..."`).
-- The `dsv4` container on this same box is a DIFFERENT workstream (branch
-  `gfx950-fp8-unified-kv-main`, no GLM server) — do not use it for GLM-5.1.
+- Container config: `/dev/kfd`+`/dev/dri`, `--ipc=host --shm-size=64g --network=host`,
+  `--cap-add SYS_PTRACE`, `--group-add video render`, `--security-opt seccomp=unconfined
+  --security-opt label=disable`, `-v /home/macui/hf_home:/root/hf_home`,
+  `-v /home/macui/spongebob:/sgl-workspace/squidward`, `-e HF_HOME=/root/hf_home`.
 - This is the fp8 **e4m3fn** box (gfx950). Our gfx942 fixes are arch-gated, so gfx950 is unaffected.
+
+## smci355 box — gfx950 / CDNA4 (MI355X, mi35x)  ← A GLM-5.2 BOX
+- Host: `smci355-ccs-aus-n06-05.cs-aus.dcgpu`
+- **GLM-5.2 work runs in the `glm5` container**: fork on branch `RM/glm51`, image
+  `rocm/sgl-dev:v0.5.14-rocm720-mi35x-20260706`, server on port 8552.
+- Container config mirrors the gbt `glm5` box (same devices/ipc/shm/net/caps/groups/
+  secopt/env), but host source paths differ:
+  `-v /mnt/dcgpuval/huggingface:/root/hf_home` (GLM-5.2-MXFP4 model lives on the shared
+  NFS `/mnt/dcgpuval`, ~410G, snapshot `386bd0e4ec821f7b07975701cec3c3b953a5576a`; no
+  local download) and `-v /home/macui/squidward:/sgl-workspace/squidward`.
+- SHARED, MULTI-TENANT box: many other users' containers run here (`torch_*`, `verl`,
+  `xiangxli_dev`, etc.) and grab GPUs; the root fs runs near-full (98%), so images/clones
+  must be sized carefully. Do NOT disturb other tenants' containers.
+- fp8 **e4m3fn** (gfx950).
 
 Follow `remote-box-rules.mdc` for all box-safety constraints (no upstream edits, no pip install,
 box never ahead of local, no git-state changes without explicit instruction, etc.).
