@@ -47,3 +47,9 @@
 | DSA indexer topk | 22 | 31 |
 | DSA indexer logits | 11 (deep_gemm) | 29 (_gluon_fp8_mqa_logits) |
 | RMSNorm(+quant) | 38 | 43 |
+
+## Optimization status
+
+| target | MI355X vs B200 | status |
+|---|---|---|
+| DSA indexer logits (`_gluon_fp8_mqa_logits`) | 29 vs 11 ms | Closed — hardware gap. Both materialize full [q x k] logits; deep_gemm wins via Blackwell tcgen05 UMMA + TMEM accumulators + TMA vs gfx950 MFMA + register accum. gfx950 gluon already beats non-gluon (0.349 vs 0.836 ms) and is near the CDNA4 ceiling; no software lever. |
