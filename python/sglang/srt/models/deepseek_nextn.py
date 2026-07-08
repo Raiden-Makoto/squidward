@@ -287,6 +287,23 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         },
     )
 
+    def _resolve_nextn_quant_config(self, config, quant_config):
+        if quant_config is None or quant_config.get_name() != "quark":
+            return quant_config
+
+        from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
+
+        # Probe a concrete excluded sub-module (eh_proj) rather than the bare
+        # layer prefix: the quark `exclude` list is keyed on full module names
+        # (e.g. "model.layers.78.eh_proj"), and should_ignore_layer does an
+        # exact/regex match, so the bare "model.layers.78" never matches and the
+        # whole-MTP-excluded case (GLM-5.2-MXFP4: layer N kept bf16) was missed.
+        ckpt_prefix = f"model.layers.{config.num_hidden_layers}.eh_proj"
+        mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
+        if should_ignore_layer(mapped_prefix, quant_config.exclude_layers):
+            return None
+        return quant_config
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -310,22 +327,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             self.cp_rank = None
             self.cp_size = None
 
-        nextn_quant_config = quant_config
-        # For quark, if the MTP layer is listed in exclude_layers, set quant_config to None.
-        if nextn_quant_config is not None and nextn_quant_config.get_name() == "quark":
-            from sglang.srt.layers.quantization.quark.utils import (
-                should_ignore_layer,
-            )
-
-            # Probe a concrete excluded sub-module (eh_proj) rather than the bare
-            # layer prefix: the quark `exclude` list is keyed on full module names
-            # (e.g. "model.layers.78.eh_proj"), and should_ignore_layer does an
-            # exact/regex match, so the bare "model.layers.78" never matches and the
-            # whole-MTP-excluded case (GLM-5.2-MXFP4: layer N kept bf16) was missed.
-            ckpt_prefix = f"model.layers.{config.num_hidden_layers}.eh_proj"
-            mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
-            if should_ignore_layer(mapped_prefix, nextn_quant_config.exclude_layers):
-                nextn_quant_config = None
+        nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
 
         self.model = DeepseekModelNextN(
             config, nextn_quant_config, prefix=add_prefix("model", prefix)
