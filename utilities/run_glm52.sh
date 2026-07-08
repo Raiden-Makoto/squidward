@@ -5,7 +5,6 @@ export PYTHONPATH=/sgl-workspace/squidward/python:${PYTHONPATH}
 MODEL=${HF_HOME:-/root/hf_home}/hub/models--amd--GLM-5.2-MXFP4/snapshots/386bd0e4ec821f7b07975701cec3c3b953a5576a
 
 export SAFETENSORS_FAST_GPU=1
-export SGLANG_DSA_TRITON_PREFILL=1
 export SGLANG_ROCM_FUSED_DECODE_MLA=0
 export SGLANG_DSA_TRITON_PREFILL=0
 unset ROCM_QUICK_REDUCE_QUANTIZATION

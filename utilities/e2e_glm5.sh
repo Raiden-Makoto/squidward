@@ -22,10 +22,7 @@ ENABLE_PROFILE=${3:-0}   # 1 = enable profile, 0 = disable
 # PORT is configurable so the sweep can target either server when running two
 # TP4 servers at once (e.g. baseline on 8552, flag-on on 8553 via run_glm5_ab.sh).
 PORT=${PORT:-8552}
-# Leading "2" is duplicated on purpose: the first run pays JIT/compile + warmup
-# and each point is averaged over only (concurrency*4) prompts, so the first
-# c=2 is heavily skewed and discarded; the second c=2 is the real measurement.
-CONCURRENCY=${CONCURRENCY:-"2 2 4 8 16 32 64"}
+CONCURRENCY=${CONCURRENCY:-"4 4 8 16 32 64"}
 
 # ===== Output directory (override with OUT_DIR=...) =====
 OUT_DIR=${OUT_DIR:-/sgl-workspace/squidward/results/glm5-bench}
