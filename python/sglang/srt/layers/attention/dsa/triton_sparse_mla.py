@@ -29,9 +29,9 @@ def _prune_configs(configs, named_args, **kwargs):
 # (a one-time stall on the first prefill of each new shape), then cached.
 _AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_N": bn}, num_warps=w, num_stages=ns)
-    for bn in (32, 64, 128)
+    for bn in (32, 64, 128, 256)
     for w in (1, 2, 4)
-    for ns in (1, 2)
+    for ns in (1, 2, 3, 4)
 ]
 
 
