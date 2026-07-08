@@ -46,7 +46,10 @@ def _cdna_version(target=None):
 
 @gluon.constexpr_function
 def _mfma_instr_k(ebw, target=None):
-    kbits = 128 if _cdna_version(target) == 3 else 256
+    v = _cdna_version(target)
+    if ebw == 8:  # fp8: CDNA4 32x32x64 / CDNA3 32x32x16
+        return 64 if v == 4 else 16
+    kbits = 128 if v == 3 else 256
     return kbits // ebw
 
 
