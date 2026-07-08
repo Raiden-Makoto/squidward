@@ -68,6 +68,9 @@ def _gluon_sparse_mla_fwd_kernel(
     n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, dot_b_layout))
     # BLOCK_N mask in the mfma column layout for qk masking / softmax
     n_m = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
+    # V load (pv operand-b): row=BLOCK_N (K, dim0), col=D_V (N, dim1)
+    n_vk = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, dot_b_layout))
+    dv_vn = gl.arange(0, D_V, layout=gl.SliceLayout(0, dot_b_layout))
     for k0 in range(0, topk, BLOCK_N):
         idx = gl.load(idx_ptr + s_i * topk + k0 + n, mask=(k0 + n) < topk, other=-1)
         valid = idx >= 0
@@ -103,12 +106,22 @@ def _gluon_sparse_mla_fwd_kernel(
         p = gl.exp(qk - m_safe[:, None])
         l_i = l_i * alpha + gl.sum(p, axis=1)
 
-        # pv: p [H, BLOCK_N] @ v [BLOCK_N, D_V]; v = kv_main^T
+        # pv: p [H, BLOCK_N] @ v [BLOCK_N, D_V]; load V row-major (K=BLOCK_N)
+        idx_v = gl.load(
+            idx_ptr + s_i * topk + k0 + n_vk, mask=(k0 + n_vk) < topk, other=-1
+        )
+        valid_v = idx_v >= 0
+        page_v = gl.where(valid_v, idx_v, 0)
+        v = gl.load(
+            kv_ptr + page_v[:, None] * DIM + dv_vn[None, :],
+            mask=valid_v[:, None],
+            other=0.0,
+        )  # [BLOCK_N, D_V]
         p_a = gl.convert_layout(p.to(q_nope_ptr.dtype.element_ty), dot_a_layout)
-        v = gl.convert_layout(kv_main, dot_b_layout)  # WIP: needs [BLOCK_N, D_V]
         pv = gl.amd.cdna4.mfma_scaled(
             a=p_a, a_scale=None, a_format="e4m3",
-            b=v, b_scale=None, b_format="e4m3", acc=gl.zeros([H, D_V], gl.float32, layout=mfma_layout),
+            b=v, b_scale=None, b_format="e4m3",
+            acc=gl.zeros([H, D_V], gl.float32, layout=mfma_layout),
         )
         acc = acc * alpha[:, None] + pv
         m_i = m_new
