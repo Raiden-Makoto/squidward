@@ -123,52 +123,54 @@ def _gluon_sparse_mla_fwd_kernel(
 ):
     s_i = gl.program_id(0)
     fp8_ty: gl.constexpr = q_nope_ptr.dtype.element_ty
+    tgt: gl.constexpr = current_target()
 
-    qm_bl: gl.constexpr = _default_blocked([H, D_V], NUM_WARPS)
-    qt_bl: gl.constexpr = _default_blocked([H, D_TAIL], NUM_WARPS)
-    kmT_bl: gl.constexpr = _default_blocked([D_V, BLOCK_N], NUM_WARPS)
-    ktT_bl: gl.constexpr = _default_blocked([D_TAIL, BLOCK_N], NUM_WARPS)
-    v_bl: gl.constexpr = _default_blocked([BLOCK_N, D_V], NUM_WARPS)
-    qk_bl: gl.constexpr = _default_blocked([H, BLOCK_N], NUM_WARPS)
-    acc_bl: gl.constexpr = _default_blocked([H, D_V], NUM_WARPS)
+    # One MFMA layout for both dots (tiling scheme is M/N-independent); operands
+    # in dot layouts, accumulator + softmax stay in `ml` (no blocked round-trip).
+    ml: gl.constexpr = _mfma_layout(NUM_WARPS, 8, tgt)
+    dot_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=ml, k_width=16)
+    dot_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=ml, k_width=16)
 
-    hq = gl.arange(0, H, layout=gl.SliceLayout(1, qm_bl))
-    dv_q = gl.arange(0, D_V, layout=gl.SliceLayout(0, qm_bl))
+    # q loaded once, converted to dot-a once (loop-invariant)
+    hq = gl.arange(0, H, layout=gl.SliceLayout(1, dot_a))
+    dv_q = gl.arange(0, D_V, layout=gl.SliceLayout(0, dot_a))
     q_main = gl.load(q_nope_ptr + s_i * H * D_V + hq[:, None] * D_V + dv_q[None, :])
-    hqt = gl.arange(0, H, layout=gl.SliceLayout(1, qt_bl))
-    dt_q = gl.arange(0, D_TAIL, layout=gl.SliceLayout(0, qt_bl))
-    q_tail = gl.load(q_rope_ptr + s_i * H * D_TAIL + hqt[:, None] * D_TAIL + dt_q[None, :])
+    dt_q = gl.arange(0, D_TAIL, layout=gl.SliceLayout(0, dot_a))
+    q_tail = gl.load(q_rope_ptr + s_i * H * D_TAIL + hq[:, None] * D_TAIL + dt_q[None, :])
 
-    m_i = gl.full([H], -float("inf"), gl.float32, layout=gl.SliceLayout(1, qk_bl))
-    l_i = gl.zeros([H], gl.float32, layout=gl.SliceLayout(1, qk_bl))
-    acc = gl.zeros([H, D_V], gl.float32, layout=acc_bl)
+    m_i = gl.full([H], -float("inf"), gl.float32, layout=gl.SliceLayout(1, ml))
+    l_i = gl.zeros([H], gl.float32, layout=gl.SliceLayout(1, ml))
+    acc = gl.zeros([H, D_V], gl.float32, layout=ml)
 
-    # index aranges (one per consumer layout)
-    n_km = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, kmT_bl))
-    dv_km = gl.arange(0, D_V, layout=gl.SliceLayout(1, kmT_bl))
-    n_kt = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, ktT_bl))
-    dt_kt = gl.arange(0, D_TAIL, layout=gl.SliceLayout(1, ktT_bl))
-    n_v = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, v_bl))
-    dv_v = gl.arange(0, D_V, layout=gl.SliceLayout(0, v_bl))
-    n_qk = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, qk_bl))
+    # KV operand aranges (dot-b: K along dim0, N along dim1)
+    dv_km = gl.arange(0, D_V, layout=gl.SliceLayout(1, dot_b))
+    dt_kt = gl.arange(0, D_TAIL, layout=gl.SliceLayout(1, dot_b))
+    n_kb = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, dot_b))  # K for qk (N of tile)
+    n_vk = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, dot_b))  # K for pv
+    dv_v = gl.arange(0, D_V, layout=gl.SliceLayout(0, dot_b))
+    n_qk = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, ml))
 
     for k0 in range(0, topk, BLOCK_N):
-        # gather page ids in each consumer layout
-        i_km = gl.load(idx_ptr + s_i * topk + k0 + n_km, mask=(k0 + n_km) < topk, other=-1)
-        p_km = gl.where(i_km >= 0, i_km, 0)
+        i_kb = gl.load(idx_ptr + s_i * topk + k0 + n_kb, mask=(k0 + n_kb) < topk, other=-1)
+        p_kb = gl.where(i_kb >= 0, i_kb, 0)
         kv_main_t = gl.load(
-            kv_ptr + p_km[None, :] * DIM + dv_km[:, None],
-            mask=(i_km >= 0)[None, :], other=0.0,
-        )  # [D_V, BLOCK_N]
-        i_kt = gl.load(idx_ptr + s_i * topk + k0 + n_kt, mask=(k0 + n_kt) < topk, other=-1)
-        p_kt = gl.where(i_kt >= 0, i_kt, 0)
+            kv_ptr + p_kb[None, :] * DIM + dv_km[:, None],
+            mask=(i_kb >= 0)[None, :], other=0.0,
+        )  # [D_V, BLOCK_N] dot-b
         kv_tail_t = gl.load(
-            kv_ptr + p_kt[None, :] * DIM + (D_V + dt_kt)[:, None],
-            mask=(i_kt >= 0)[None, :], other=0.0,
-        )  # [D_TAIL, BLOCK_N]
+            kv_ptr + p_kb[None, :] * DIM + (D_V + dt_kt)[:, None],
+            mask=(i_kb >= 0)[None, :], other=0.0,
+        )  # [D_TAIL, BLOCK_N] dot-b
 
-        qk = tl_dot(q_main, kv_main_t, None)
-        qk = tl_dot(q_tail, kv_tail_t, qk)
+        qk = gl.amd.cdna4.mfma_scaled(
+            a=q_main, a_scale=None, a_format="e4m3",
+            b=kv_main_t, b_scale=None, b_format="e4m3",
+            acc=gl.zeros([H, BLOCK_N], gl.float32, layout=ml),
+        )
+        qk = gl.amd.cdna4.mfma_scaled(
+            a=q_tail, a_scale=None, a_format="e4m3",
+            b=kv_tail_t, b_scale=None, b_format="e4m3", acc=qk,
+        )
         qk = qk * sm_scale
         i_qk = gl.load(idx_ptr + s_i * topk + k0 + n_qk, mask=(k0 + n_qk) < topk, other=-1)
         qk = gl.where((i_qk >= 0)[None, :], qk, -float("inf"))
@@ -179,21 +181,25 @@ def _gluon_sparse_mla_fwd_kernel(
         p = gl.exp(qk - m_safe[:, None])
         l_i = l_i * alpha + gl.sum(p, axis=1)
 
-        i_v = gl.load(idx_ptr + s_i * topk + k0 + n_v, mask=(k0 + n_v) < topk, other=-1)
+        i_v = gl.load(idx_ptr + s_i * topk + k0 + n_vk, mask=(k0 + n_vk) < topk, other=-1)
         p_v = gl.where(i_v >= 0, i_v, 0)
         v = gl.load(
             kv_ptr + p_v[:, None] * DIM + dv_v[None, :],
             mask=(i_v >= 0)[:, None], other=0.0,
-        )  # [BLOCK_N, D_V]
-        p_fp8 = (p * fp8_max).to(fp8_ty)
-        pv = tl_dot(p_fp8, v, None) * (1.0 / fp8_max)
+        )  # [BLOCK_N, D_V] dot-b
+        p_a = gl.convert_layout((p * fp8_max).to(fp8_ty), dot_a)
+        pv = gl.amd.cdna4.mfma_scaled(
+            a=p_a, a_scale=None, a_format="e4m3",
+            b=v, b_scale=None, b_format="e4m3",
+            acc=gl.zeros([H, D_V], gl.float32, layout=ml),
+        ) * (1.0 / fp8_max)
         acc = acc * alpha[:, None] + pv
         m_i = m_new
 
     l_safe = gl.where(l_i == 0.0, 1.0, l_i)
     acc = acc / l_safe[:, None]
-    h_o = gl.arange(0, H, layout=gl.SliceLayout(1, acc_bl))
-    dv_o = gl.arange(0, D_V, layout=gl.SliceLayout(0, acc_bl))
+    h_o = gl.arange(0, H, layout=gl.SliceLayout(1, ml))
+    dv_o = gl.arange(0, D_V, layout=gl.SliceLayout(0, ml))
     gl.store(
         o_ptr + s_i * H * D_V + h_o[:, None] * D_V + dv_o[None, :],
         acc.to(o_ptr.dtype.element_ty),
