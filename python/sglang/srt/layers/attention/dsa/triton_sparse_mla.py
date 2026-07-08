@@ -7,6 +7,8 @@ prefill regime (n_groups=1): the attention tile is tiny (M=16 heads = one
 coordination overhead of the 256-thread TileLang block.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -15,6 +17,20 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 
 _IS_FNUZ = is_fp8_fnuz()
 _FP8_MAX = 240.0 if _IS_FNUZ else 448.0
+
+# Opt-in gluon prefill kernel (gfx950): explicit async KV-gather pipeline to
+# overlap the scattered topk gather behind MFMA. Enable with
+# SGLANG_DSA_SPARSE_MLA_GLUON=1. Falls back to the triton kernel if the gluon
+# dialect / gfx950 primitives are unavailable.
+_USE_GLUON = os.environ.get("SGLANG_DSA_SPARSE_MLA_GLUON", "0") == "1"
+_gluon_sparse_mla_fwd = None
+if _USE_GLUON:
+    try:
+        from sglang.srt.layers.attention.dsa.gluon_sparse_mla import (
+            gluon_sparse_mla_fwd as _gluon_sparse_mla_fwd,
+        )
+    except Exception:
+        _gluon_sparse_mla_fwd = None
 
 
 def _prune_configs(configs, named_args, **kwargs):
@@ -134,6 +150,8 @@ def triton_sparse_mla_fwd(
     Reads q from the two un-concatenated tensors directly (no q_nope/q_rope
     concat). Returns [1, seq, H, d_v] bf16 to match tilelang_sparse_fwd.
     """
+    if _gluon_sparse_mla_fwd is not None:
+        return _gluon_sparse_mla_fwd(q_nope, q_rope, kv, indices, sm_scale, d_v=d_v)
     seq, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
     d_tail = q_rope.shape[-1]
