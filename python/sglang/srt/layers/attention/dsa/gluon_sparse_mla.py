@@ -118,11 +118,10 @@ def _gluon_sparse_mla_fwd_kernel(
             other=0.0,
         )  # [BLOCK_N, D_V]
         p_a = gl.convert_layout(p.to(q_nope_ptr.dtype.element_ty), dot_a_layout)
-        pv = gl.amd.cdna4.mfma_scaled(
-            a=p_a, a_scale=None, a_format="e4m3",
-            b=v, b_scale=None, b_format="e4m3",
-            acc=gl.zeros([H, D_V], gl.float32, layout=mfma_layout),
-        )
+        # DIAG iter4: isolate whether the pv MFMA is what fails LLIR lowering.
+        pv = gl.zeros([H, D_V], gl.float32, layout=mfma_layout)
+        _ = v
+        _ = p_a
         acc = acc * alpha[:, None] + pv
         m_i = m_new
 
