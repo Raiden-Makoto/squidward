@@ -67,6 +67,8 @@ def _mfma_layout(num_warps, ebw, target=None):
 @gluon.constexpr_function
 def _mfma_kwidth(a_ty, b_ty, target=None):
     mb = min(a_ty.element_ty.primitive_bitwidth, b_ty.element_ty.primitive_bitwidth)
+    if mb == 8:  # fp8 scaled MFMA uses k_width=16 (see reference gluon kernel)
+        return 16
     return _mfma_instr_k(mb, target) // 2
 
 
@@ -89,7 +91,12 @@ def tl_dot(a, b, acc, out_dtype: gl.constexpr = gl.float32):
         accum = gl.convert_layout(acc, ml)
     else:
         accum = gl.zeros([M, N], out_dtype, layout=ml)
-    res = amd_mfma(a, b, accum)
+    # fp8 MFMA on CDNA4 is only available via the scaled instruction; pass
+    # scale=None for plain (unscaled) e4m3 x e4m3 -> f32.
+    res = gl.amd.cdna4.mfma_scaled(
+        a=a, a_scale=None, a_format="e4m3",
+        b=b, b_scale=None, b_format="e4m3", acc=accum,
+    )
     if acc is not None:
         rl: gl.constexpr = acc.type.layout
     else:
