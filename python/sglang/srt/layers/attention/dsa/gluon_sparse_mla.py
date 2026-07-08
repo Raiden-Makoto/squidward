@@ -36,7 +36,7 @@ def _gluon_sparse_mla_fwd_kernel(
 
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16, 32],
+        instr_shape=[16, 16, 128],
         transposed=False,
         warps_per_cta=[1, NUM_WARPS],
     )
