@@ -66,10 +66,16 @@ def _gluon_sparse_mla_fwd_kernel(
     dv_b = gl.arange(0, D_V, layout=gl.SliceLayout(1, dot_b_layout))
     dt_b = gl.arange(0, D_TAIL, layout=gl.SliceLayout(1, dot_b_layout))
     n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, dot_b_layout))
+    # BLOCK_N mask in the mfma column layout for qk masking / softmax
+    n_m = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
     for k0 in range(0, topk, BLOCK_N):
         idx = gl.load(idx_ptr + s_i * topk + k0 + n, mask=(k0 + n) < topk, other=-1)
         valid = idx >= 0
         page = gl.where(valid, idx, 0)
+        idx_m = gl.load(
+            idx_ptr + s_i * topk + k0 + n_m, mask=(k0 + n_m) < topk, other=-1
+        )
+        valid_m = idx_m >= 0
         # gather KV transposed to [D, BLOCK_N] for MFMA operand-b (K-major)
         kbase = page[None, :] * DIM
         kv_main = gl.load(
@@ -89,7 +95,7 @@ def _gluon_sparse_mla_fwd_kernel(
             b=kv_tail, b_scale=None, b_format="e4m3", acc=qk,
         )
         qk = qk * sm_scale
-        qk = gl.where(valid[None, :], qk, -float("inf"))
+        qk = gl.where(valid_m[None, :], qk, -float("inf"))
 
         m_new = gl.maximum(m_i, gl.max(qk, axis=1))
         m_safe = gl.where(m_new == -float("inf"), 0.0, m_new)
