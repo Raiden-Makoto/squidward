@@ -1,13 +1,11 @@
 # GLM-5.2 prefill — i1k/o1k conc64, TP4 — MI355X (MXFP4) vs B200 (NVFP4)
 
-GPU-busy per prefill forward: MI355X 611 ms (overlap 1.00x) vs B200 170 ms (1.02x) → 0.28x. All kernel times are **ms per prefill forward pass** (MI355X captured 4 forwards, B200 1; normalized so both are 1-forward). DSA sparse-MLA path on both (B200 forced sparse via `SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD=0`). MI355X MoE = tuned tile CSV.
+GPU-busy per prefill forward: MI355X 329 ms (overlap 1.00x) vs B200 150 ms (1.02x) → 0.46x. All kernel times are **ms per prefill forward pass** (MI355X captured 4 forwards, B200 1; normalized so both are 1-forward). Both use the dense-MHA path (default at i1k, kv_len≤2048): MI355X `ck_tile FmhaFwd` (gfx950), B200 `fmhaSm100f ...H256...Causal`. MI355X MoE = tuned tile CSV. Attention and all-reduce rows re-profiled on the amdsmi-fixed image (INT4 QuickReduce + aiter 2-stage, no generic RCCL); MoE/dense-GEMM/RMSNorm retained from the tuned capture.
 
 | Section | MI355X kernel | MI355X ms | B200 kernel | B200 ms | B200/MI355X |
 | --- | --- | ---: | --- | ---: | ---: |
-| Attention | `_sparse_mla_fwd_split_dim` (triton sparse MLA, #30575) | 128.8 | `fmhaSm100f` fp8 paged sparse MLA | 28.3 | |
-| Attention | `_batched_gemm_a8w8` absorb_prepare (#30519) | 38.8 | (absorbed bmm, folded) | 1.9 | |
-| Attention | `_batched_gemm_a8w8` absorb_core (#30519) | 23.5 | — | — | |
-| **Attention subtotal** | | **191.2** | | **30.1** | **0.16x** |
+| Attention | `ck_tile FmhaFwd` dense MHA (gfx950, `_forward_standard_mha`) | 27.2 | `fmhaSm100f ...H256...Causal` dense MHA | 9.9 | |
+| **Attention subtotal** | | **27.2** | | **9.9** | **0.36x** |
 | MoE | `mfma_moe2_t64x256` (tuned tile) | 41.7 | `bmm_E2m1` gemm1 (swiGlu) | 13.8 | |
 | MoE | `ck_moe_mxgemm` stage1 | 31.0 | `bmm_Bfloat16_E2m1` gemm2 | 13.5 | |
 | MoE | `moe_reduction_kernel` | 23.2 | `bmm_E2m1` gemm1 (small-M) | 5.7 | |
@@ -20,11 +18,12 @@ GPU-busy per prefill forward: MI355X 611 ms (overlap 1.00x) vs B200 170 ms (1.02
 | Dense GEMM | `aiter::bf16gemm_256x256` | 8.5 | `nvjet_sm100_128x240` | 2.5 | |
 | Dense GEMM | Tensile `MT256x256` | 7.7 | (more nvjet <1%) | ≈10.7 | |
 | **Dense GEMM subtotal** | | **73.9** | | **32.7** | **0.44x** |
-| All-reduce | `ncclDevKernel_Generic` (serial) | 236.0 | `nccl_RING_LL` + `mnnvl` twoshot/lamport fusion (overlapped) | 54.3 | |
-| **All-reduce subtotal** | | **236.0** | | **54.3** | **0.23x** |
+| All-reduce | `quickreduce::allreduce_prototype_twoshot` (INT4 CodecQ4) | 101.8 | `nccl_RING_LL` + `mnnvl` twoshot/lamport fusion (overlapped) | 54.3 | |
+| All-reduce | `aiter::cross_device_reduce_2stage` | 15.7 | — | — | |
+| **All-reduce subtotal** | | **117.5** | | **54.3** | **0.46x** |
 | RMSNorm / hadamard-quant fusion (#30715) | `aiter::add_rmsnorm_quant` | 14.1 | `fused_add_rmsnorm` | 6.0 | |
 | **RMSNorm subtotal** | | **14.1** | | **6.0** | **0.43x** |
-| **TOTAL prefill** | | **611** | | **170** | **0.28x** |
+| **TOTAL prefill** | | **329** | | **150** | **0.46x** |
 
 ## Levers
 
