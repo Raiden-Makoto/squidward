@@ -34,8 +34,8 @@ exec sglang serve \
   --trust-remote-code \
   --tool-call-parser glm47 \
   --reasoning-parser glm45 \
-  --nsa-prefill-backend tilelang \
-  --nsa-decode-backend tilelang \
+  --dsa-prefill-backend triton \
+  --dsa-decode-backend triton \
   --watchdog-timeout 1200 \
   --mem-fraction-static 0.85 \
   --disable-radix-cache \
