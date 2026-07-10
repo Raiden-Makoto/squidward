@@ -18,7 +18,7 @@ GPU-busy per prefill forward: MI355X 611 ms (overlap 1.00x) vs B200 170 ms (1.02
 | Dense GEMM | Tensile `MT224x256` | 15.7 | `nvjet_sm100_128x272` | 5.8 | |
 | Dense GEMM | Tensile `MT224x384` | 12.3 | `nvjet_sm100_256x240` | 3.6 | |
 | Dense GEMM | `aiter::bf16gemm_256x256` | 8.5 | `nvjet_sm100_128x240` | 2.5 | |
-| Dense GEMM | Tensile `MT256x256` | 7.7 | (more nvjet <1%) | ~10.7 | |
+| Dense GEMM | Tensile `MT256x256` | 7.7 | (more nvjet <1%) | ≈10.7 | |
 | **Dense GEMM subtotal** | | **73.9** | | **32.7** | **0.44x** |
 | All-reduce | `ncclDevKernel_Generic` (serial) | 236.0 | `nccl_RING_LL` + `mnnvl` twoshot/lamport fusion (overlapped) | 54.3 | |
 | **All-reduce subtotal** | | **236.0** | | **54.3** | **0.23x** |
@@ -29,7 +29,7 @@ GPU-busy per prefill forward: MI355X 611 ms (overlap 1.00x) vs B200 170 ms (1.02
 ## Levers
 
 - **Dense-attention fallback at short prefill context (IMPLEMENTED + validated, commit `3235a7d271`).** MI355X previously ran triton `_sparse_mla_fwd_split_dim` **unconditionally** (128.8 ms/forward, the #1 prefill kernel) because the dense-MHA fallback was hard-gated to NVIDIA SM90/SM100 in `dsa_backend.py`. We extended the `use_mha` device gate to gfx950 and routed `_forward_standard_mha` through aiter `flash_attn_varlen_func` (ck_tile dense FA). It is threshold-gated by `SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD`, whose effective value for GLM-5.2 is the model `index_topk` = **2048** (env raw default is also 2048; GLM-5.2 config: `index_topk=2048`, `index_topk_freq=4`); off switch = set it to 0. Dense triggers when `max_kv_len ≤ 2048`, i.e. short prefill; long context stays on sparse-MLA (correct crossover — sparse only pays off once there's enough KV to prune).
-  - **Result at i1k (graph-on, GLM-5.2-MXFP4, MI355X TP4):** the ~764 ms attention stack (sparse-MLA 515 + absorbed bmm 249) collapses to a single ck_tile dense-FA kernel at **~104 ms**. GSM8K parity (**0.955**, 200 ex). e2e median **TTFT drops 14-32%** vs the sparse path:
+  - **Result at i1k (graph-on, GLM-5.2-MXFP4, MI355X TP4):** the ≈764 ms attention stack (sparse-MLA 515 + absorbed bmm 249) collapses to a single ck_tile dense-FA kernel at **≈104 ms**. GSM8K parity (**0.955**, 200 ex). e2e median **TTFT drops 14-32%** vs the sparse path:
 
 | conc | sparse TTFT (ms) | dense TTFT (ms) | Δ |
 | --- | ---: | ---: | ---: |
