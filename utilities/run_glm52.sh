@@ -43,6 +43,7 @@ exec sglang serve \
   --reasoning-parser glm45 \
   --dsa-prefill-backend triton \
   --dsa-decode-backend triton \
+  --enable-aiter-allreduce-fusion \
   --watchdog-timeout 1200 \
   --mem-fraction-static 0.85 \
   --disable-radix-cache \
