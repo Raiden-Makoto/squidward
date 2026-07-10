@@ -28,5 +28,14 @@ GPU-busy per prefill forward: MI355X 611 ms (overlap 1.00x) vs B200 170 ms (1.02
 
 ## Levers
 
-- **Dense-attention fallback at short prefill context (biggest untapped win).** MI355X runs triton `_sparse_mla_fwd_split_dim` **unconditionally** — 128.8 ms/forward, ~21% of prefill and the #1 prefill kernel. B200 gates the sparse path behind `SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD` (default = `index_topk` = 2048): at i1k it uses **dense** attention, which is **2.9x faster than its own sparse MLA** there (B200 dense 9.9 vs sparse 28.3 ms/forward). At short context the sparse indexer topk + gather + mask overhead exceeds the KV it skips. Adding the same threshold-gated dense path to MI355X should cut its biggest i1k prefill cost toward a dense-attention cost — config/backend change, no new kernel.
+- **Dense-attention fallback at short prefill context (IMPLEMENTED + validated, commit `3235a7d271`).** MI355X previously ran triton `_sparse_mla_fwd_split_dim` **unconditionally** (128.8 ms/forward, the #1 prefill kernel) because the dense-MHA fallback was hard-gated to NVIDIA SM90/SM100 in `dsa_backend.py`. We extended the `use_mha` device gate to gfx950 and routed `_forward_standard_mha` through aiter `flash_attn_varlen_func` (ck_tile dense FA). It is threshold-gated by `SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD`, whose effective value for GLM-5.2 is the model `index_topk` = **2048** (env raw default is also 2048; GLM-5.2 config: `index_topk=2048`, `index_topk_freq=4`); off switch = set it to 0. Dense triggers when `max_kv_len ≤ 2048`, i.e. short prefill; long context stays on sparse-MLA (correct crossover — sparse only pays off once there's enough KV to prune).
+  - **Result at i1k (graph-on, GLM-5.2-MXFP4, MI355X TP4):** the ~764 ms attention stack (sparse-MLA 515 + absorbed bmm 249) collapses to a single ck_tile dense-FA kernel at **~104 ms**. GSM8K parity (**0.955**, 200 ex). e2e median **TTFT drops 14-32%** vs the sparse path:
+
+| conc | sparse TTFT (ms) | dense TTFT (ms) | Δ |
+| --- | ---: | ---: | ---: |
+| 4  | 277.3  | 196.9  | −29% |
+| 8  | 467.6  | 366.8  | −22% |
+| 16 | 872.9  | 593.9  | −32% |
+| 32 | 1371.1 | 1183.6 | −14% |
+| 64 | 1920.5 | 1640.6 | −15% |
 - **Tuned MoE tile CSV (applied above).** −17% MoE prefill GPU time via the tuned `mfma_moe2 t64x256` tile (vs default `t64x128`); already reflected in the MI355X MoE rows.
