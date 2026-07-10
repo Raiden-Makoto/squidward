@@ -11,6 +11,7 @@ export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
 
 PROFILE_ARGS=""
 SPEC_ARGS=""
+EXTRA_ARGS=""
 for arg in "$@"; do
   case "$arg" in
     --profile)
@@ -20,6 +21,11 @@ for arg in "$@"; do
       export SGLANG_ENABLE_SPEC_V2=1
       SPEC_ARGS="--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --attention-backend triton"
       ;;
+    *)
+      # forward any other flag straight to `sglang serve`
+      # (e.g. --enable-aiter-allreduce-fusion for A/B sweeps)
+      EXTRA_ARGS="${EXTRA_ARGS} ${arg}"
+      ;;
   esac
 done
 
@@ -28,6 +34,7 @@ exec sglang serve \
   --model-path "${MODEL}" \
   ${PROFILE_ARGS} \
   ${SPEC_ARGS} \
+  ${EXTRA_ARGS} \
   --tp 4 \
   --host localhost \
   --port 8552 \
