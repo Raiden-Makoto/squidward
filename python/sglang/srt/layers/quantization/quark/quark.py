@@ -27,7 +27,7 @@ from sglang.srt.layers.quantization.quark.schemes import (
 from sglang.srt.layers.quantization.quark.utils import deep_compare, should_ignore_layer
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_device_capability
+from sglang.srt.utils import get_bool_env_var, get_device_capability
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -37,6 +37,19 @@ if TYPE_CHECKING:
 __all__ = ["QuarkLinearMethod", "QuarkFusedMoEMethod"]
 
 logger = logging.getLogger(__name__)
+
+# EXPERIMENT (default off): force otherwise-excluded bf16 `kv_b_proj` to be
+# online-quantized to MXFP4 (W4A4), to measure 4-bit accuracy and unlock the
+# fused fp8-K/V prefill path. See results/glm52_prefill_i1k_c64_profile.md.
+_FORCE_MXFP4_KVB = get_bool_env_var("SGLANG_FORCE_MXFP4_KVB")
+_MXFP4_W_CFG = {
+    "dtype": "fp4",
+    "qscheme": "per_group",
+    "group_size": 32,
+    "is_dynamic": False,
+    "scale_format": "e8m0",
+}
+_MXFP4_A_CFG = {**_MXFP4_W_CFG, "is_dynamic": True}
 
 _MOE_SHARED_EXPERT_QUANT_LAYER0_BASES: tuple[str, ...] = (
     "model.layers.0",
@@ -124,6 +137,26 @@ class QuarkConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
         # Check if the layer is skipped for quantization.
+
+        if (
+            _FORCE_MXFP4_KVB
+            and isinstance(layer, LinearBase)
+            and prefix.endswith("kv_b_proj")
+        ):
+            # Override the exclude list: online-quantize the bf16 kv_b_proj to
+            # MXFP4 (W4A4). Uses the same online path as higher-precision-
+            # checkpoint MXFP4 quantization.
+            layer.scheme = QuarkW4A4MXFP4(
+                _MXFP4_W_CFG,
+                _MXFP4_A_CFG,
+                is_checkpoint_mxfp4_serialized=False,
+            )
+            self._quantized_layers.add(prefix)
+            logger.info_once(
+                "SGLANG_FORCE_MXFP4_KVB: online-quantizing %s to MXFP4 (W4A4)",
+                prefix,
+            )
+            return QuarkLinearMethod(self)
 
         if should_ignore_layer(
             prefix,
