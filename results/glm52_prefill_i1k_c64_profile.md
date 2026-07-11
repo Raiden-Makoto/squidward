@@ -1,11 +1,14 @@
 # GLM-5.2 prefill — i1k/o1k conc64, TP4 — MI355X (MXFP4) vs B200 (NVFP4)
 
-GPU-busy per prefill forward: MI355X 329 ms (overlap 1.00x) vs B200 150 ms (1.02x) → 0.46x. All kernel times are **ms per prefill forward pass** (MI355X captured 4 forwards, B200 1; normalized so both are 1-forward). Both use the dense-MHA path (default at i1k, kv_len≤2048): MI355X `ck_tile FmhaFwd` (gfx950), B200 `fmhaSm100f ...H256...Causal`. MI355X MoE = tuned tile CSV. Attention and all-reduce rows re-profiled on the amdsmi-fixed image (INT4 QuickReduce + aiter 2-stage, no generic RCCL); MoE/dense-GEMM/RMSNorm retained from the tuned capture.
+GPU-busy per prefill forward: MI355X 336 ms (overlap 1.00x) vs B200 150 ms (1.02x) → 0.45x. All kernel times are **ms per prefill forward pass** (MI355X captured 4 forwards, B200 1; normalized so both are 1-forward). Both use the dense-MHA path (default at i1k, kv_len≤2048): MI355X `ck_tile FmhaFwd` (gfx950), B200 `fmhaSm100f ...H256...Causal`. MI355X MoE = tuned tile CSV. Attention and all-reduce rows re-profiled on the amdsmi-fixed image (INT4 QuickReduce + aiter 2-stage, no generic RCCL); MoE/dense-GEMM/RMSNorm retained from the tuned capture.
 
 | Section | MI355X kernel | MI355X ms | B200 kernel | B200 ms | B200/MI355X |
 | --- | --- | ---: | --- | ---: | ---: |
 | Attention | `ck_tile FmhaFwd` dense MHA (gfx950, `_forward_standard_mha`) | 27.2 | `fmhaSm100f ...H256...Causal` dense MHA | 9.9 | |
-| **Attention subtotal** | | **27.2** | | **9.9** | **0.36x** |
+| Attention | `set_mla_kv_buffer_fp8_quant` + concat/cast (KV-cache write) | 6.2 | — † | — | |
+| Attention | `RotaryEmbedding` (rope) | 1.3 | — † | — | |
+| Attention | DSA indexer (`fast_hadamard` + `indexer_k_quant` + LN) | 0.4 | — † | — | |
+| **Attention subtotal** | | **35.1** | | **9.9** † | **—** |
 | MoE | `mfma_moe2_t64x256` (tuned tile) | 41.7 | `bmm_E2m1` gemm1 (swiGlu) | 13.8 | |
 | MoE | `ck_moe_mxgemm` stage1 | 31.0 | `bmm_Bfloat16_E2m1` gemm2 | 13.5 | |
 | MoE | `moe_reduction_kernel` | 23.2 | `bmm_E2m1` gemm1 (small-M) | 5.7 | |
@@ -23,7 +26,9 @@ GPU-busy per prefill forward: MI355X 329 ms (overlap 1.00x) vs B200 150 ms (1.02
 | **All-reduce subtotal** | | **117.5** | | **54.3** | **0.46x** |
 | RMSNorm / hadamard-quant fusion (#30715) | `aiter::add_rmsnorm_quant` | 14.1 | `fused_add_rmsnorm` | 6.0 | |
 | **RMSNorm subtotal** | | **14.1** | | **6.0** | **0.43x** |
-| **TOTAL prefill** | | **329** | | **150** | **0.46x** |
+| **TOTAL prefill** | | **336** | | **150** † | **0.45x** |
+
+† MI355X indexer/KV-cache/rope rows are from the dense EXTEND trace. B200 i1k prefill per-kernel numbers for indexer/KV-cache/rope are not in the reference capture, so B200 attention subtotal and TOTAL count FA only for those; the B200/MI355X attention ratio is therefore omitted until the B200 rows are sourced.
 
 ## Levers
 
