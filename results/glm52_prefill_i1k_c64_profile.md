@@ -18,7 +18,7 @@ GPU-busy per prefill forward: MI355X 329 ms (overlap 1.00x) vs B200 150 ms (1.02
 | Dense GEMM | `aiter::bf16gemm_256x256` | 8.5 | `nvjet_sm100_128x240` | 2.5 | |
 | Dense GEMM | Tensile `MT256x256` | 7.7 | (more nvjet <1%) | ≈10.7 | |
 | **Dense GEMM subtotal** | | **73.9** | | **32.7** | **0.44x** |
-| All-reduce | `quickreduce::allreduce_prototype_twoshot` (INT4 CodecQ4) | 101.8 | `nccl_RING_LL` + `mnnvl` twoshot/lamport fusion (overlapped) | 54.3 | |
+| All-reduce | `quickreduce::allreduce_prototype_twoshot` (INT4 CodecQ4) | 101.8 | `ncclDevKernel_AllReduce_Sum_bf16_RING_LL` (plain NCCL ring) | 54.3 | |
 | All-reduce | `aiter::cross_device_reduce_2stage` | 15.7 | — | — | |
 | **All-reduce subtotal** | | **117.5** | | **54.3** | **0.46x** |
 | RMSNorm / hadamard-quant fusion (#30715) | `aiter::add_rmsnorm_quant` | 14.1 | `fused_add_rmsnorm` | 6.0 | |
@@ -38,3 +38,4 @@ GPU-busy per prefill forward: MI355X 329 ms (overlap 1.00x) vs B200 150 ms (1.02
 | 32 | 1371.1 | 1183.6 | −14% |
 | 64 | 1920.5 | 1640.6 | −15% |
 - **Tuned MoE tile CSV (applied above).** −17% MoE prefill GPU time via the tuned `mfma_moe2 t64x256` tile (vs default `t64x128`); already reflected in the MI355X MoE rows.
+- **All-reduce is shot — hardware-bound, no software lever.** B200 runs a plain NCCL ring (`ncclDevKernel_AllReduce_Sum_bf16_RING_LL`) and still beats MI355X's INT4 QuickReduce, which already moves 4x less data over the wire — so MI355X's reduce is already the optimal path. The residual gap is the Infinity Fabric vs NVLink5/NVSwitch bandwidth floor. Neither platform fuses RMSNorm into the reduce (both keep add+rmsnorm as a separate kernel). Can't fix hardware with software.
