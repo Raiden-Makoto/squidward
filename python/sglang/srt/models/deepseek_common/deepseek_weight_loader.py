@@ -650,8 +650,17 @@ class DeepseekV2WeightLoaderMixin:
                 and self.quant_config is not None
                 and self.quant_config.get_name() == "quark"
                 and self.config.architectures
-                and self.config.architectures[0]
-                == "DeepseekV3ForCausalLM"  # Avoid processing other models like GlmMoeDsaForCausalLM
+                and (
+                    self.config.architectures[0] == "DeepseekV3ForCausalLM"
+                    # SGLANG_FORCE_MXFP4_KVB experiment: kv_b_proj is online-
+                    # quantized to MXFP4 (uint8), so GLM also needs the mxfp4
+                    # absorb-weight setup (builds uint8 w_kc + w_scale_k) rather
+                    # than the bf16/fp8 path that leaves w_scale_k unset.
+                    or (
+                        self.config.architectures[0] == "GlmMoeDsaForCausalLM"
+                        and w.dtype == torch.uint8
+                    )
+                )
             ):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
