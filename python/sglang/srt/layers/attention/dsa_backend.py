@@ -2313,6 +2313,7 @@ class DeepseekSparseAttnBackend(
                 max_seqlen_q=metadata.max_seq_len_q,
                 max_seqlen_k=max_seqlen_k,
                 softmax_scale=layer.scaling,
+                forward_batch=forward_batch,
             )
 
         # Use FA3 for SM90 (Hopper/H200)
@@ -2338,6 +2339,7 @@ class DeepseekSparseAttnBackend(
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """fp8 dense MHA via aiter `mha_batch_prefill_func` (gfx950).
 
@@ -2345,6 +2347,12 @@ class DeepseekSparseAttnBackend(
         so there is no upstream fp8 K/V to reuse) and presents the contiguous
         varlen K/V as the page_size=16 paged layout the batch-prefill kernel
         requires at head_dim 256.
+
+        The page-16 layout (kv_indptr/indices/last_page_lens, alignment, and the
+        ragged scatter map) depends only on the sequence lengths, which are
+        identical across every layer of a forward pass. It is therefore computed
+        once and cached on ``forward_batch`` — avoiding ~N_layers redundant
+        GPU->CPU syncs (`.item()`) and index rebuilds per forward.
 
         Fast path (the common prefill case): when every sequence length is a
         multiple of the page size, the contiguous K/V is *already* the paged
@@ -2357,6 +2365,50 @@ class DeepseekSparseAttnBackend(
         head_dim = k.shape[-1]
         v_head_dim = v.shape[-1]
         fp8_max = torch.finfo(fp8_dtype).max
+        total_k = k.shape[0]
+
+        # Per-forward paging metadata (shared by all layers): compute once.
+        paging = getattr(forward_batch, "_fp8_dense_paging", None)
+        if paging is None or paging[0] != total_k:
+            bs = cu_seqlens_k.numel() - 1
+            seqlens_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).to(torch.int32)
+            aligned = total_k % PS == 0 and bool((seqlens_k % PS == 0).all().item())
+            if aligned:
+                total_pages = total_k // PS
+                kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=dev)
+                kv_indptr[1:] = torch.cumsum(seqlens_k // PS, dim=0)
+                kv_indices = torch.arange(total_pages, dtype=torch.int32, device=dev)
+                kv_last_page_lens = torch.full(
+                    (bs,), PS, dtype=torch.int32, device=dev
+                )
+                dest = None
+            else:
+                pages_per_seq = (seqlens_k + (PS - 1)) // PS
+                kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=dev)
+                kv_indptr[1:] = torch.cumsum(pages_per_seq, dim=0)
+                total_pages = int(kv_indptr[-1].item())
+                kv_indices = torch.arange(total_pages, dtype=torch.int32, device=dev)
+                kv_last_page_lens = ((seqlens_k - 1) % PS + 1).to(torch.int32)
+                tok = torch.arange(total_k, device=dev, dtype=torch.int64)
+                cu_k64 = cu_seqlens_k.to(torch.int64)
+                seq_id = torch.searchsorted(cu_k64[1:], tok, right=True)
+                pos = tok - cu_k64[:-1][seq_id]
+                dest = (kv_indptr.to(torch.int64)[seq_id] + pos // PS) * PS + (
+                    pos % PS
+                )
+            paging = (
+                total_k,
+                total_pages,
+                aligned,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_lens,
+                dest,
+            )
+            forward_batch._fp8_dense_paging = paging
+        (_, total_pages, aligned, kv_indptr, kv_indices, kv_last_page_lens, dest) = (
+            paging
+        )
 
         def _quant(x: torch.Tensor):
             # aminmax is a single fused reduction (no full abs() temp).
@@ -2369,35 +2421,10 @@ class DeepseekSparseAttnBackend(
         kf, k_descale = _quant(k)
         vf, v_descale = _quant(v)
 
-        bs = cu_seqlens_k.numel() - 1
-        seqlens_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).to(torch.int32)
-        total_k = kf.shape[0]
-        aligned = total_k % PS == 0 and bool((seqlens_k % PS == 0).all().item())
-
         if aligned:
-            # Contiguous varlen K/V is already page_size-16 paged: view, no copy.
-            total_pages = total_k // PS
-            pages_per_seq = seqlens_k // PS
-            kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=dev)
-            kv_indptr[1:] = torch.cumsum(pages_per_seq, dim=0)
-            kv_indices = torch.arange(total_pages, dtype=torch.int32, device=dev)
-            kv_last_page_lens = torch.full((bs,), PS, dtype=torch.int32, device=dev)
             k_paged = kf.view(total_pages, PS, num_heads, head_dim)
             v_paged = vf.view(total_pages, PS, num_heads, v_head_dim)
         else:
-            pages_per_seq = (seqlens_k + (PS - 1)) // PS
-            kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=dev)
-            kv_indptr[1:] = torch.cumsum(pages_per_seq, dim=0)
-            total_pages = int(kv_indptr[-1].item())
-            kv_indices = torch.arange(total_pages, dtype=torch.int32, device=dev)
-            kv_last_page_lens = ((seqlens_k - 1) % PS + 1).to(torch.int32)
-
-            tok = torch.arange(total_k, device=dev, dtype=torch.int64)
-            cu_k64 = cu_seqlens_k.to(torch.int64)
-            seq_id = torch.searchsorted(cu_k64[1:], tok, right=True)
-            pos = tok - cu_k64[:-1][seq_id]
-            dest = (kv_indptr.to(torch.int64)[seq_id] + pos // PS) * PS + (pos % PS)
-
             k_paged = kf.new_zeros((total_pages * PS, num_heads, head_dim))
             v_paged = vf.new_zeros((total_pages * PS, num_heads, v_head_dim))
             k_paged[dest] = kf
