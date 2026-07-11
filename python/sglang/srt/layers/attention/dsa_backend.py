@@ -57,6 +57,7 @@ from sglang.srt.layers.utils.cp_utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
+    get_bool_env_var,
     is_cuda,
     is_hip,
     is_sm100_supported,
@@ -104,6 +105,16 @@ def _detect_gfx950() -> bool:
 
 # gfx950 supports the dense-MHA prefill fallback via aiter flash_attn_varlen_func.
 _is_gfx950 = _detect_gfx950()
+
+# Experimental (gfx950, default off): route the dense-MHA prefill fallback through
+# aiter fp8 `mha_batch_prefill_func` (fp8 q/k/v + per-tensor descales) instead of the
+# bf16 `flash_attn_varlen_func`. ~1.14x on the FA kernel at the GLM head_dim-256 shape.
+# fp8 attention is an accuracy trade-off; validate before trusting.
+_use_fp8_dense_attn = (
+    _is_gfx950 and get_bool_env_var("SGLANG_DSA_FP8_DENSE_ATTN")
+)
+# batch_prefill only compiles a page_size=16 variant at head_dim 256.
+_FP8_DENSE_ATTN_PAGE_SIZE = 16
 
 if _is_hip:
     from sglang.srt.layers.attention.dsa.triton_kernel import get_valid_kv_indices
@@ -2291,6 +2302,19 @@ class DeepseekSparseAttnBackend(
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
             )
 
+        # gfx950 experimental: fp8 dense FA via aiter batch-prefill (default off).
+        if _use_fp8_dense_attn:
+            return self._forward_standard_mha_fp8(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=metadata.max_seq_len_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=layer.scaling,
+            )
+
         # Use FA3 for SM90 (Hopper/H200)
         return flash_attn_varlen_func(
             q=q,
@@ -2302,6 +2326,81 @@ class DeepseekSparseAttnBackend(
             max_seqlen_k=max_seqlen_k,
             softmax_scale=layer.scaling,
             causal=causal,
+        )
+
+    def _forward_standard_mha_fp8(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        softmax_scale: float,
+    ) -> torch.Tensor:
+        """fp8 dense MHA via aiter `mha_batch_prefill_func` (gfx950).
+
+        Per-tensor fp8-quantizes q/k/v (bf16 in; `kv_b_proj` is bf16 for GLM-5.2,
+        so there is no upstream fp8 K/V to reuse) and rebuilds the contiguous
+        varlen K/V into the page_size=16 paged layout the batch-prefill kernel
+        requires at head_dim 256. Ragged sequences are scattered into padded
+        pages; `kv_last_page_lens` masks the padding.
+        """
+        PS = _FP8_DENSE_ATTN_PAGE_SIZE
+        dev = q.device
+        num_heads = q.shape[1]
+        head_dim = k.shape[-1]
+        v_head_dim = v.shape[-1]
+        fp8_max = torch.finfo(fp8_dtype).max
+
+        def _quant(x: torch.Tensor):
+            amax = x.abs().amax().clamp(min=1e-4)
+            scale = amax / fp8_max
+            return (x / scale).to(fp8_dtype), scale.reshape(1).float()
+
+        qf, q_descale = _quant(q)
+        kf, k_descale = _quant(k)
+        vf, v_descale = _quant(v)
+
+        bs = cu_seqlens_k.numel() - 1
+        seqlens_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).to(torch.int32)
+        pages_per_seq = (seqlens_k + (PS - 1)) // PS
+        kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=dev)
+        kv_indptr[1:] = torch.cumsum(pages_per_seq, dim=0)
+        total_pages = int(kv_indptr[-1].item())
+        kv_indices = torch.arange(total_pages, dtype=torch.int32, device=dev)
+        kv_last_page_lens = ((seqlens_k - 1) % PS + 1).to(torch.int32)
+
+        total_k = kf.shape[0]
+        tok = torch.arange(total_k, device=dev, dtype=torch.int64)
+        cu_k64 = cu_seqlens_k.to(torch.int64)
+        seq_id = torch.searchsorted(cu_k64[1:], tok, right=True)
+        pos = tok - cu_k64[:-1][seq_id]
+        dest = (kv_indptr.to(torch.int64)[seq_id] + pos // PS) * PS + (pos % PS)
+
+        k_paged = kf.new_zeros((total_pages * PS, num_heads, head_dim))
+        v_paged = vf.new_zeros((total_pages * PS, num_heads, v_head_dim))
+        k_paged[dest] = kf
+        v_paged[dest] = vf
+        k_paged = k_paged.view(total_pages, PS, num_heads, head_dim)
+        v_paged = v_paged.view(total_pages, PS, num_heads, v_head_dim)
+
+        return mha_batch_prefill_func(
+            qf,
+            k_paged,
+            v_paged,
+            cu_seqlens_q,
+            kv_indptr,
+            kv_indices,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=True,
+            softmax_scale=softmax_scale,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            kv_last_page_lens=kv_last_page_lens,
         )
 
     def _forward_tilelang(
