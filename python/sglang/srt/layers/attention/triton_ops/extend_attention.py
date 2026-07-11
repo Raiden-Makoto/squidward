@@ -16,6 +16,8 @@ Memory-efficient attention for prefill.
 It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -682,11 +684,16 @@ def extend_attention_fwd(
     stride_lse_h = lse_extend.stride(1) if STORE_LSE else 0
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    num_stages = 1
+    num_stages = int(os.environ.get("SGLANG_FA_NUM_STAGES", "1"))
 
     extra_kargs = {}
     if _is_hip:
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+        _wpe = int(os.environ.get("SGLANG_FA_WAVES_PER_EU", "1"))
+        extra_kargs = {
+            "waves_per_eu": _wpe,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 2,
+        }
 
     k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
         k_buffer, page_size
@@ -1149,11 +1156,16 @@ def extend_attention_fwd_unified(
         window_start_pos = torch.zeros(batch_size, dtype=torch.int32, device=q.device)
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    num_stages = 1
+    num_stages = int(os.environ.get("SGLANG_FA_NUM_STAGES", "1"))
 
     extra_kargs = {}
     if _is_hip:
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+        _wpe = int(os.environ.get("SGLANG_FA_WAVES_PER_EU", "1"))
+        extra_kargs = {
+            "waves_per_eu": _wpe,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 2,
+        }
 
     k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
         k_buffer, page_size
