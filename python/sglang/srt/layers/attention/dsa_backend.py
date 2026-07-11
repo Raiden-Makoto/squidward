@@ -118,7 +118,7 @@ _FP8_DENSE_ATTN_PAGE_SIZE = 16
 
 if _is_hip:
     from sglang.srt.layers.attention.dsa.triton_kernel import get_valid_kv_indices
-    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, scaled_fp8_quant
 
     try:
         from aiter import (  # noqa: F401
@@ -2364,7 +2364,6 @@ class DeepseekSparseAttnBackend(
         num_heads = q.shape[1]
         head_dim = k.shape[-1]
         v_head_dim = v.shape[-1]
-        fp8_max = torch.finfo(fp8_dtype).max
         total_k = k.shape[0]
 
         # Per-forward paging metadata (shared by all layers): compute once.
@@ -2411,11 +2410,11 @@ class DeepseekSparseAttnBackend(
         )
 
         def _quant(x: torch.Tensor):
-            # aminmax is a single fused reduction (no full abs() temp).
-            mn, mx = torch.aminmax(x)
-            amax = torch.maximum(mx.abs(), mn.abs()).clamp(min=1e-4)
-            scale = amax / fp8_max
-            return (x / scale).to(fp8_dtype), scale.reshape(1).float()
+            # Fused dynamic per-tensor fp8 quant: reads bf16, writes fp8 in one
+            # kernel (no bf16 divide temp -> avoids the extra q/k/v-sized
+            # allocations that OOM'd at high concurrency).
+            xq, scale = scaled_fp8_quant(x.reshape(x.shape[0], -1))
+            return xq.view_as(x), scale.reshape(1).float()
 
         qf, q_descale = _quant(q)
         kf, k_descale = _quant(k)
