@@ -48,7 +48,7 @@ GPU-busy per prefill forward: MI355X 363 ms vs B200 331 ms → 0.91x. All kernel
 - **RMSNorm (1.06x):** parity.
 - **Attention (0.67x, dense FA 27 vs 9.9): register-pressure wall on CDNA4, no fork lever.** ck_tile FA = 256 VGPR / 0 AGPR → ~2 waves; latency-bound (14% compute / 44% BW). The `[BM,256]` fp32 accumulator needs ~256 VGPR (B200 offloads to TMEM, CDNA4 can't). Config levers all neutral-or-worse: tiling 1.00x, backend swap 1.01x, `waves_per_eu` 1→8 (`4811ac0906`) spills at wpe≥3.
   - *fp8 batch-prefill (`SGLANG_DSA_FP8_DENSE_ATTN`, default off; `c410a22111`/`9c966c21a0`/`6cea8561a2`): dead.* Kernel faster (1.13–1.40x), accuracy parity (0.928 vs 0.929), but per-forward q/k/v quant (bf16 `kv_b_proj`) makes e2e +6/+42/+25% at conc 4/8/16 and OOM at conc32+. Fused fp8-K/V needs MXFP4 `kv_b_proj`, structurally excluded for GLM (`SGLANG_FORCE_MXFP4_KVB`).
-- **MoE (0.78x):**
+- **MoE (0.78x):** table numbers use the stale `utilities/glm_fp8fp4_tuned_fmoe.csv`. Upstream aiter now ships `glm5_fp4_tuned_fmoe.csv` (~13–19% faster at inter_dim=512, added to `utilities/`; box image → `v0.5.15-rocm720-mi35x-20260711`) — so MoE only improves; no reprofile (down GEMM already ceiling-limited).
   - **Down GEMM (41.4 vs 26.2):** already tuned `t64x256`, near CDNA4 mxfp4 roofline — needs a kernel rewrite (aiter/upstream), not re-tuning.
   - **Expert combine (22.3):** near-parity once B200's shared-add is counted (15.8 + 5.4 = 21.2); memory-bound at roofline; kernel is aiter FlyDSL-JIT (aiter-side only).
   - gate-up GEMM / all-reduce / dense-GEMM / RMSNorm / router at/above parity.
