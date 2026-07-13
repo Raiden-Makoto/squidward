@@ -81,11 +81,17 @@ Consequences:
 - pipe3 could still help token buckets that dispatch `tile_k=128` (nk = 512/128 = 4), e.g. the
   t64x128x128 rows at some concurrencies — untested, and not the i1k prefill kernel.
 
-## Next
+## PDL-overlap lever — CLOSED (ceiling ~0 on gfx950)
 
-1. (skipped) e2e A/B is pointless for i1k prefill: pipe3 inactive at nk=2 -> identical to baseline.
-  reaching the workers, capture real ms/fwd + GSM8K parity, update the profile md.
-2. Sweep S=3 across other token/M buckets to confirm no smaller-shape regression.
+Fusion recon: B200 does NOT epilogue-fuse finalize; its 42ms is a profiler SUM (PDL hides
+finalize under gemm2 → ~26-32ms wall). Atomic mode (fold combine into gemm2) TESTED at per-rank:
+gemm2 897→1461us (atomic contention +63%), gemm2+combine 1461 vs reduce+reduce 1292 — atomic
+LOSES. 2-stream overlap ceiling probe (reduction on side stream concurrent w/ gemm2, timing-only
+env `SGLANG_MOE2_OVERLAP_CEIL`): serial vs overlap within ±80us NOISE (2189/2170/2124 vs
+2107/2097/2208) → **overlap ~0**. Cause: gemm2 is a persistent full-grid kernel monopolizing all
+CUs; concurrent combine can't get CU slots until it retires (no CTA-retire/GDC overlap on CDNA4).
+Real overlap needs a fused megakernel interleaving both on shared CUs — huge effort for ~0 ceiling.
+MoE gap now attributed: ~20.5ms gemm2 cubin (hard, nk=2/13% MFMA) + ~6.8ms finalize micro-opt.
 
 
 

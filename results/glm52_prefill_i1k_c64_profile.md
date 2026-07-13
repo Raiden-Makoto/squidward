@@ -39,7 +39,7 @@ ms/prefill forward. MI355X ~390 vs B200 331 (0.85x). Graphs-off eager, dense-MHA
 ## Remaining gaps
 
 1. **Down-GEMM (46.7 vs 26.2) — mainloop levers exhausted.** TP4 shards inter_dim→512/rank ⇒ nk=2 K-tiles, so pipeline-deepening is impossible (`SGLANG_MOE2_PIPE=3` inert at nk=2: 884→900us noise; the −4.7% only exists at unsharded nk=8, off-deployment). Also rejected: full-K LDS +31%, `cu_num_mul=3` wash. At nk=2 it's overhead/epilogue-bound → folds into gap 2.
-2. **gemm2+combine fusion — ACTIVE lever.** combine 22.6 vs 15.8. aiter combine already matches B200's kernel; gap is B200's PDL overlapping finalize behind the gemm2 tail. CDNA4 has no PDL → needs persistent producer-consumer megakernel (gemm2 signals per-tile completion, combine consumes). Target: gemm2+combine ~69 vs B200 ~42 ms.
+2. **gemm2↔combine overlap — CLOSED, not viable on gfx950.** B200's 42ms is a profiler *sum*, not wall (PDL hides finalize under gemm2 → ~26-32ms wall). Gap decomp: ~20.5ms better gemm2 cubin (75%), ~6.8ms faster finalize (25%); B200 does NOT epilogue-fuse finalize. 2-stream overlap ceiling probe (per-rank, reduction on side stream concurrent w/ gemm2): **~0 within ±80us noise** — gemm2 is a persistent full-grid kernel monopolizing all CUs, so combine can't get CU slots until it retires (no GDC/CTA-retire overlap on CDNA4). Real overlap would need a fused megakernel interleaving both on shared CUs — huge effort for ~0 ceiling. Remaining real lever = the gemm2 cubin itself (hard: nk=2, 13% MFMA).
 3. **Dense-attn rewrite** — FA 27.9 vs 9.9 (0.35x); needs register-pressure-engineered D=256 kernel.
 
 Parity (no work): all-reduce (1.07x), RMSNorm (1.03x), gate-up (0.83x).
