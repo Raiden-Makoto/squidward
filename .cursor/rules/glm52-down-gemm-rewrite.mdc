@@ -1,0 +1,32 @@
+---
+description: PINNED context for the GLM-5.2 MoE down-GEMM (stage-2) kernel rewrite. Temporary - remove when the rewrite lands.
+alwaysApply: true
+---
+
+# GLM-5.2 down-GEMM rewrite — always reference
+
+Full working notes: `results/glm52_down_gemm_rewrite_notes.md`. Read it before editing the kernel.
+
+## Target (edit the RIGHT file)
+
+- `compile_mixed_moe_gemm2` in `/home/macui/aiter/aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage.py`
+  (~lines 2910-4720; cache prefix `launch_mixed_moe_gemm2_*`).
+- NOT `moe_gemm_2stage.py` — that path is not executed for this shape.
+- Lever: grouped-K A staging (LDS `lds_x_bytes` @~3090 → G buffers; K-loop @~4327; drop per-pair
+  barriers @~4361/4405). Diagnosis: latency-bound (MfmaUtil 13%, MemUnitStalled 0.6%, occ 37%) — the
+  per-K-tile LDS-A `s_barrier` is the serializer; not BW/compute/dequant-throughput bound.
+
+## Non-negotiable gotchas (each burned real cycles)
+
+1. After ANY kernel edit: `rm -rf /sgl-workspace/aiter_dev/aiter/jit/flydsl_cache/*` before testing —
+   the FlyDSL disk cache silently serves the OLD kernel otherwise.
+2. `logits_diff` varies run-to-run (random fp4 inputs) — NOT a valid before/after delta. Judge perf by
+   rocprof `MfmaUtil` / gemm2 us; add a `sys.stderr.write` in the compile fn to CONFIRM it recompiled.
+3. rocprofv3 multi-metric `--pmc A B C` HANGS — use single-metric passes + `--kernel-trace`; analyze
+   with `utilities/pmc_pick.py` / `utilities/kt_analyze.py`.
+
+## Dev flow
+
+Box `smci355-ccs-aus-m12-17.cs-aus.dcgpu`, container `glm5`. Edit fork `/home/macui/aiter`, sync to
+scratch `/sgl-workspace/aiter_dev` (leave `/sgl-workspace/aiter` untouched), `PYTHONPATH=/sgl-workspace/aiter_dev`.
+Microbench: `python3 op_tests/test_moe_2stage.py -q 4 -dim 6144,2048 -e 257 -k 9 -t 512 --no-flydsl-csv`.
