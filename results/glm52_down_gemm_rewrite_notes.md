@@ -33,27 +33,34 @@ line 57's `compile_moe_gemm2 / moe_gemm_2stage.py` is stale/wrong.)
 microbench `-q 4 -dim 6144,2048 -e 257 -k 9 -t 512` (dispatches ATOMIC, same mainloop),
 rocprofv3 kernel-trace, moe2 avg us:
 
-| mainloop change | moe2 avg | vs baseline | what it tests |
+Two probes at the WRONG M (`-t 512`, atomic, tiny per-expert M) were only sanity checks:
+full-K resident (8 barriers->1) = +31% (overlap matters, not barrier count); `cu_num_mul=3`
+(occupancy) = wash. They ruled out barriers and occupancy as levers.
+
+## RESULT — 3-stage prefetch WINS (production kernel, correct M)
+
+Reproduced the exact production kernel `flydsl_moe2_..._t64x128x256_reduce_persist_sbm128` at
+per-expert M≈573 (op_test `-t 16384` + forced config `/tmp/glm5_reduce_sbm.csv`), GPU-isolated,
+rocprofv3 kernel-trace, moe2 avg us:
+
+| pipeline depth S (SGLANG_MOE2_PIPE) | moe2 avg | vs baseline | logits_diff |
 | --- | ---: | ---: | --- |
-| baseline (2-buffer ping-pong, 1 barrier/tile) | ~320 us | — | — |
-| full-K resident (8 barriers -> 1, overlap REMOVED) | 422 us | +31% | barrier count is NOT the limiter; overlap is |
-| `cu_num_mul=3` (occupancy 3x WGs) | 319 us | ~0% | occupancy knob is a wash |
+| S=2 (baseline 2-buffer ping-pong) | 2619 us | — | 3.43e-06 |
+| **S=3 (3-stage, prefetch 2 ahead)** | **2497 us** | **-4.7%** | 3.43e-06 (exact) |
+| S=4 (4-stage) | 2645 us | +1% (worse) | 3.43e-06 |
 
-**What is proven:** cutting barriers by killing overlap hurts; the occupancy knob does nothing.
-**What is NOT proven / still open:** the profile doc's actual lever — **deepen the pipeline
-2->3/4-stage prefetch that KEEPS the ping-pong overlap** (one more in-flight prefetch of
-x/scale/b so fp4 dequant/scale overlaps MFMA). full-K was the OPPOSITE of this. This is the
-real experiment and it has not been run. Down-GEMM (46.7 vs 26.2 ms, 0.56x) remains OPEN;
-B200 wins by SW pipelining, not hardware. All experimental edits reverted (fork `01f52ea7`).
+**S=3 is the optimum, numerically exact.** Shallow optimum at depth 3 also explains why full-K
+(max depth) was catastrophic. Committed to the aiter fork branch `glm52-moe2-pipe3`
+(`0fd2d2bb9`, off box baseline `9127c94a1`), env-gated `SGLANG_MOE2_PIPE` (default 2 = no
+change). Confined to `compile_mixed_moe_gemm2`; off-variant fp4 shapes unaffected.
 
-## Next (do this properly)
+Scale: gemm2 46.7 -> ~44.5 ms/fwd (~-2.2 ms, ~0.6% of 390 ms prefill). Real but modest.
 
-1. Implement 3-stage (then 4-stage) prefetch in `compile_mixed_moe_gemm2`: keep the 2 LDS
-   ping-pong buffers' overlap, add a 3rd buffer + prefetch x/scale/b one tile further ahead.
-   Do NOT collapse barriers to one (full-K proved that regresses).
-2. Measure moe2 us vs baseline; validate correctness by logits_diff order-of-magnitude.
-3. If a win, validate e2e on the reduce production path (`bench_one_batch` batch16/i1k, M≈573)
-   and update the profile md with real ms/fwd deltas.
+## Next
+
+1. e2e validation: run the server (GPU 4-7) or `bench_one_batch` with `SGLANG_MOE2_PIPE=3`
+   reaching the workers, capture real ms/fwd + GSM8K parity, update the profile md.
+2. Sweep S=3 across other token/M buckets to confirm no smaller-shape regression.
 
 ## Correct kernel target (DO NOT edit the wrong file)
 
