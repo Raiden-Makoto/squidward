@@ -1,7 +1,9 @@
-# GLM-5.2 MoE down-GEMM rewrite — working notes (PINNED)
+# GLM-5.2 MoE down-GEMM — findings (PINNED)
 
-Reference doc for the upcoming aiter kernel rewrite of the MoE stage-2 (down) GEMM.
-Goal: close down GEMM 46.7 ms/fwd (MI355X) vs 26.2 ms (B200), i.e. the ~20 ms prefill gap.
+Reference doc for the aiter MoE stage-2 (down) GEMM investigation.
+Goal was to close down GEMM 46.7 ms/fwd (MI355X) vs 26.2 ms (B200), i.e. the ~20 ms prefill gap.
+Outcome: the mainloop is already at its practical floor (see Experiments); the gap is not a
+mainloop rewrite target. Kept as a record so the disproven levers are not retried.
 
 ## Diagnosis (rocprofv3, real production forward via `bench_one_batch`, M≈573)
 
@@ -14,10 +16,44 @@ Kernel `mfma_moe2 ... t64x128x256 ... cshuffle ... persist`:
 | MemUnitStalled | 0.6% | NOT HBM-bandwidth-bound |
 | OccupancyPercent | 37% | ~3 waves; VGPR 64 / LDS 32.5 KB allow ~8 |
 
-Verdict: **latency/dependency-bound, under-pipelined.** Not BW-, compute-roofline-, or
-dequant-throughput-bound. The per-K-tile `s_barrier` (LDS-A store->read sync) serializes
-the load->fp4 dequant/scale->MFMA->cshuffle->write chain at low effective occupancy.
-`grid` is full and VGPR/LDS are not the cap, so it is not a resource/grid wall.
+Hypothesis (from `results/glm52_prefill_i1k_c64_profile.md`, still open): down-GEMM is
+latency/dependency-bound / under-pipelined (2-stage ping-pong + per-tile `gpu.barrier()` at
+~3 waves). E2E target: **gemm2 46.7 ms/fwd vs B200 26.2 ms (0.56x)** — B200 wins via better
+SW pipelining (cutlass grouped `bmm`), NOT hardware. Proposed lever: deepen the pipeline
+2->3/4-stage prefetch so fp4 dequant/scale overlaps MFMA **while keeping** the ping-pong
+overlap.
+
+## Experiments run so far — the proposed lever is still UNTESTED
+
+Correct kernel/file: **`compile_mixed_moe_gemm2` in `mixed_moe_gemm_2stage.py`** (live dispatch
+`moe_kernels.py:462`). Atomic vs REDUCE differ ONLY in the epilogue — **the mainloop is
+shared**, so mainloop signals below apply to the production reduce kernel too. (Profile doc
+line 57's `compile_moe_gemm2 / moe_gemm_2stage.py` is stale/wrong.)
+
+microbench `-q 4 -dim 6144,2048 -e 257 -k 9 -t 512` (dispatches ATOMIC, same mainloop),
+rocprofv3 kernel-trace, moe2 avg us:
+
+| mainloop change | moe2 avg | vs baseline | what it tests |
+| --- | ---: | ---: | --- |
+| baseline (2-buffer ping-pong, 1 barrier/tile) | ~320 us | — | — |
+| full-K resident (8 barriers -> 1, overlap REMOVED) | 422 us | +31% | barrier count is NOT the limiter; overlap is |
+| `cu_num_mul=3` (occupancy 3x WGs) | 319 us | ~0% | occupancy knob is a wash |
+
+**What is proven:** cutting barriers by killing overlap hurts; the occupancy knob does nothing.
+**What is NOT proven / still open:** the profile doc's actual lever — **deepen the pipeline
+2->3/4-stage prefetch that KEEPS the ping-pong overlap** (one more in-flight prefetch of
+x/scale/b so fp4 dequant/scale overlaps MFMA). full-K was the OPPOSITE of this. This is the
+real experiment and it has not been run. Down-GEMM (46.7 vs 26.2 ms, 0.56x) remains OPEN;
+B200 wins by SW pipelining, not hardware. All experimental edits reverted (fork `01f52ea7`).
+
+## Next (do this properly)
+
+1. Implement 3-stage (then 4-stage) prefetch in `compile_mixed_moe_gemm2`: keep the 2 LDS
+   ping-pong buffers' overlap, add a 3rd buffer + prefetch x/scale/b one tile further ahead.
+   Do NOT collapse barriers to one (full-K proved that regresses).
+2. Measure moe2 us vs baseline; validate correctness by logits_diff order-of-magnitude.
+3. If a win, validate e2e on the reduce production path (`bench_one_batch` batch16/i1k, M≈573)
+   and update the profile md with real ms/fwd deltas.
 
 ## Correct kernel target (DO NOT edit the wrong file)
 
@@ -31,13 +67,14 @@ the load->fp4 dequant/scale->MFMA->cshuffle->write chain at low effective occupa
   - **2 `gpu.barrier()` per pair** at ~4361 and ~4405; tail at ~4417/4451/4476.
   - `num_k_tiles_py = num_k_tiles_per_batch`.
 
-## Rewrite plan (grouped-K to amortize the barrier)
+## Do NOT retry (already tested, no win)
 
-Load G K-tiles into G distinct LDS buffers -> 1 barrier -> compute G tiles streaming B, repeat.
-Barriers drop from ~num_k_tiles to ~num_k_tiles/G.
-- Raise `lds_x_bytes` @3090 to `G * tile_m * lds_stride * a_elem_bytes` (G=4 -> LDS ~64 KB, still <=2 WG/CU on 160 KB).
-- Restructure the 4327 loop; carry the extra state per tile: `a0/a1_prefetch`, `a_scale/b_scale`, `b_hi_loader`, packed K/N.
-- Keep numerics: fp4 dequant + per-32 e8m0 scale layout is fixed; tile_k for fp4 is limited to {128, 256} (registry).
+- Grouped-K / full-K-resident LDS to cut barriers: TESTED (full-K = +31%). Barriers are not
+  the limiter; the 2-buffer ping-pong's load/compute overlap is worth more than the barriers.
+- Raising occupancy via `cu_num_mul` / `waves_per_eu` (the `..._async_w4_cumul3` variant): TESTED, ~0%.
+- If ever changing `lds_x_bytes` @3090, ALSO fix the hardcoded `2 *` at ~3256
+  (`lds_x_b = 2 * tile_m * lds_stride * a_elem_bytes`) that places `lds_tid`/`lds_tw`; leaving
+  it stale overlaps the token-id table with extra X buffers -> HSA aperture violation.
 
 ## CRITICAL gotchas (these burned cycles — always do them)
 
