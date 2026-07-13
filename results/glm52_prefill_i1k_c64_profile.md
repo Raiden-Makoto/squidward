@@ -27,24 +27,38 @@ ms/prefill forward. MI355X ~390 vs B200 331 (0.85x). Graphs-off eager, dense-MHA
 
 ‡ `q_b_proj`/`o_proj` are the two 128-aligned dense projections `SGLANG_DSA_FP8_PROJ_GEMM=1` (default off) converts to fp8 CK GEMM.
 
-## Levers
+## Status / levers
 
-- **Dense-attn fallback (DONE, `3235a7d271`):** short prefill (`max_kv_len ≤ 2048`) → ck_tile dense FA, not sparse-MLA. Sparse ≈764 → dense ≈28 ms/fwd; GSM8K 0.955. TTFT −14–32% (conc4/8/16/32/64: −29/−22/−32/−14/−15%).
-- **Tuned MoE dispatch (fixed):** `AITER_CONFIG_FMOE` env doesn't reach workers; injected `glm5_fp4` gfx950/cu256 rows into box aiter default. Box-local (lost on rebuild).
-- **All-reduce (1.07x):** MI355X faster; not the gap.
-- **Dense GEMM (0.80x):** fp8 proj lever A/B had anomalous all-reduce; needs clean redo.
-- **Router GEMM:** not an anomaly (547→1196 TF standalone); B200 fuses it. No lever.
-- **Attention (0.65x, FA 27.9 vs 9.9):** register-pressure wall — 256 VGPR/0 AGPR → ~2 waves; `[BM,256]` fp32 accum can't fit (B200 uses TMEM). Tiling/backend/`waves_per_eu` all neutral-or-worse. fp8 batch-prefill (`SGLANG_DSA_FP8_DENSE_ATTN`) dead: kernel 1.13–1.40x but per-fwd qkv quant → e2e +6/+42/+25% and OOM.
+| Area | MI vs B200 (ms) | ratio | status | result / next |
+| --- | --- | ---: | --- | --- |
+| Dense GEMM `MT256x240/240x256/224x256` | 46.0 vs ≈22 | 0.48x | **UNEXPLORED — biggest untouched gap** | ragged Tensile tiles (240/224 = non-256-aligned N); try tile/pad/backend |
+| MoE gemm2 | 46.7 vs 26.2 | 0.56x | CK re-test in progress | FlyDSL floor 862us @ nk=2; CK re-test on `cb859854a`; see detail |
+| MoE gemm2↔combine fusion | — | — | DEAD | no CDNA4 PDL overlap; fused megakernel 5.6x slower |
+| MoE combine | 22.6 vs 15.8 | 0.70x | open | — |
+| MoE act quant | 4.2 vs 2.6 | 0.62x | open | — |
+| Attention FA (kernel) | 27.9 vs 9.9 | 0.35x | tuning EXHAUSTED | pin D256 `(128,128)` new-CK = 421us kernel (−5.4% vs old 444.9); rest architectural (B200 TMEM) — see detail |
+| MoE gate-up (gemm1) | 38.6 vs 32.1 | 0.83x | open — real gap, NOT parity | — |
+| Dense GEMM fp8 proj | — | — | redo | `SGLANG_DSA_FP8_PROJ_GEMM=1` A/B had anomalous all-reduce |
+| Router GEMM | — | — | no lever | B200 fuses; standalone 547→1196 TF |
+| Dense GEMM `MT256x256` | 27.7 vs ≈40 | 1.4x | MI faster | — |
+| All-reduce | 130.7 vs 139.5 | 1.07x | parity | — |
+| RMSNorm | 14.3 vs 14.7 | 1.03x | parity | — |
+| Dense-attn fallback | — | — | DONE `3235a7d271` | sparse≈764→dense≈28 ms/fwd; GSM8K 0.955; TTFT −14–32% |
+| Tuned MoE dispatch | — | — | DONE (box-local) | `glm5_fp4` gfx950/cu256 rows injected; lost on rebuild |
+| fp8 dense attn | — | — | DEAD | `SGLANG_DSA_FP8_DENSE_ATTN` kernel 1.13–1.40x but qkv-quant → e2e +6/+42/+25%, OOM |
 
-## Remaining gaps
+### Attention FA detail
+D256 tile sweep, new CK `cb859854a`, b16 s1024 nh16, `module_mha_varlen_fwd`:
 
-1. **MoE gemm2 + combine (69 vs 42 ms) — REOPENED vs new CK.** gemm2 46.7 vs 26.2 (0.56x), combine 22.6 vs 15.8 (0.70x). At the deployed per-rank shape (TP4 shards inter_dim→512 ⇒ nk=2 K-tiles) gemm2 is latency-bound (~888us: 13% MFMA, ~316us unhidable stall; MFMA 115 + dequant 231 + [M,topk,D] write 226). Exhausted with data:
-   - *FlyDSL tuning:* all levers wash/regress (pipe3 inert nk<3, full-K +31%, cu_num_mul/waves_per_eu/tile_m wash, atomic +63%); config pick optimal (862us).
-   - *gemm2↔combine fusion:* dead — no CDNA4 PDL/CTA-retire overlap (persistent gemm2 hogs CUs); 2-stream ceiling ~0; fused megakernel built+measured 7112us (5.6x slower) + coherence bugs (aiter `glm52-moe2-pipe3`, `SGLANG_MOE2_FUSED`).
-   - *CK:* tuner picked FlyDSL over CK at nk=2 — BUT that was **STALE CK**. Active CK (rocm-libraries) may have a better fp4 gemm2. **Re-test new-CK `moe_ck2stages_gemm2` before final.** If it also loses, a win needs a new-from-scratch CK device-op (frontier).
-2. **Dense-attn FA (27.9 vs 9.9, 0.35x) — ACTIVE, CK-bound, improvable (not pure HW).** GLM dense prefill → aiter `flash_attn_varlen_func` → CK-tile `FmhaFwd` (hdim_q/v=256 causal varlen; not fmha_v3/FlyDSL). Fwd baseline **444.9us** (b16 s1024 nh16). `[BM,256]` fp32 O-accum → 256 VGPR/0 AGPR → ~2 waves. Box runs **STALE CK** (untuned gfx950 D256 `(128,128,...)`); active CK has a gfx950 D256 tune `(128,64,...)` (BN0 128→64) — cherry-pick won't compile (needs full new-CK). PLAN: new CK → CK_DIR → rebuild → A/B vs 444.9us (use CK-dev-blessed configs; hand-crafted BM0=64 hit CK-tile validity).
+| tile · warps·mfma | VGPR | waves | fwd_us |
+| --- | ---: | ---: | ---: |
+| **(128,128) 4w 32×32** (pinned) | 236 | ~2 | **421** |
+| (128,64) 4w 32×32 (new-CK auto) | 208 | ~2 | 490 |
+| (128,64) 8w 16×16 | 84 | 3+ | 620 |
+| (128,32) 8w 16×16 | 76 | 3+ | 762 |
+| (128,128) old-CK baseline | 256 | ~2 | 444.9 |
 
-Both big gaps now hinge on the **new CK** (`ROCm/rocm-libraries/projects/composablekernel`; box submodule points at stale `ROCm/composable_kernel` cb859854, and box aiter itself is behind).
+MFMA-throughput bound: biggest valid tile wins, more waves = slower (occupancy disproven). `(128,128)` is max valid (`bn0≥192`/`bk0≥64` don't compile). Pinned in `aiter_dev` CK submodule.
 
-Parity (no work): all-reduce (1.07x), RMSNorm (1.03x).
-Minor / possibly-mislabeled: gate-up 38.6 vs 32.1 (0.83x) — NOT parity; `mfma_moe1` vs B200 `bmm_E2m1` mapping may be mislabeled (verify before treating as a real gap).
+### MoE gemm2 detail (nk=2 per-rank, TP4 inter_dim→512)
+Latency-bound ~888us: MFMA 115 + dequant 231 + `[M,topk,D]` write 226; ~316us unhidable stall (13% MFMA util). FlyDSL levers wash/regress (pipe3 inert nk<3, full-K +31%, atomic +63%). CK re-test pending → if CK also loses, needs from-scratch CK device-op.
