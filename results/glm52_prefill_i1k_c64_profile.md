@@ -14,13 +14,15 @@ ms/prefill forward. MI355X ~383 (fp8-tuned proj ‡, was ~390 bf16) vs B200 331 
 | MoE combine | `moe_reduction_kernel` | 22.6 | `finalizeKernelVecLoad` | 15.8 | 0.70x |
 | MoE act quant | `dynamic_per_group_scaled_quant` | 4.2 | `NVFP4Quantize` | 2.6 | 0.62x |
 | **MoE** | | **112.2** | | **76.7** | **0.68x** |
-| Dense GEMM | o_proj `a8w8_blockscale_bpreshuffle` (fp8 ‡) | 27.9 | — | — | |
-| Dense GEMM | q_a+kv_a Tensile `MT224x256/240x256` (bf16) | 26.1 | — | — | |
-| Dense GEMM | q_b_proj `a8w8_blockscale_bpreshuffle` (fp8 ‡) | 12.2 | — | — | |
+| Dense GEMM | o_proj `a8w8_blockscale_bpreshuffle` (fp8 ‡) | 27.9 | `nvjet_sm100 128x256` | ≈40 | |
+| Dense GEMM | q_a+kv_a Tensile `MT224x256/240x256` (bf16) | 26.1 | `nvjet_sm100 176x128` | ≈22 | |
+| Dense GEMM | q_b_proj `a8w8_blockscale_bpreshuffle` (fp8 ‡) | 12.2 | `nvjet_sm100 256x128` | ≈12 | |
 | Dense GEMM | kv_b Tensile `MT256x256/256x240` (bf16) | 8.6 | — | — | |
 | Dense GEMM | router `hgemm`+`MT256x256` (bf16) | 5.6 | — | — | |
 | Dense GEMM | DenseMLP L0-2 (bf16) | 3.0 | — | — | |
 | **Dense GEMM** | | **83.3** | | **73.7** | **0.89x** |
+
+_Dense GEMM: MI rows are per-projection (fp8-tuned ‡); B200 rows are per-`nvjet_sm100` kernel — they do NOT correspond 1:1, only the section totals (83.3 vs 73.7) are comparable. B200 dense GEMM = `nvjet_sm100` 128x256 ≈40 + 176x128 ≈22 + 256x128 ≈12 = 73.7._
 | All-reduce | `quickreduce twoshot` (INT4) | 109.9 | `ncclDevKernel ...RING_LL` | 68.6 | |
 | All-reduce | `aiter::cross_device_reduce_2stage` | 20.8 | `mnnvl twoshot` + `rmsNormLamport` + one-shot | 70.9 | |
 | **All-reduce** | | **130.7** | | **139.5** | **1.07x** |
