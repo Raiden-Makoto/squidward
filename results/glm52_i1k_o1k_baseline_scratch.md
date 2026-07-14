@@ -54,3 +54,18 @@ Prefill (M>512) → tuned fp8 CK GEMM; decode (M<=512) → bf16. GSM8K 200q = 0.
 | 16 | −2.3% | −1.3% | −1.2% | +1.7% |
 | 32 | −9.4% | +0.6% | +0.1% | −0.1% |
 | 64 | −1.3% | +0.1% | +0.4% | −0.1% |
+
+## D. c4/c8 de-noised — 4 reps same-session, median, obvious outlier dropped
+
+gated = prefill-only fp8 (this branch); bf16 = `SGLANG_DSA_FP8_PROJ_GEMM=0`.
+Dropped outlier: bf16 c8 TTFT rep2 (325.45 vs ~255). All Δ within ±0.5% = parity;
+decode (ITL/tok-s) unchanged vs bf16, as expected since gated decode IS bf16.
+
+| conc | metric | bf16 | gated | Δ |
+|------|--------|------|-------|---|
+| 4 | tok/s | 331.96 | 332.58 | +0.2% |
+| 4 | TTFT (ms) | 198.90 | 197.81 | −0.5% |
+| 4 | ITL (ms) | 11.82 | 11.83 | +0.1% |
+| 8 | tok/s | 570.97 | 570.31 | −0.1% |
+| 8 | TTFT (ms) | 255.68 | 255.00 | −0.3% |
+| 8 | ITL (ms) | 13.68 | 13.74 | +0.5% |
