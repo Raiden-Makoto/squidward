@@ -32,12 +32,12 @@ ms/prefill forward. MI355X ~390 vs B200 331 (0.85x). Graphs-off eager, dense-MHA
 | Area | MI vs B200 (ms) | ratio | status | result / next |
 | --- | --- | ---: | --- | --- |
 | Dense GEMM `MT256x240/240x256/224x256` | 46.0 vs ≈22 | 0.48x | **UNEXPLORED — biggest untouched gap** | ragged Tensile tiles (240/224 = non-256-aligned N); try tile/pad/backend |
-| MoE gemm2 | 46.7 vs 26.2 | 0.56x | CK re-test BLOCKED on new CK | fp4 CK won't compile vs cb859854a (`ck::IndexEval` API drift); needs aiter update. FlyDSL wins/deployed; see detail |
+| MoE gemm2 | 46.7 vs 26.2 | 0.56x | CK re-test BLOCKED (upstream CK bug) | new mxfp4 MoE pipeline + its compile-breaking loader landed in same CK commit #8260; won't build thru develop tip. FlyDSL wins/deployed; see detail |
 | MoE gemm2↔combine fusion | — | — | DEAD | no CDNA4 PDL overlap; fused megakernel 5.6x slower |
 | MoE combine | 22.6 vs 15.8 | 0.70x | open | — |
 | MoE act quant | 4.2 vs 2.6 | 0.62x | open | — |
 | Attention FA (kernel) | 27.9 vs 9.9 | 0.35x | tuning EXHAUSTED | pin D256 `(128,128)` new-CK = 421us kernel (−5.4% vs old 444.9); rest architectural (B200 TMEM) — see detail |
-| MoE gate-up (gemm1) | 38.6 vs 32.1 | 0.83x | open — real gap, NOT parity | — |
+| MoE gate-up (gemm1) | 38.6 vs 32.1 | 0.83x | VALU-bound, not MFMA | MFMA util 37% / VALU 100% @ M16384 (637.9us); bottleneck = fp4 dequant + e8m0 scale + fused silu_mul, not MFMA peak; see detail |
 | Dense GEMM fp8 proj | — | — | redo | `SGLANG_DSA_FP8_PROJ_GEMM=1` A/B had anomalous all-reduce |
 | Router GEMM | — | — | no lever | B200 fuses; standalone 547→1196 TF |
 | Dense GEMM `MT256x256` | 27.7 vs ≈40 | 1.4x | MI faster | — |
@@ -62,4 +62,8 @@ MFMA-throughput bound: biggest valid tile wins, more waves = slower (occupancy d
 
 ### MoE gemm2 detail (nk=2 per-rank, TP4 inter_dim→512)
 Latency-bound ~888us: MFMA 115 + dequant 231 + `[M,topk,D]` write 226; ~316us unhidable stall (13% MFMA util). FlyDSL levers wash/regress (pipe3 inert nk<3, full-K +31%, atomic +63%).
-CK re-test on new CK (cb859854a) **BLOCKED**: fp4 `moe_ck2stages_gemm2` fails to compile — `ck/utility/thread_buf_to_vec_loader.hpp` needs `ck::IndexEval<int,N>` (new-CK util refactor) absent from aiter `9127c94a1` codegen. Testing CK gemm2 on new CK requires an aiter update. Old-CK tuner verdict stands: FlyDSL wins all buckets (CK ~2% behind @ low M, 2.6x @ 16384). FMHA compiled clean on new CK; only MoE-CK drifts.
+New-CK re-test blocked: upstream CK bug (rocm-libraries #9400) — #8260 shipped the reworked mxfp4 MoE pipeline + a compile-breaking static-only loader in one commit; broken thru develop tip. Last compilable CK = old pipeline = prior verdict (FlyDSL wins all buckets). A win needs the upstream fix or a from-scratch CK device-op.
+
+### MoE gemm1 gate-up detail (K=6144, fused silu_mul, M=16384 microbench)
+`mfma_moe1_silu_mul_afp4_wfp4_bf16_t128x128x256_pm1_async_xcd` = 637.9us, VGPR=160 (~3 waves), LDS=82KB.
+**MFMA util 37% / VALU util 100%** → VALU-bound, not MFMA-peak-bound. Bottleneck = fp4 dequant + e8m0 per-1×32 scale application + fused silu_mul (all VALU); MFMA idle 63%. Likely partly architectural (B200 nvfp4 applies microscale in tensor core; MI mxfp4 applies e8m0 on VALU), but 37% MFMA util = headroom if VALU/scale/activation can overlap MFMA better or be cheapened. Lever = reduce VALU scale/activation cost in the FlyDSL mfma_moe1 kernel.
