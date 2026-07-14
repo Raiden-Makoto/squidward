@@ -21,8 +21,6 @@ ms/prefill forward. MI355X ~383 (fp8-tuned proj ‡, was ~390 bf16) vs B200 331 
 | Dense GEMM | router `hgemm`+`MT256x256` (bf16) | 5.6 | — | — | |
 | Dense GEMM | DenseMLP L0-2 (bf16) | 3.0 | — | — | |
 | **Dense GEMM** | | **83.3** | | **73.7** | **0.89x** |
-
-_Dense GEMM: MI rows are per-projection (fp8-tuned ‡); B200 rows are per-`nvjet_sm100` kernel — they do NOT correspond 1:1, only the section totals (83.3 vs 73.7) are comparable. B200 dense GEMM = `nvjet_sm100` 128x256 ≈40 + 176x128 ≈22 + 256x128 ≈12 = 73.7._
 | All-reduce | `quickreduce twoshot` (INT4) | 109.9 | `ncclDevKernel ...RING_LL` | 68.6 | |
 | All-reduce | `aiter::cross_device_reduce_2stage` | 20.8 | `mnnvl twoshot` + `rmsNormLamport` + one-shot | 70.9 | |
 | **All-reduce** | | **130.7** | | **139.5** | **1.07x** |
