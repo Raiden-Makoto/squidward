@@ -1,6 +1,6 @@
 # GLM-5.2 prefill — i1k/o1k conc64, TP4 — MI355X (MXFP4) vs B200 (NVFP4)
 
-ms/prefill forward. MI355X ~390 vs B200 331 (0.85x). Graphs-off eager, dense-MHA at i1k, `bench_serving` conc64 num256 `--profile-num-steps 4 --profile-by-stage`, EXTEND trace n_fwd=4. MI355X = `v0.5.15-rocm720-mi35x-20260711`, tuned MoE confirmed executing. All-reduce row carried over from prior clean capture (fresh QuickReduce profiler-perturbed).
+ms/prefill forward. MI355X ~383 (fp8-tuned proj ‡, was ~390 bf16) vs B200 331 (0.86x). Graphs-off eager, dense-MHA at i1k, `bench_serving` conc64 num256 `--profile-num-steps 4 --profile-by-stage`, EXTEND trace n_fwd=4. MI355X = `v0.5.15-rocm720-mi35x-20260711`, tuned MoE confirmed executing. All-reduce row carried over from prior clean capture (fresh QuickReduce profiler-perturbed).
 
 | Section | MI355X kernel | MI355X ms | B200 kernel | B200 ms | B200/MI355X |
 | --- | --- | ---: | --- | ---: | ---: |
@@ -14,18 +14,20 @@ ms/prefill forward. MI355X ~390 vs B200 331 (0.85x). Graphs-off eager, dense-MHA
 | MoE combine | `moe_reduction_kernel` | 22.6 | `finalizeKernelVecLoad` | 15.8 | 0.70x |
 | MoE act quant | `dynamic_per_group_scaled_quant` | 4.2 | `NVFP4Quantize` | 2.6 | 0.62x |
 | **MoE** | | **112.2** | | **76.7** | **0.68x** |
-| Dense GEMM | Tensile `MT256x256` | 27.7 | `nvjet_sm100 128x256` | ≈40 | |
-| Dense GEMM | Tensile `MT256x240/240x256/224x256` | 46.0 | `nvjet_sm100 176x128` | ≈22 | |
-| Dense GEMM | `aiter::bf16gemm_256x256` (q_b_proj ‡) | 8.4 | `nvjet_sm100 256x128` | ≈12 | |
-| Dense GEMM | `hgemm_bf16_128x128` (router) + misc | 10.0 | — | — | |
-| **Dense GEMM** | | **92.1** | | **73.7** | **0.80x** |
+| Dense GEMM | o_proj `a8w8_blockscale_bpreshuffle` (fp8 ‡) | 27.9 | — | — | |
+| Dense GEMM | q_a+kv_a Tensile `MT224x256/240x256` (bf16) | 26.1 | — | — | |
+| Dense GEMM | q_b_proj `a8w8_blockscale_bpreshuffle` (fp8 ‡) | 12.2 | — | — | |
+| Dense GEMM | kv_b Tensile `MT256x256/256x240` (bf16) | 8.6 | — | — | |
+| Dense GEMM | router `hgemm`+`MT256x256` (bf16) | 5.6 | — | — | |
+| Dense GEMM | DenseMLP L0-2 (bf16) | 3.0 | — | — | |
+| **Dense GEMM** | | **83.3** | | **73.7** | **0.89x** |
 | All-reduce | `quickreduce twoshot` (INT4) | 109.9 | `ncclDevKernel ...RING_LL` | 68.6 | |
 | All-reduce | `aiter::cross_device_reduce_2stage` | 20.8 | `mnnvl twoshot` + `rmsNormLamport` + one-shot | 70.9 | |
 | **All-reduce** | | **130.7** | | **139.5** | **1.07x** |
 | RMSNorm | `aiter::add_rmsnorm_quant` | 14.3 | `fused_add_rmsnorm` | 14.7 | 1.03x |
-| **TOTAL** | | **~390** | | **331** | **0.85x** |
+| **TOTAL** | | **~383** ‡ | | **331** | **0.86x** |
 
-‡ `q_b_proj`/`o_proj` are the two 128-aligned dense projections `SGLANG_DSA_FP8_PROJ_GEMM=1` (default off) converts to fp8 CK GEMM.
+‡ Dense GEMM section is the **fp8-tuned proj config**: `SGLANG_DSA_FP8_PROJ_GEMM=1` converts the 128-aligned `q_b_proj`/`o_proj` to fp8 `a8w8_blockscale_bpreshuffle`, **tuned** for GLM shapes (q_b_proj 4096,2048 / o_proj 6144,4096). vs bf16-off: o_proj 45.9→27.9, Dense GEMM total 92.1→83.3 (−8.8ms/−9.5%). Adds +2.3ms fp8 act-quant (o_proj input, not in GEMM total) → net dense-side −6.5ms. Tuning is mandatory (untuned = +8.8ms regression). Other sections are the fp8-off baseline capture.
 
 ## Status / levers
 
@@ -38,7 +40,7 @@ ms/prefill forward. MI355X ~390 vs B200 331 (0.85x). Graphs-off eager, dense-MHA
 | MoE act quant | 4.2 vs 2.6 | 0.62x | HBM-bound, no lever | `dynamic_per_group_scaled_quant` 30us@M16384 ~6.3 TB/s. Fusion into gemm1 TESTED = net LOSS: fp4q stage1 1615.7us vs bf16 1569.5 (+46us epilogue quant) > standalone quant 30us. gemm1 is VALU-saturated so in-epilogue group-max+pack has no free cycles. Tuner's bf16+separate-quant is correct. |
 | Attention FA (kernel) | 27.9 vs 9.9 | 0.35x | CLOSED | pin D256 `(128,128)` new-CK = 421us (−5.4%); rest architectural (B200 TMEM); DSA indexer = required decode-cache, not a lever — see detail |
 | MoE gate-up (gemm1) | 38.6 vs 32.1 | 0.83x | VALU-bound, not MFMA | MFMA 37% / VALU 100% @ M16384 (637.9us); native mxfp4 MFMA already used; bottleneck = per-MFMA fp4 packing + silu_mul; see detail |
-| Dense GEMM fp8 proj | — | — | redo | `SGLANG_DSA_FP8_PROJ_GEMM=1` A/B had anomalous all-reduce |
+| Dense GEMM fp8 proj | — | — | **WIN after tuning** | Tuned a8w8_blockscale_bpreshuffle for q_b_proj(4096,2048)+o_proj(6144,4096) M∈{1k..64k}, then fp8-ON e2e (GPU4-7): Dense GEMM **83.3ms vs 92.1 bf16 = −8.8ms/−9.5%**. o_proj 45.9→**27.9** (−39%, the whole swing); q_b_proj flat 12.2. +2.3ms fp8 act-quant → still −6.5ms net. Untuned it was +8.8ms REGRESSION — tuning is mandatory. DEPLOY: `SGLANG_DSA_FP8_PROJ_GEMM=1` + carry tuned config (box-local in model_configs/glm5_a8w8_blockscale_bpreshuffle_tuned_gemm.csv). |
 | Router GEMM | — | — | no lever | B200 fuses; standalone 547→1196 TF |
 | Dense GEMM `MT256x256` | 27.7 vs ≈40 | 1.4x | MI faster | — |
 | All-reduce | 130.7 vs 139.5 | 1.07x | parity | — |

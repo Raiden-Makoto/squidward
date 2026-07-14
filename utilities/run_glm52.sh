@@ -9,6 +9,13 @@ export SAFETENSORS_FAST_GPU=1
 export SGLANG_ROCM_FUSED_DECODE_MLA=0
 export SGLANG_DSA_TRITON_PREFILL=1
 export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
+# fp8 dense projections (q_b_proj/o_proj) -> tuned fp8 a8w8_blockscale_bpreshuffle CK GEMM.
+# Dense GEMM section -8.8ms/-9.5% (o_proj 45.9->27.9). Untuned = +8.8ms regression, so the
+# tuned config below is REQUIRED. The box aiter is stock (config edits are box-local/lost),
+# so we carry the tuned rows for q_b_proj(4096,2048)/o_proj(6144,4096) in-repo and point aiter
+# at them via env (same pattern as AITER_CONFIG_FMOE). Disable via SGLANG_DSA_FP8_PROJ_GEMM=0.
+export SGLANG_DSA_FP8_PROJ_GEMM=${SGLANG_DSA_FP8_PROJ_GEMM:-1}
+export AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE=${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE:-${SCRIPT_DIR}/glm5_a8w8_blockscale_bpreshuffle_tuned.csv}
 # Tuned MoE (fmoe) config: upstream aiter glm5_fp4 tiles (faster than the old
 # glm_fp8fp4). Override by exporting AITER_CONFIG_FMOE before launch.
 export AITER_CONFIG_FMOE=${AITER_CONFIG_FMOE:-${SCRIPT_DIR}/glm5_fp4_tuned_fmoe.csv}
