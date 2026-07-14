@@ -34,8 +34,8 @@ ms/prefill forward. MI355X ~390 vs B200 331 (0.85x). Graphs-off eager, dense-MHA
 | Dense GEMM `MT256x240/240x256/224x256` | 46.0 vs ≈22 | 0.48x | **UNEXPLORED — biggest untouched gap** | ragged Tensile tiles (240/224 = non-256-aligned N); try tile/pad/backend |
 | MoE gemm2 | 46.7 vs 26.2 | 0.56x | CK re-test BLOCKED (upstream CK bug) | new mxfp4 MoE pipeline + its compile-breaking loader landed in same CK commit #8260; won't build thru develop tip. FlyDSL wins/deployed; see detail |
 | MoE gemm2↔combine fusion | — | — | DEAD | no CDNA4 PDL overlap; fused megakernel 5.6x slower |
-| MoE combine | 22.6 vs 15.8 | 0.70x | open | — |
-| MoE act quant | 4.2 vs 2.6 | 0.62x | open | — |
+| MoE combine | 22.6 vs 15.8 | 0.70x | HBM-bound, no lever | `moe_reduction` 366us@M16384 ~5.5 TB/s; combine fusion DEAD (gemm2+combine megakernel 5.6x slower) |
+| MoE act quant | 4.2 vs 2.6 | 0.62x | HBM-bound, no lever | `dynamic_per_group_scaled_quant` 30us@M16384 ~6.3 TB/s. Fusion into gemm1 TESTED = net LOSS: fp4q stage1 1615.7us vs bf16 1569.5 (+46us epilogue quant) > standalone quant 30us. gemm1 is VALU-saturated so in-epilogue group-max+pack has no free cycles. Tuner's bf16+separate-quant is correct. |
 | Attention FA (kernel) | 27.9 vs 9.9 | 0.35x | CLOSED | pin D256 `(128,128)` new-CK = 421us (−5.4%); rest architectural (B200 TMEM); DSA indexer = required decode-cache, not a lever — see detail |
 | MoE gate-up (gemm1) | 38.6 vs 32.1 | 0.83x | VALU-bound, not MFMA | MFMA 37% / VALU 100% @ M16384 (637.9us); native mxfp4 MFMA already used; bottleneck = per-MFMA fp4 packing + silu_mul; see detail |
 | Dense GEMM fp8 proj | — | — | redo | `SGLANG_DSA_FP8_PROJ_GEMM=1` A/B had anomalous all-reduce |
