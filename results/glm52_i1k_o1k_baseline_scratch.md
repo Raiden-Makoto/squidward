@@ -2,7 +2,7 @@
 
 TP4 MI355X GPUs 4-7, port 8552. `bash utilities/e2e_glm5.sh 1024 1024 0`
 (random, input=1024, output=1024, num-prompts=conc*4), graphs-on, median.
-c4/c8 = 4-rep avg, c64 = 3-rep avg (obvious outlier dropped); c16/c32 = single run.
+c4/c8 = 4-rep avg, c64 = 6-rep avg (obvious outlier dropped); c16/c32 = single run.
 c64 TTFT is queue-variance-dominated (rep spread ~1.1-1.5s), so its Δ is noise.
 
 ## Baseline — fp8-proj off (bf16 dense-fallback-on, post-#30808)
@@ -26,4 +26,4 @@ Prefill (M>512) → tuned fp8 CK GEMM; decode (M<=512) → bf16. GSM8K 200q = 0.
 | 8           | 255.0     | −0.3%  | 13.74 | +0.4% | 14354 | +0.1% | 570.31 | −0.1% |
 | 16          | 499.5     | −5.1%  | 16.39 | −0.4% | 17296 | −0.8% | 946.1  | +1.2% |
 | 32          | 678.4     | −13.4% | 20.28 | −1.0% | 21778 | −0.5% | 1503.3 | +0.3% |
-| 64          | 1145.2    | +3.9%  | 27.09 | −0.3% | 29672 | −0.2% | 2208.2 | +0.3% |
+| 64          | 1137.4    | +3.2%  | 27.08 | −0.3% | 29658 | −0.3% | 2208.4 | +0.3% |
