@@ -1,9 +1,9 @@
-# GLM-5.2-MXFP4 i1k/o1k baseline (scratch)
+# GLM-5.2-MXFP4 i1k/o1k (scratch)
 
-Stock aiter (no `SGLANG_MOE2_PIPE`), TP4 MI355X GPUs 4-7, port 8552.
-`bash utilities/e2e_glm5.sh 1024 1024 0` (random, input=1024, output=1024, num-prompts=conc*4).
+TP4 MI355X GPUs 4-7, port 8552. `bash utilities/e2e_glm5.sh 1024 1024 0`
+(random, input=1024, output=1024, num-prompts=conc*4), graphs-on, median.
 
-## A. baseline (fp8-proj off)
+## Baseline — fp8-proj off (bf16 dense-fallback-on, post-#30808)
 
 | concurrency | TTFT (ms) | ITL (ms) | E2EL (ms) | output tok/s |
 |-------------|-----------|----------|-----------|--------------|
@@ -13,17 +13,7 @@ Stock aiter (no `SGLANG_MOE2_PIPE`), TP4 MI355X GPUs 4-7, port 8552.
 | 32          | 783.2     | 20.48    | 21895     | 1498.13      |
 | 64          | 1125.6    | 26.10    | 29352     | 2227.3       |
 
-## B. fp8-proj on, decode-tuned (`SGLANG_DSA_FP8_PROJ_GEMM=1`)
-
-| concurrency | TTFT (ms) | ITL (ms) | E2EL (ms) | output tok/s |
-|-------------|-----------|----------|-----------|--------------|
-| 4           | 197.1     | 12.15    | 12616     | 322.2        |
-| 8           | 372.1     | 13.99    | 14703     | 553.4        |
-| 16          | 511.0     | 16.61    | 17510     | 930.4        |
-| 32          | 749.2     | 20.16    | 21754     | 1505.5       |
-| 64          | 1138.3    | 27.06    | 29553     | 2211.0       |
-
-## C. fp8-proj on, prefill-only gated (`SGLANG_DSA_FP8_PROJ_GEMM=1`, decode bf16)
+## Feature — fp8-proj prefill-only gated (`SGLANG_DSA_FP8_PROJ_GEMM=1`, decode bf16)
 
 Prefill (M>512) → tuned fp8 CK GEMM; decode (M<=512) → bf16. GSM8K 200q = 0.930.
 
@@ -34,38 +24,3 @@ Prefill (M>512) → tuned fp8 CK GEMM; decode (M<=512) → bf16. GSM8K 200q = 0.
 | 16          | 499.5     | 16.39    | 17296     | 946.1        |
 | 32          | 678.4     | 20.28    | 21778     | 1503.3       |
 | 64          | 1123.5    | 27.10    | 29667     | 2209.3       |
-
-## Δ (B vs A) — un-gated fp8
-
-| concurrency | TTFT | ITL | E2EL | output tok/s |
-|-------------|------|-----|------|--------------|
-| 4  | +0.1% | +7.4% | +7.1% | −7.1% |
-| 8  | +1.4% | +7.6% | +7.6% | −4.9% |
-| 16 | −3.0% | +0.9% | +0.4% | −0.5% |
-| 32 | −4.3% | −1.6% | −0.6% | +0.5% |
-| 64 | +1.1% | +3.7% | +0.7% | −0.7% |
-
-## Δ (C vs B) — gating recovers decode
-
-| concurrency | TTFT | ITL | E2EL | output tok/s |
-|-------------|------|-----|------|--------------|
-| 4  | +0.2% | −2.6% | −2.4% | +3.2% |
-| 8  | −31.4% | −1.9% | −2.0% | +2.8% |
-| 16 | −2.3% | −1.3% | −1.2% | +1.7% |
-| 32 | −9.4% | +0.6% | +0.1% | −0.1% |
-| 64 | −1.3% | +0.1% | +0.4% | −0.1% |
-
-## D. c4/c8 de-noised — 4 reps same-session, median, obvious outlier dropped
-
-gated = prefill-only fp8 (this branch); bf16 = `SGLANG_DSA_FP8_PROJ_GEMM=0`.
-Dropped outlier: bf16 c8 TTFT rep2 (325.45 vs ~255). All Δ within ±0.5% = parity;
-decode (ITL/tok-s) unchanged vs bf16, as expected since gated decode IS bf16.
-
-| conc | metric | bf16 | gated | Δ |
-|------|--------|------|-------|---|
-| 4 | tok/s | 331.96 | 332.58 | +0.2% |
-| 4 | TTFT (ms) | 198.90 | 197.81 | −0.5% |
-| 4 | ITL (ms) | 11.82 | 11.83 | +0.1% |
-| 8 | tok/s | 570.97 | 570.31 | −0.1% |
-| 8 | TTFT (ms) | 255.68 | 255.00 | −0.3% |
-| 8 | ITL (ms) | 13.68 | 13.74 | +0.5% |
