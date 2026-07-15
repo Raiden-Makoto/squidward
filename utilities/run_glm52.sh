@@ -7,7 +7,6 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 export SAFETENSORS_FAST_GPU=1
 export SGLANG_ROCM_FUSED_DECODE_MLA=0
-export SGLANG_DSA_TRITON_PREFILL=1
 export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
 # fp8 dense projections (q_b_proj/o_proj) -> tuned fp8 a8w8_blockscale_bpreshuffle CK GEMM.
 # Dense GEMM section -8.8ms/-9.5% (o_proj 45.9->27.9). Untuned = +8.8ms regression, so the
