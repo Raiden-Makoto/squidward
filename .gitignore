@@ -291,3 +291,6 @@ utilities/dsv4_guard*
 # Cursor MCP config holds a (read-only) GitHub PAT - never commit
 .cursor/mcp.json
 **/.cursor/mcp.json
+
+# Internal, non-published docs
+internal-docs/
