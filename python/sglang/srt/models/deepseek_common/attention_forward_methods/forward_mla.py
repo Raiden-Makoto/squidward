@@ -894,7 +894,15 @@ class DeepseekMLAForwardMixin:
                 # _bmm_buf is already (batch, heads, dim) contiguous
                 if self.o_proj.weight.dtype == torch.uint8:
                     attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)
-                elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+                elif self.o_proj.weight.dtype == torch.float8_e4m3fn or (
+                    _use_aiter_gfx95
+                    and getattr(self.o_proj, "_fp8_proj_ready", False)
+                ):
+                    # Fold o_proj's activation quant into the flatten epilogue so the
+                    # marked bf16-weight o_proj (all-M FP8) receives a pre-quantized
+                    # (fp8, scale) tuple and skips the standalone dynamic quant kernel
+                    # in apply() — the analog of q_b's fused RMSNorm+quant. Removes the
+                    # small-M decode penalty from the separate quant launch.
                     attn_bmm_output = fused_flatten_fp8_group_quant(
                         _bmm_buf,
                         group_size=128,
@@ -906,7 +914,12 @@ class DeepseekMLAForwardMixin:
             elif self.o_proj.weight.dtype == torch.uint8:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
-            elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+            elif self.o_proj.weight.dtype == torch.float8_e4m3fn or (
+                _use_aiter_gfx95 and getattr(self.o_proj, "_fp8_proj_ready", False)
+            ):
+                # See the _bmm_buf branch above: fuse o_proj's activation quant into
+                # the flatten epilogue for the marked bf16-weight o_proj so decode
+                # skips the standalone quant kernel.
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_fp8_group_quant(
                     attn_bmm_output,
