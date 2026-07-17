@@ -32,6 +32,7 @@ from sglang.srt.layers.utils import MultiPlatformOp, copy_or_rebind_param
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_int_env_var,
     is_cpu,
     is_gfx95_supported,
     is_hip,
@@ -65,8 +66,10 @@ _is_gfx95_supported = is_gfx95_supported()
 _DSA_FP8_PROJ_GEMM = get_bool_env_var("SGLANG_DSA_FP8_PROJ_GEMM")
 # Token-count gate: tokens beyond this count are treated as prefill and take the
 # FP8 projection GEMM. Decode cuda-graph batch sizes top out at 512, so M <= 512
-# stays bf16.
-_FP8_PROJ_PREFILL_M_MIN = 512
+# stays bf16 by default. Set SGLANG_DSA_FP8_PROJ_M_MIN=0 to also run decode on FP8
+# (all-fp8): valid once q_b's activation-quant is fused into q_a_layernorm and
+# o_proj's inline-quant fp8 still beats bf16 at small M.
+_FP8_PROJ_PREFILL_M_MIN = get_int_env_var("SGLANG_DSA_FP8_PROJ_M_MIN", 512)
 
 
 def _fp8_proj_gemm_enabled(layer: torch.nn.Module) -> bool:
