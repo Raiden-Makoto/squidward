@@ -342,6 +342,30 @@ class DeepseekMLAForwardMixin:
                                 transpose_scale=_use_aiter_bpreshuffle_gfx95,
                             )
 
+                    elif _use_aiter_gfx95 and getattr(
+                        self.q_b_proj, "_fp8_proj_ready", False
+                    ):
+                        # fp8-proj gate (bf16 weight + private fp8 copy): fp8-quant
+                        # only q so q_b_proj takes the (fp8, scale) tuple path and
+                        # skips the standalone dynamic_per_group_scaled_quant (the
+                        # decode-regression cause). k_nope stays bf16 (kv_b is not
+                        # fp8-gated); q_lora (bf16) is kept for the DSA indexer.
+                        q_quanted, q_lora, _, _ = fused_rms_fp8_group_quant(
+                            q,
+                            self.q_a_layernorm.weight,
+                            self.q_a_layernorm.variance_epsilon,
+                            None,
+                            None,
+                            None,
+                            group_size=128,
+                            dtype_quant=torch.float8_e4m3fn,
+                            res1=None,
+                            output_unquantized_inp1=True,
+                            transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                        )
+                        q = q_quanted
+                        k_nope = self.kv_a_layernorm(k_nope)
+
                     elif _use_aiter:
                         q, k_nope = fused_qk_rmsnorm_bf16(
                             q,
