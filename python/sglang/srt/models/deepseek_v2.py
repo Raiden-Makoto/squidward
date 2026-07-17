@@ -1688,10 +1688,15 @@ class DeepseekV2AttentionMLA(
         # the layer is unquantized (quark-excluded bf16). Only 128-aligned
         # projections qualify (q_b [.,2048], o_proj [6144,.]); fused_qkv_a
         # (out=2624) is not 128-aligned, and kv_b_proj is the absorbed-bmm path.
-        for _fp8_proj_name in ("q_b_proj", "o_proj"):
+        # o_proj takes FP8 at all M (small-M fp8 still beats bf16 there — decode
+        # win); q_b_proj only at prefill (default M-gate) since at decode's
+        # forced-small M its activation quant costs more than the fp8 GEMM saves.
+        for _fp8_proj_name, _fp8_proj_m_min in (("q_b_proj", None), ("o_proj", 0)):
             _fp8_proj = getattr(self, _fp8_proj_name, None)
             if _fp8_proj is not None:
                 _fp8_proj._fp8_proj_gemm = True
+                if _fp8_proj_m_min is not None:
+                    _fp8_proj._fp8_proj_m_min = _fp8_proj_m_min
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         if not skip_rope:

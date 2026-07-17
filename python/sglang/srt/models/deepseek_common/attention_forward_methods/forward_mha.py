@@ -144,13 +144,9 @@ class DeepseekMHAForwardMixin:
                 # on gfx95, we can still use fused RMSNorm+FP8 quant, but MUST request
                 # the unquantized output for q_lora; otherwise q_lora becomes the (fp8,scale)
                 # tuple.
-                if _use_aiter_gfx95 and (
-                    self.q_b_proj.weight.dtype == torch.float8_e4m3fn
-                    # fp8-proj gate: bf16 weight + private fp8 copy. Fuse the
-                    # activation quant into q_a_layernorm so q_b_proj takes the
-                    # pre-quantized (fp8, scale) tuple path and skips the standalone
-                    # dynamic_per_group_scaled_quant (the decode-regression cause).
-                    or getattr(self.q_b_proj, "_fp8_proj_ready", False)
+                if (
+                    _use_aiter_gfx95
+                    and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
                 ):
                     q_quanted, q_lora, _, _ = fused_rms_fp8_group_quant(
                         q,

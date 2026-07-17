@@ -308,14 +308,9 @@ class DeepseekMLAForwardMixin:
                     )
                 else:
                     q_lora = None
-                    if _use_aiter_gfx95 and (
-                        self.q_b_proj.weight.dtype == torch.float8_e4m3fn
-                        # fp8-proj gate (bf16 weight + private fp8 copy): reuse the
-                        # SAME fused q->fp8 + kv->bf16 RMSNorm kernel (inp2/kv is
-                        # RMS-normed only, returned bf16 — see fused_rms_fp8_group_quant
-                        # docstring "fp8 quantization for inp1 only"). q_b_proj takes
-                        # the (fp8,scale) tuple; NOT a separate kv norm.
-                        or getattr(self.q_b_proj, "_fp8_proj_ready", False)
+                    if (
+                        _use_aiter_gfx95
+                        and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
                     ):
                         if self.use_dsa:
                             q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(

@@ -207,7 +207,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
             # A pre-quantized (fp8_act, scale) tuple should not occur while
             # layer.weight stays bf16, but if it does the bf16 activation is
             # unavailable, so keep FP8 for that case regardless of M.
-            if m_tokens > _FP8_PROJ_PREFILL_M_MIN or isinstance(x, tuple):
+            # Per-projection M-gate: o_proj sets _fp8_proj_m_min=0 (FP8 at all M —
+            # small-M fp8 beats bf16 for it); q_b_proj uses the default (prefill-only,
+            # bf16 at decode's small M).
+            _m_min = getattr(layer, "_fp8_proj_m_min", _FP8_PROJ_PREFILL_M_MIN)
+            if m_tokens > _m_min or isinstance(x, tuple):
                 from sglang.srt.layers.quantization.fp8_utils import (
                     aiter_w8a8_block_fp8_linear,
                 )
