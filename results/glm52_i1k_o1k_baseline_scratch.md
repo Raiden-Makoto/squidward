@@ -42,7 +42,16 @@ weight bytes while fp8 stays flat → fp8 wins for M>=32. Fix: o_proj `_fp8_proj
 ## Feature — per-proj gated (`SGLANG_DSA_FP8_PROJ_GEMM=1`, o_proj fp8 M>16, q_b prefill-only)
 
 o_proj → tuned fp8 CK GEMM for M>16 (decode M>=32 + prefill), bf16 at M<=16; q_b_proj → fp8 only
-at prefill (M>512), bf16 at decode. GSM8K 400q = 0.932 / 0 invalid. Δ = vs baseline above.
+at prefill (M>512), bf16 at decode. GSM8K 400q = 0.932 / 0 invalid. Same-session clean sweep,
+3-rep median. Δ = vs baseline above.
 
-Decode-ITL validated neutral (o_proj bf16 at M<=16): c4 11.80 (base 11.82), c8 13.71 (base 13.70),
-c16 16.38 (base 16.34). Full clean sweep re-running for the complete table.
+| concurrency | TTFT (ms) | Δ | ITL (ms) | Δ | E2EL (ms) | Δ | output tok/s | Δ |
+|-------------|-----------|---|----------|---|-----------|---|--------------|---|
+| 4           | 198.7     | −0.2% | 11.79 | −0.3% | 12266 | −0.3% | 333.71 | +0.4% |
+| 8           | 238.4     | −7.5% | 13.71 | +0.1% | 14341 | −0.0% | 570.47 | −0.1% |
+| 16          | 502.7     | −1.2% | 16.37 | +0.2% | 17314 | +0.1% | 946.38 | −0.1% |
+| 32          | 735.2     | +4.5% | 20.31 | −0.1% | 21789 | −0.4% | 1502.82 | +0.1% |
+| 64          | 1183.4    | +4.6% | 27.10 | +0.1% | 29663 | −0.1% | 2205.61 | +0.0% |
+
+Decode ITL now neutral at all conc (was +2.1%/+1.8%/+1.2% at c4/c8/c16 under all-M). E2EL/tok-s
+neutral. TTFT queue-variance-dominated at c32/c64 (rep spread c32 657-786, c64 1133-1232).
