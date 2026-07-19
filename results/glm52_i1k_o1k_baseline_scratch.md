@@ -1,5 +1,11 @@
 # GLM-5.2-MXFP4 i1k/o1k (scratch)
 
+> STATUS: o_proj reverted to **prefill-only** (bf16 at decode); q_b quant fusion kept. The
+> "o_proj fp8 M>16" tables below are the superseded gate config — o_proj-fp8-at-decode raised
+> c32 TTFT at the prefill↔decode knee (see glm52_dense_gemm_fp8_vs_bf16_scratch.md "Decision").
+> Final config = prefill-only fp8 (q_b + o_proj) + q_b→q_a_layernorm quant fusion.
+
+
 TP4 MI355X GPUs 4-7, port 8552. `bash utilities/e2e_glm5.sh 1024 1024 0`
 (random, input=1024, output=1024, num-prompts=conc*4), graphs-on. Both tables are
 **same-session, one clean sweep each** (baseline `SGLANG_DSA_FP8_PROJ_GEMM=0`, per-proj `=1`;

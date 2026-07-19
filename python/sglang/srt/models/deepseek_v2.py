@@ -1688,14 +1688,16 @@ class DeepseekV2AttentionMLA(
         # the layer is unquantized (quark-excluded bf16). Only 128-aligned
         # projections qualify (q_b [.,2048], o_proj [6144,.]); fused_qkv_a
         # (out=2624) is not 128-aligned, and kv_b_proj is the absorbed-bmm path.
-        # o_proj takes FP8 for M>16 (M-gate=16): at decode's small M (<=16) the bf16
-        # and fp8 o_proj GEMMs cost the same (~12us, latency-bound, not weight-BW
-        # bound), so fp8's ~2us activation quant is pure overhead and loses (~+22% at
-        # M=4). The crossover is M~=32, where bf16 starts scaling with its 2x weight
-        # bytes while fp8 stays flat — so fp8 wins for M>=32 (high-conc decode +
-        # prefill). q_b_proj stays prefill-only (default M-gate). Cold-weight
-        # microbench: results/glm52_i1k_o1k_baseline_scratch.md.
-        for _fp8_proj_name, _fp8_proj_m_min in (("q_b_proj", None), ("o_proj", 16)):
+        # Both q_b_proj and o_proj are FP8 PREFILL-ONLY (default M-gate, M>512): fp8 at
+        # prefill (large-M, clear GEMM win), bf16 at decode. o_proj was briefly gated at
+        # M>16 to also take fp8 for decode M>=32 (small isolated-GEMM win), but that adds
+        # o_proj fp8 + activation-quant WORK to the decode path, which at the prefill<->
+        # decode throughput knee (~c32) contends with the interleaved new-request prefill
+        # and raises TTFT there (+7% median), while every prefill-only optimization
+        # decreases c32 TTFT. The isolated decode-GEMM win (~-3% at M=32) is not worth the
+        # TTFT side-effect, so o_proj stays prefill-only too. Decode side-effects +
+        # analysis: results/glm52_dense_gemm_fp8_vs_bf16_scratch.md.
+        for _fp8_proj_name, _fp8_proj_m_min in (("q_b_proj", None), ("o_proj", None)):
             _fp8_proj = getattr(self, _fp8_proj_name, None)
             if _fp8_proj is not None:
                 _fp8_proj._fp8_proj_gemm = True

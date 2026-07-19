@@ -74,3 +74,19 @@ Removed ~630 kernel launches (the standalone q_b `dynamic_per_group_scaled_quant
 dropped 48.6% → 45.4%, back to the bf16 baseline — the fp8 host-idle penalty is erased.
 GSM8K 200q = 0.945 / 0 invalid. Remaining lever: o_proj quant (still a standalone launch; needs
 an attention-epilogue fusion in the backend, not a host-side change).
+
+## Decision — revert o_proj to prefill-only; keep q_b fusion (commit pending)
+
+Final config: q_b_proj AND o_proj FP8 **prefill-only** (M>512 → fp8, bf16 at decode), plus the
+q_b activation-quant folded into q_a_layernorm at prefill. This is the original prefill-only plan
++ the host-side q_b fusion.
+
+Why o_proj is NOT fp8 at decode (dropping the earlier M>16 gate): running o_proj fp8 at decode is
+the only change that touches the decode path, and it raises **c32 TTFT (+7% median)** while every
+prefill-only optimization *decreases* c32 TTFT. Cause: c32 sits at the prefill↔decode throughput
+knee (tok/s scaling 1.72→1.66→1.58→1.48× per doubling from c4→c64 — decode saturating). Below the
+knee (c≤16) TTFT is prefill-bound → fp8 prefill helps; above (c64) it's decode-bound → cheaper fp8
+decode frees slots → helps; AT the knee (c32) neither dominates, so the extra o_proj fp8 GEMM +
+quant on the decode steps purely contends with the interleaved new-request prefill → TTFT up. The
+isolated decode-GEMM win is only ~−3% at M=32 (see microbench in glm52_i1k_o1k doc), not worth the
+knee TTFT cost. So o_proj stays prefill-only. Decode-side note recorded per the revert decision.
