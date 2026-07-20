@@ -60,4 +60,4 @@ exec sglang serve \
   --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' \
   --kv-cache-dtype fp8_e4m3 \
   --tokenizer-worker-num 8 \
-  --chunked-prefill-size 131072
+  --chunked-prefill-size ${CHUNKED_PREFILL_SIZE:-131072}
