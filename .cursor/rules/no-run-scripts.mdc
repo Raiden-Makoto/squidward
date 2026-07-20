@@ -7,9 +7,12 @@ alwaysApply: true
 The ONLY run/launcher/benchmark scripts that may ever be used are the
 version-controlled ones in the repo `utilities/` folder, e.g.:
 
-- `utilities/run_glm52.sh` — canonical GLM-5.2-MXFP4 server launcher (baseline)
-- `utilities/run_glm5_ab.sh` — dual-server baseline-vs-flag A/B launcher
+- `utilities/run_glm52.sh` — canonical GLM-5.2-MXFP4 server launcher
 - `utilities/e2e_glm5.sh` — end-to-end throughput/latency sweep
+
+A/B is sequential on ONE server: launch `run_glm52.sh` with the feature flag off
+(baseline), run `e2e_glm5.sh`, then relaunch with `SGLANG_DSA_FP8_PROJ_GEMM=1`
+(feature) and run `e2e_glm5.sh` again. There is no dual-server launcher.
 
 ## Hard rules
 
