@@ -8,9 +8,13 @@
 # NOTE on profiling: --profile only writes traces if the SERVER was launched
 # with SGLANG_TORCH_PROFILER_DIR set to a matching dir.
 #
+# A/B is sequential on ONE server: launch baseline (flag off), sweep, then
+# relaunch with SGLANG_DSA_FP8_PROJ_GEMM=1 (feature), sweep again. Same GPUs,
+# same port. There is no simultaneous two-server setup.
+#
 # Usage:
 #   bash e2e_glm5.sh [INPUT_LEN] [OUTPUT_LEN] [ENABLE_PROFILE]
-#   PORT=8553 OUT_DIR=/root/glm5-bench-flag bash e2e_glm5.sh   # e.g. flag server
+#   OUT_DIR=/root/glm5-bench-feat bash e2e_glm5.sh            # tag the run's output
 #   CONCURRENCY="1 2 4 8 16 32 64" bash e2e_glm5.sh            # override sweep
 
 # ===== Default parameters =====
@@ -19,8 +23,6 @@ OUTPUT_LEN=${2:-1024}
 ENABLE_PROFILE=${3:-0}   # 1 = enable profile, 0 = disable
 
 # ===== Server / sweep config (override via env) =====
-# PORT is configurable so the sweep can target either server when running two
-# TP4 servers at once (e.g. baseline on 8552, flag-on on 8553 via run_glm5_ab.sh).
 PORT=${PORT:-8552}
 CONCURRENCY=${CONCURRENCY:-"4 4 8 16 32 64"}
 
