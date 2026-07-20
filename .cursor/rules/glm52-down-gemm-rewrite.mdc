@@ -1,32 +1,52 @@
 ---
-description: PINNED context for the GLM-5.2 MoE down-GEMM (stage-2) kernel rewrite. Temporary - remove when the rewrite lands.
+description: PINNED context for the GLM-5.2 MoE GEMM kernel work (gemm1 gate-up small-M root-cause). Temporary - remove when the gemm1 lever lands.
 alwaysApply: true
 ---
 
-# GLM-5.2 down-GEMM rewrite — always reference
+# GLM-5.2 MoE GEMM kernel work — always reference
 
-Full working notes: `results/glm52_down_gemm_rewrite_notes.md`. Read it before editing the kernel.
+Full working notes: `results/glm52_prefill_i1k_c64_profile.md` (the `MoE gemm1`/`gemm2` detail
+sections + the status/levers table). Read it before touching a kernel.
 
-## Target (edit the RIGHT file)
+## Current focus: gemm1 (gate-up) new-CK small-M loss — the REAL fix
 
-- `compile_mixed_moe_gemm2` in `/home/macui/aiter/aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage.py`
-  (~lines 2910-4720; cache prefix `launch_mixed_moe_gemm2_*`).
-- NOT `moe_gemm_2stage.py` — that path is not executed for this shape.
-- Lever: grouped-K A staging (LDS `lds_x_bytes` @~3090 → G buffers; K-loop @~4327; drop per-pair
-  barriers @~4361/4405). Diagnosis: latency-bound (MfmaUtil 13%, MemUnitStalled 0.6%, occ 37%) — the
-  per-K-tile LDS-A `s_barrier` is the serializer; not BW/compute/dequant-throughput bound.
+- New-CK `gufusion_v3` (gate-up fusion) gemm1 vs FlyDSL `mfma_moe1 t128x128x256`, prod shape
+  (6144,512 per-rank, a4w4), per-call µs: **wins M≥8192 (−5→−7.6%), loses M≤4096**
+  (1024 +35%, 4096 +12%; 8192 −5.0%, 16384 −7.6%, 32768 −7.3%). Numerically ==FlyDSL
+  (logits_diff 1e-5).
+- **Goal: root-cause and fix the small-M regression** so CK wins across all M. That makes CK
+  viable for BOTH stages (gemm2 is already at parity) and removes the need for the fragile
+  CK-gemm1 ↔ FlyDSL-gemm2 "mixed dispatch" — that handoff (different intermediate layout/sort
+  contracts, breaks at some M) is a band-aid, not a solution.
+- CK gemm1 target: `csrc/ck_tile_gemm_moe_2stages/` (kernel `moe_cktile2stages.cu` /
+  `include/moe_cktile2stages_common.cuh`; per-shape codegen `gen_instances.py`).
+
+## gemm2 (down-GEMM): PARKED — do NOT rewrite
+
+- CK port (`flydsl_mxmoe_g2` / `mfma_moe2`) ≈ FlyDSL at best (−1% @16k, +15% @8k); the newer CK
+  version is ~39% slower @16k. No CK win. The 0.55x vs B200 gap is architectural (FlyDSL-vs-B200),
+  not closeable by a CK rewrite.
+- The glm5-shape codegen gap (`(257,6144,512,9)` missing from `csrc/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py SHAPES`)
+  is only WHY it defaults to FlyDSL — closing it yields no perf. FlyDSL gemm2 lives in
+  `aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage.py` (`compile_mixed_moe_gemm2`); leave it alone.
+- Disregard all legacy `kernel_moe_mxgemm_2lds` bypass numbers (2.4×/2855us/occupancy/split-K) —
+  that path was never deployed.
 
 ## Non-negotiable gotchas (each burned real cycles)
 
-1. After ANY kernel edit: `rm -rf /sgl-workspace/aiter_dev/aiter/jit/flydsl_cache/*` before testing —
-   the FlyDSL disk cache silently serves the OLD kernel otherwise.
-2. `logits_diff` varies run-to-run (random fp4 inputs) — NOT a valid before/after delta. Judge perf by
-   rocprof `MfmaUtil` / gemm2 us; add a `sys.stderr.write` in the compile fn to CONFIRM it recompiled.
+1. After ANY FlyDSL kernel edit: `rm -rf /sgl-workspace/aiter_dev/aiter/jit/flydsl_cache/*` before
+   testing — the FlyDSL disk cache silently serves the OLD kernel otherwise. (CK edits: rebuild the
+   affected module; confirm recompile with a `sys.stderr.write` in the compile/gen path.)
+2. `logits_diff` varies run-to-run (random fp4 inputs) — NOT a valid before/after delta. Judge perf
+   by rocprof `MfmaUtil` / per-call µs.
 3. rocprofv3 multi-metric `--pmc A B C` HANGS — use single-metric passes + `--kernel-trace`; analyze
    with `utilities/pmc_pick.py` / `utilities/kt_analyze.py`.
 
 ## Dev flow
 
-Box `smci355-ccs-aus-m12-17.cs-aus.dcgpu`, container `glm5`. Edit fork `/home/macui/aiter`, sync to
+Box `smci355-ccs-aus-m12-17.cs-aus.dcgpu`, container `glm5` (now on image
+`glm52-fork-aiter0720-ckb675945`, aiter `632367677`). NOTE: the box aiter (0720) has `gufusion_v3`;
+local `/home/macui/aiter` (`889a79fce`, 07-16) does not — work against the box aiter, synced to
 scratch `/sgl-workspace/aiter_dev` (leave `/sgl-workspace/aiter` untouched), `PYTHONPATH=/sgl-workspace/aiter_dev`.
-Microbench: `python3 op_tests/test_moe_2stage.py -q 4 -dim 6144,2048 -e 257 -k 9 -t 512 --no-flydsl-csv`.
+Microbench (gemm1 sweep, single GPU): `python3 op_tests/test_moe_2stage.py --kernel -q <M> -dim 6144,512 -e 257 -k 9 -t 512`.
+GPUs 4-7 run production; GPUs 0-3 are currently in a bad state (TP4 load hangs on rank 3) — verify a GPU before microbenching.
