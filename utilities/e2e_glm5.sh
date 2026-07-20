@@ -16,6 +16,11 @@
 #   bash e2e_glm5.sh [INPUT_LEN] [OUTPUT_LEN] [ENABLE_PROFILE]
 #   OUT_DIR=/root/glm5-bench-feat bash e2e_glm5.sh            # tag the run's output
 #   CONCURRENCY="1 2 4 8 16 32 64" bash e2e_glm5.sh            # override sweep
+#   REPS=4 bash e2e_glm5.sh                                    # repeat each conc 4x
+#
+# REPS repeats the whole concurrency sweep N times; every run writes its own
+# log (unique run index in the filename), so e2e_table.py averages across reps
+# per concurrency (central-limit smoothing for the noisy TTFT median).
 
 # ===== Default parameters =====
 INPUT_LEN=${1:-8192}
@@ -25,6 +30,7 @@ ENABLE_PROFILE=${3:-0}   # 1 = enable profile, 0 = disable
 # ===== Server / sweep config (override via env) =====
 PORT=${PORT:-8552}
 CONCURRENCY=${CONCURRENCY:-"4 4 8 16 32 64"}
+REPS=${REPS:-1}
 
 # ===== Output directory (override with OUT_DIR=...) =====
 OUT_DIR=${OUT_DIR:-/sgl-workspace/squidward/results/glm5-bench}
@@ -44,16 +50,21 @@ echo "PORT=${PORT}"
 echo "INPUT_LEN=${INPUT_LEN}"
 echo "OUTPUT_LEN=${OUTPUT_LEN}"
 echo "CONCURRENCY=${CONCURRENCY}"
+echo "REPS=${REPS}"
 echo "PROFILE=${ENABLE_PROFILE}"
 echo "TIMESTAMP=${TIMESTAMP}"
 echo "OUT_DIR=${OUT_DIR}"
 [ "${ENABLE_PROFILE}" -eq 1 ] && echo "PROFILER_DIR=${SGLANG_TORCH_PROFILER_DIR}"
 
+n=0
+for rep in $(seq 1 ${REPS})
+do
 for concurrency in ${CONCURRENCY}
 do
+    n=$((n + 1))
     prompt=$((concurrency * 4))
 
-    LOG_FILE="${OUT_DIR}/glm5_${INPUT_LEN}_${OUTPUT_LEN}_tp4_c-${concurrency}_${TIMESTAMP}.log"
+    LOG_FILE="${OUT_DIR}/glm5_${INPUT_LEN}_${OUTPUT_LEN}_tp4_c-${concurrency}_run-${n}_${TIMESTAMP}.log"
 
     CMD="PYTHONPATH=/sgl-workspace/squidward/python:\${PYTHONPATH} python3 -m sglang.bench_serving \
         --backend sglang \
@@ -70,8 +81,9 @@ do
         CMD="${CMD} --profile --profile-num-steps 4 --profile-by-stage"
     fi
 
-    echo "Running: ${CMD}"
+    echo "Running [rep ${rep}/${REPS}]: ${CMD}"
     echo "Log: ${LOG_FILE}"
 
     eval ${CMD} 2>&1 | tee "${LOG_FILE}"
+done
 done
