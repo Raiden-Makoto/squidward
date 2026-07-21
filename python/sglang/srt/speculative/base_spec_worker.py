@@ -1,69 +1,15 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
-
-import torch
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.io_struct import (
+        UpdateWeightFromDiskReqInput,
+        UpdateWeightsFromIPCReqInput,
+    )
     from sglang.srt.managers.tp_worker import TpModelWorker
-    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
-        EAGLEDraftCudaGraphRunner,
-    )
-    from sglang.srt.speculative.eagle_info import (
-        EagleDraftExtendInput,
-        EagleDraftInput,
-    )
-
-
-def duplicate_prefix_tail_to_draft_branches(
-    token_to_kv_pool,
-    rows: torch.Tensor,
-    prefix_base: torch.Tensor,
-    last_page: torch.Tensor,
-    num_new_pages: torch.Tensor,
-    topk: int,
-    page_size: int,
-) -> None:
-    """Copy the prefix partial-tail page into each branch's first-page holes (page>1 + topk>1).
-
-    The draft-decode expand pass reads each branch's own draft page by block id
-    (cache_loc // page_size), so branch b>=1's hole slots [0, last_page) must hold the
-    real prefix tail (branch 0's first page already is it). Mirrors V1 #7725.
-    """
-    if topk <= 1:
-        return
-    bs = rows.shape[0]
-    page_off = torch.arange(page_size, device=rows.device, dtype=torch.int64)
-    branches = torch.arange(1, topk, device=rows.device, dtype=torch.int64).view(
-        1, topk - 1, 1
-    )
-    # Source: the prefix tail page [prefix_base, prefix_base + page_size), one per branch.
-    src_pos = (prefix_base.view(bs, 1, 1) + page_off.view(1, 1, page_size)).expand(
-        bs, topk - 1, page_size
-    )
-    # Target: branch b's first page [prefix_base + b*num_new_pages*page, + page_size).
-    tgt_pos = (
-        prefix_base.view(bs, 1, 1)
-        + branches * (num_new_pages.view(bs, 1, 1) * page_size)
-        + page_off.view(1, 1, page_size)
-    )
-    # Only [0, last_page) holds real prefix KV; [last_page, page_size) are the branch's
-    # own draft slots and must not be overwritten.
-    vmask = (page_off.view(1, 1, page_size) < last_page.view(bs, 1, 1)).expand(
-        bs, topk - 1, page_size
-    )
-    src_slots = torch.gather(rows, 1, src_pos.reshape(bs, -1)).reshape(
-        bs, topk - 1, page_size
-    )[vmask]
-    tgt_slots = torch.gather(rows, 1, tgt_pos.reshape(bs, -1)).reshape(
-        bs, topk - 1, page_size
-    )[vmask]
-    if src_slots.numel() > 0:
-        token_to_kv_pool.move_kv_cache(tgt_slots, src_slots)
 
 
 class EagleDraftWorkerBase(ABC):
@@ -74,6 +20,12 @@ class EagleDraftWorkerBase(ABC):
     @abstractmethod
     def draft_extend():
         pass
+
+    @property
+    def draft_runners(self) -> list[ModelRunner]:
+        """All draft model runners; multi-layer eagle overrides with its
+        per-step runner list."""
+        return [self.draft_runner]
 
     def alloc_memory_pool(self, **kwargs):
         pass
@@ -284,14 +236,14 @@ class EagleDraftWorkerBase(ABC):
 
 class BaseSpecWorker(ABC):
     @property
-    @abstractmethod
     def target_worker(self) -> TpModelWorker:
-        pass
+        return self._target_worker
 
     @property
-    @abstractmethod
-    def draft_worker(self) -> EagleDraftWorkerBase:
-        pass
+    def draft_worker(self) -> Optional[EagleDraftWorkerBase | TpModelWorker]:
+        # dflash / dspark drive the draft model through a plain TpModelWorker;
+        # ngram has no draft worker at all (returns None via its override).
+        return self._draft_worker
 
     @property
     def war_fastpath_runner(self):
@@ -307,19 +259,52 @@ class BaseSpecWorker(ABC):
         Default returns target only; subclasses extend with draft backends."""
         return (self.target_worker.model_runner.attn_backend,)
 
-    @abstractmethod
     def clear_cache_pool(self):
-        # TODO: move this abstract method to BaseTpWorker and call through self.model_runner
+        """Default no-op: the allocator and kv cache pool are shared with the
+        target worker and cleared by the scheduler."""
+        # TODO: move this method to BaseTpWorker and call through self.model_runner
         pass
 
-    def alloc_memory_pool(self, **kwargs):
-        pass
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        if self.draft_worker is not None:
+            self.draft_worker.alloc_memory_pool(
+                memory_pool_config=memory_pool_config,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
     def init_attention_backends(self):
-        pass
+        if self.draft_worker is not None:
+            self.draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
-        pass
+        if self.draft_worker is not None:
+            self.draft_worker.init_cuda_graphs()
+
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        for runner in self.draft_worker.draft_runners:
+            success, message = runner.weight_updater.update_weights_from_disk(
+                recv_req.model_path,
+                recv_req.load_format,
+                recapture_cuda_graph=recv_req.recapture_cuda_graph,
+            )
+            if not success:
+                return success, message
+        return True, "Succeeded to update model weights."
+
+    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+        for runner in self.draft_worker.draft_runners:
+            success, message = runner.weight_updater.update_weights_from_ipc(recv_req)
+            if not success:
+                return success, message
+        return True, "Succeeded to update model weights."
 
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
@@ -328,6 +313,14 @@ class BaseSpecWorker(ABC):
 
         Default no-op. Adaptive-aware workers override this to feed the
         controller without forcing a GPU→CPU sync in the worker hot path.
+        """
+        pass
+
+    def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+        """Hook called by the batch-result processor when a request finishes.
+
+        Default no-op. DSpark overrides this to settle / censor its
+        block-accept estimator state for the finished request.
         """
         pass
 

@@ -296,3 +296,5 @@ utilities/dsv4_guard*
 *.trace.json
 *.trace.json.gz
 *.trace.json.gz.*
+# Internal, non-published docs
+internal-docs/
