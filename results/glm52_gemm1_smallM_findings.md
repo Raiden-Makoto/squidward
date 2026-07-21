@@ -1,8 +1,17 @@
 # GLM-5.2 MoE gemm1 (gate-up) — CK vs FlyDSL small-M analysis
 
+INVALID — SCOPE ERROR. All CK numbers below were taken via `AITER_BYPASS_TUNE_CONFIG=1`,
+which runs the legacy `kernel_moe_mxgemm_2lds` (v2) kernel, NOT the deployable candidate
+`moe_ck2stages_gemm1_*_v3`. The bypass kernel is never deployed and must be disregarded.
+The VGPR=249 occupancy result is a property of that legacy kernel only. The v3 candidate has
+selectable tiles (incl. low-VGPR `64x32x32x128_1x1`) and must be benched via a tuned
+`AITER_CONFIG_FMOE` CSV whose `kernelName1` is a `moe_ck2stages_gemm1_*_v3` name — not bypass.
+The block_m heuristic point (Cause 1) still holds in principle, but its µs were also on the
+legacy kernel. Redo on the v3 candidate before citing any number here.
+
 - Shape: prod per-rank a4w4 mxfp4, `dim 6144,512`, E257, topk9, gfx950 / cu256
 - Bench: `op_tests/test_moe_2stage.py --kernel` (kernel_bench, isolated stage1), GPU4, per-call µs
-- CK forced via `AITER_BYPASS_TUNE_CONFIG=1 AITER_FLYDSL_FORCE=0` (kernel `kernel_moe_mxgemm_2lds`); FlyDSL = tuned `mfma_moe1`
+- CK forced via `AITER_BYPASS_TUNE_CONFIG=1 AITER_FLYDSL_FORCE=0` (kernel `kernel_moe_mxgemm_2lds` — LEGACY BYPASS); FlyDSL = tuned `mfma_moe1`
 
 ## Crossover — CK (optimal block_m) vs FlyDSL
 
