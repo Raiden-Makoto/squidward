@@ -1,58 +1,43 @@
-# GLM-5.2 MoE gemm1 (gate-up) — CK vs FlyDSL small-M analysis
-
-INVALID — SCOPE ERROR. All CK numbers below were taken via `AITER_BYPASS_TUNE_CONFIG=1`,
-which runs the legacy `kernel_moe_mxgemm_2lds` (v2) kernel, NOT the deployable candidate
-`moe_ck2stages_gemm1_*_v3`. The bypass kernel is never deployed and must be disregarded.
-The VGPR=249 occupancy result is a property of that legacy kernel only. The v3 candidate has
-selectable tiles (incl. low-VGPR `64x32x32x128_1x1`) and must be benched via a tuned
-`AITER_CONFIG_FMOE` CSV whose `kernelName1` is a `moe_ck2stages_gemm1_*_v3` name — not bypass.
-The block_m heuristic point (Cause 1) still holds in principle, but its µs were also on the
-legacy kernel. Redo on the v3 candidate before citing any number here.
+# GLM-5.2 MoE gemm1 (gate-up) — CK (ck2stages_v3) vs FlyDSL small-M analysis
 
 - Shape: prod per-rank a4w4 mxfp4, `dim 6144,512`, E257, topk9, gfx950 / cu256
-- Bench: `op_tests/test_moe_2stage.py --kernel` (kernel_bench, isolated stage1), GPU4, per-call µs
-- CK forced via `AITER_BYPASS_TUNE_CONFIG=1 AITER_FLYDSL_FORCE=0` (kernel `kernel_moe_mxgemm_2lds` — LEGACY BYPASS); FlyDSL = tuned `mfma_moe1`
+- CK candidate: `moe_ck2stages_gemm1_*_v3` — the deployable path, selected via a tuned
+  `AITER_CONFIG_FMOE` `kernelName1`. NOT `AITER_BYPASS_TUNE_CONFIG` (that runs the legacy
+  `kernel_moe_mxgemm_2lds` and is disregarded).
+- gemm1 µs from aiter online-tune: best CK tile per M vs the auto-tuned best (deployed).
 
-## Crossover — CK (optimal block_m) vs FlyDSL
+## Best CK tile vs FlyDSL (isolated gemm1 µs)
 
-| M | tok/expert | CK µs | FlyDSL µs | Δ |
-| ----- | --- | ---- | ---- | ---- |
-| 1024  | 35  | 177  | 151  | +17% |
-| 4096  | 143 | 307  | 270  | +14% |
-| 8192  | 286 | 399  | 407  | −2%  |
-| 16384 | 573 | 615  | 670  | −8%  |
+| M | best CK tile | CK µs | FlyDSL µs | winner |
+| ----- | ------------------ | ----- | ----- | ------------- |
+| 1024  | 256x64x128x128_1x4 | 209.6 | 185.9 | FlyDSL (+12.8%) |
+| 4096  | 256x64x128x128_1x4 | 380.8 | 327.2 | FlyDSL (+16%) |
+| 8192  | 256x64x128x128_1x4 | 549.8 | 493.8 | FlyDSL (+11%) |
+| 16384 | 256x128x128x128_1x4| 843.9 | >843.9 | CK |
 
-Two independent causes.
+The auto-tuner deploys FlyDSL gemm1 for M ≤ 8192 and `ck2stages_gemm1_256x128x128x128_1x4`
+only at M = 16384. Crossover is 8192↔16384 — higher, and small-M losses larger (+11–16%),
+than the legacy bypass kernel appeared to show.
 
-## Cause 1 — `block_m` heuristic picks 128 at all M
+## Why CK loses at small M
 
-CK stage1 µs vs forced `block_m`:
+The CK tile family's small/mid-M pick is `256x64x128x128_`**`1x4`** — 4 N-accumulator XDL
+tiles per wave → high VGPR → low occupancy. At small M the CUs are under-filled (few
+expert-tiles) so low occupancy cannot hide latency → CK trails FlyDSL. The lower-VGPR tiles
+that are codegen'd (`64x32x32x128_`**`1x1`**) raise occupancy but are too small (low
+arithmetic intensity) and the tuner only selects them at tiny M. CK's ck2stages tile set has
+no small-M configuration that beats FlyDSL; only the large `256x128_1x4` tile's throughput
+wins, and only at M = 16384. Occupancy-vs-register-intensity tradeoff.
 
-| M | bm32 | bm64 | bm128 | optimal |
-| ----- | ---- | ---- | ----- | ------- |
-| 1024  | 188  | 177  | 200   | 64  |
-| 4096  | 388  | 304  | 311   | 64  |
-| 8192  | 653  | 430  | 398   | 128 |
-| 16384 | 1149 | 720  | 618   | 128 |
+## block_m
 
-`get_block_size_M` sorts candidates by wave-count `(rnd, empty)`, which structurally always picks the largest `block_m` (128). It ignores intra-tile padding: at low tok/expert each expert's rows pad into a mostly-empty 128-row tile (waste ∝ `block_m / m_per_expert`). Optimal is bm64 ≤ ~256 tok/expert, bm128 above (bm32 never wins).
-
-Fix (in `aiter_dev` scratch; needs an aiter PR to land): select `block_m` by per-expert occupancy instead of wave-count → **−11.5% @M1024, −1.3% @M4096, neutral ≥ M8192**.
-
-## Cause 2 — VGPR pressure caps occupancy (residual small-M gap)
-
-Even at optimal `block_m`, CK trails FlyDSL at M ≤ 4096. Code-object (`amdhsa.kernels`) metadata:
-
-| kernel | VGPR/thread | LDS | occ limiter | ~waves/SIMD |
-| ------ | ---- | ----- | ----- | ---- |
-| CK gemm1 `kernel_moe_mxgemm_2lds` | 249 | 32 KB | VGPR | ~2 |
-| FlyDSL `mfma_moe1` t64x64 | 100 | 40 KB | LDS | ~4–5 |
-
-CK's 249 VGPRs cap occupancy at ~2 waves/SIMD. At small M the CUs are under-filled (few expert-tiles) and ~2 waves can't hide memory/MFMA latency → +17%. At large M the CUs saturate regardless and CK's heavier register blocking wins on per-wave MFMA throughput → −8%. Classic occupancy-vs-register-intensity crossover; VGPR=249 is the driver.
-
-Fix: lower-VGPR CK gemm1 tiling (kernel-template change) to raise small-M occupancy, else keep the M-gated split.
+`get_block_size_M` (adaptive fix prototyped in aiter_dev) governs the mxfp4 fallback/bypass
+path only. For the deployable ck2stages path the per-M tile — including block_m — comes from
+the tuned `AITER_CONFIG_FMOE`, not `get_block_size_M`.
 
 ## Deployment
 
-- Mixed CK-gemm1 + FlyDSL-gemm2 is shelved: CK-stage1 sort layout ≠ FlyDSL-stage2 expected sort → wrong outputs at M ≥ 12288 (logits_diff 0.997).
-- CK is only a win at M ≥ 8192; there the current heuristic already picks the optimal bm128, so Cause-1's fix does not change the deploy calculus — it only helps the M ≤ 4096 range, which stays FlyDSL regardless.
+CK gemm1 is a win only at M ≥ 16384 (`256x128_1x4`). Mixed CK-gemm1 + FlyDSL-gemm2 is shelved
+(CK-stage1 sort layout ≠ FlyDSL-stage2, wrong outputs at M ≥ 12288). Net: FlyDSL remains best
+for GLM-5.2 gemm1 across the prefill range that matters; there is no compelling CK gemm1
+deployment win except the largest chunks.
