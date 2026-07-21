@@ -13,7 +13,7 @@ export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
 # the dense-MHA fallback re-fetched KV and previously reused a stale kv_a_quanted.
 exec sglang serve \
   --model-path "${MODEL}" \
-  --tp 8 \
+  --tp ${TP:-8} \
   --host localhost \
   --port 8551 \
   --trust-remote-code \
