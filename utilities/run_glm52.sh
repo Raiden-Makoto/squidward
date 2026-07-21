@@ -51,8 +51,8 @@ exec sglang serve \
   --trust-remote-code \
   --tool-call-parser glm47 \
   --reasoning-parser glm45 \
-  --dsa-prefill-backend triton \
-  --dsa-decode-backend triton \
+  --dsa-prefill-backend tilelang \
+  --dsa-decode-backend tilelang \
   --enable-aiter-allreduce-fusion \
   --watchdog-timeout 1200 \
   --mem-fraction-static 0.85 \
