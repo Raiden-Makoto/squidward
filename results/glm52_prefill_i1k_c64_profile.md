@@ -42,7 +42,7 @@ ms/prefill forward, TP0 EXTEND trace (n_fwd=4). MI355X ~376 (fp8-proj prefill-on
 | MoE combine                               | 22.3 vs 15.8    | 0.71x | HBM-bound, no lever                      | `moe_reduction` 366us@M16384 ~5.5 TB/s; combine fusion DEAD (gemm2+combine megakernel 5.6x slower)                                                                                                                                                                                                                                                                                                                                                               |
 | MoE act quant                             | 4.0 vs 2.6      | 0.65x | HBM-bound, no lever                      | `dynamic_per_group_scaled_quant` 30us@M16384 ~6.3 TB/s. Fusion into gemm1 TESTED = net LOSS: fp4q stage1 1615.7us vs bf16 1569.5 (+46us epilogue quant) > standalone quant 30us. gemm1 is VALU-saturated so in-epilogue group-max+pack has no free cycles. Tuner's bf16+separate-quant is correct.                                                                                                                                                               |
 | Attention FA (kernel)                     | 27.3 vs 9.9     | 0.36x | CLOSED                                   | pin D256 `(128,128)` new-CK = 421us (−5.4%); rest architectural (B200 TMEM); DSA indexer = required decode-cache, not a lever — see detail                                                                                                                                                                                                                                                                                                                       |
-| MoE gate-up (gemm1)                       | 38.0 vs 32.1    | 0.85x | **LEVER: new-CK gufusion_v3**            | new-CK gemm1 beats FlyDSL −5→−7.6% at prefill M≥8192 (@16384 626.8 vs 678.7us), loses M≤4096; numerically ==FlyDSL. Capture via M-gated mixed dispatch (CK gemm1 M≥8192 + FlyDSL gemm2), unwired. See detail                                                                                                                                                                                                                                                     |
+| MoE gate-up (gemm1)                       | 38.0 vs 32.1    | 0.85x | no occupancy lever (VGPR disproven)      | new-CK gemm1 beats FlyDSL −5→−7.6% at M≥8192, loses M≤4096; numerically ==FlyDSL. **Small-M loss is NOT occupancy: forced 2/3/4-wave tiles all ≈232us @1024 — VGPR lever disproven, low-VGPR tiles dead.** See detail                                                                                                                                                                                                                                            |
 | Dense GEMM fp8 proj                       | —               | —     | **WIN — prefill-only gate, upstreaming** | Tuned a8w8_blockscale_bpreshuffle q_b_proj(4096,2048)+o_proj(6144,4096): Dense GEMM −8.8ms/−9.5% (o_proj 45.9→27.9). Prefill-only M-gate (M>512 fp8, decode bf16); GSM8K 0.943. Untuned = regression (tuning mandatory). Upstreaming: sglang PR `RM/fp8-proj-gemm-prefill-gate` + tuned config aiter#4243.                                                                                                                                                       |
 | Router GEMM                               | —               | —     | no lever                                 | B200 fuses; standalone 547→1196 TF                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | Dense GEMM `MT256x256`                    | 27.7 vs ≈40     | 1.4x  | MI faster                                | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
@@ -107,6 +107,39 @@ new-CK `gufusion_v3` vs FlyDSL `mfma_moe1 t128x128x256`, gemm1 only (`test_moe_2
 | 131072 | 4233.2 | 4037.6 | −4.6% |
 
 
-new-CK wins −5→−7.6% at prefill M≥8192 (numerically ==FlyDSL, logits_diff 1e-5), loses M≤4096. Lever = M-gated mixed dispatch (CK gemm1 M≥8192 + FlyDSL gemm2), unwired. FlyDSL gemm1 itself VALU-bound: MFMA 37% / VALU 100% @16384; native mxfp4 MFMA (`mfma_scale_f32_16x16x128_f8f6f4`) already used, cost = per-MFMA fp4 packing + silu_mul.
+new-CK wins −5→−7.6% at prefill M≥8192 (numerically ==FlyDSL, logits_diff 1e-5), loses M≤4096. FlyDSL gemm1 itself VALU-bound: MFMA 37% / VALU 100% @16384; native mxfp4 MFMA (`mfma_scale_f32_16x16x128_f8f6f4`) already used, cost = per-MFMA fp4 packing + silu_mul.
 
-**MoE GEMM section:** gemm1 has a new-CK mixed-dispatch lever (−5→−8% prefill, unwired); gemm2 CK loses (PARKED, needs rewrite).
+#### CK gemm1 dispatch — HOW TO ACTUALLY RUN EACH PATH (do NOT re-derive — cost real hours twice)
+
+a4w4 (fp4×fp4, per-1x32) has THREE gemm1 paths in `aiter/fused_moe.py`; the wrong invocation silently runs the wrong kernel:
+
+1. **FlyDSL `mfma_moe1`** — the DEFAULT. `_flydsl_force = AITER_FLYDSL_FORCE` **defaults to `"1"`**, so `use_mxfp4_flydsl` (line ~2163) is True for a4w4 regardless of activation → FlyDSL wins before any CK branch. **Any "forced CK" run that does not set `AITER_FLYDSL_FORCE=0` silently runs FlyDSL.**
+2. **CK-tile `moe_cktile2stages_gemm1`** (`csrc/ck_tile_gemm_moe_2stages`) — a8w8/a16w4 only; **raises `RuntimeError: Unsupported scales/output dtype!` for a4w4.** `AITER_FORCE_CK_GEMM1=1` mis-routes HERE (line ~2245) → that error. NOT the deployable CK; never use force-ck to benchmark a4w4.
+3. **CK gufusion `ck_moe_stage1` → `aiter.ck_moe_stage1_fwd`** (`csrc/ck_gemm_moe_2stages_codegen`, `moe_ck2stages_gemm1_..._v3`) — the REAL a4w4 CK gemm1 (the numbers above). Reached at line ~2316 when `kernelName1` contains `ck2stages`.
+
+**To dispatch real gufusion CK gemm1:** `AITER_FLYDSL_FORCE=0` + `AITER_CONFIG_FMOE` row with `kernelName1=moe_ck2stages_gemm1_...` + activation Silu; do NOT set `AITER_FORCE_CK_GEMM1`. **Verify with rocprofv3 `--kernel-trace`:** real CK shows an `mxgemm`/`ck2stages` kernel; if the trace shows only `mfma_moe1_...`, forcing failed and it ran FlyDSL. Pitfalls: (a) `AITER_CONFIG_FMOE` token must match the microbench's padded tier (`-t 1536` pads to 2048 → a `token=1536` row misses → default dispatch); (b) `--kernel` KBENCH µs are meaningless under rocprof (perftest perturbed) — use kernel-trace durations.
+
+#### CK gufusion_v3 gemm1 tile VGPR (valid — real `_v3_` object metadata, gfx950 512 VGPR/SIMD, spill=0)
+
+
+| tile (BLOCK×M×N×K_MxN) | accum fp32/lane = M·N/BLOCK | VGPR | waves/SIMD |
+| ---------------------- | --------------------------- | ---- | ---------- |
+| 256×32×128×128_1x4     | 16                          | 132  | 3          |
+| 256×64×128×128_1x4     | 32                          | 186  | 2          |
+| 256×128×128×128_1x4    | 64                          | 249  | 2          |
+| 64×32×32×128_1x1       | 16                          | 134  | 3          |
+
+
+VGPR ≈ 93 + 2.44·(accum/lane); occupancy cliffs ≤170=3w, ≤128=4w.
+
+**INVALID — measured FlyDSL, not CK** (run WITHOUT `AITER_FLYDSL_FORCE=0`; kernel-trace showed `mfma_moe1_t32x128x256` only, mxgemm=0). Kept as a warning; re-run via the gufusion invocation above:
+
+
+| M     | 256×64×128 (2w) | 256×32×128 (3w) | 256×32×64 (4w) |
+| ----- | --------------- | --------------- | -------------- |
+| 1024  | 235.6           | 231.5           | 232.1          |
+| 4096  | 313.4           | 323.0           | 319.4          |
+| 16384 | 687.9           | 676.1           | 686.1          |
+
+
+All three "tiles" gave ≈232µs @1024 **because they were the same FlyDSL kernel, not CK** — so the "occupancy disproven / low-VGPR tiles don't help" conclusion is UNPROVEN. The occupancy question for real CK gufusion gemm1 is still open; measure it via the gufusion invocation above (trace-verified).
