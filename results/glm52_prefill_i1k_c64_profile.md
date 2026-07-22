@@ -153,3 +153,14 @@ All three "tiles" gave ≈232µs @1024 **because they were the same FlyDSL kerne
 | 2048 | 272.9 | 251.7 | ~193  |
 
 Real CK tiles are NOT identical (unlike the invalid FlyDSL sweep). **Occupancy is NOT the small-M lever — now confirmed on the real kernel:** the higher-occupancy `256×32×128` (3w) is *slower* (224) than the lower-occupancy `256×64×128` (2w, 171) @1024. Bigger per-wave tile wins even at small M (matches the Attention-FA result). CK's best small-M tile `256×64×128` = 171µs @1024 vs FlyDSL 147 (**+17%**); the residual gap is CK's fixed pipeline/packing cost, not occupancy/tiling. Lowering VGPR / adding low-N tiles is dead. (`256×128×128` @M512 produced no KBENCH — block_m=128 at tiny M.)
+
+#### root-cause = VALU-bound fp4 unpack; ALL config levers exhausted (2026-07-21)
+
+PMC on real CK gemm1 `256×64×128` (GPU0, single-metric passes): **VALUUtilization 99% / MfmaUtil 8.6% @1024 (18% @8192) / MemUnitStalled ~1% / Occupancy ~29%.** Hard VALU-bound, MFMA idle, not memory/occupancy limited. `is_scale_mfma=true` → e8m0 scale applied in-HW by the scaled MFMA (scale is FREE). The VALU is the **fp4x2→MFMA-operand unpack** in the CK **v3 blockwise mx-moe pipeline** (`3rdparty/composable_kernel/include/ck/tensor_operation/gpu/block/blockwise_gemm_pipeline_xdlops_b_preshuffle_mx_moe_selector.hpp`, via `gridwise_moe_mx_gemm_bpreshuffle.hpp`). FlyDSL wins small-M because its `pm1_async` unpack path is leaner.
+
+Config/codegen levers — **all exhausted, do not retry:**
+- Occupancy/VGPR tiles — disproven (higher-occupancy is slower).
+- `KPerBlock` — the wrapper `gemm_moe_ck2stages_common_mxfp4.cuh` **hardcodes `128`** (the `KPerBlock` field is ignored); a `…x256` instance silently builds as K=128. Inert.
+- Pipeline `v1` — **does not compile** for a4w4 gufusion (only `v3` builds; a `v1` instance breaks the whole module build). Closed.
+
+**Only remaining lever = CK submodule source:** reduce the per-MFMA fp4 unpack VALU in the v3 blockwise mx-moe pipeline (LDS-stage operands / fewer unpack ops, matching FlyDSL `pm1_async`). Vendor-CK-kernel surgery, not a config change.
