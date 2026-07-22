@@ -142,4 +142,14 @@ VGPR ≈ 93 + 2.44·(accum/lane); occupancy cliffs ≤170=3w, ≤128=4w.
 | 16384 | 687.9           | 676.1           | 686.1          |
 
 
-All three "tiles" gave ≈232µs @1024 **because they were the same FlyDSL kernel, not CK** — so the "occupancy disproven / low-VGPR tiles don't help" conclusion is UNPROVEN. The occupancy question for real CK gufusion gemm1 is still open; measure it via the gufusion invocation above (trace-verified).
+All three "tiles" gave ≈232µs @1024 **because they were the same FlyDSL kernel, not CK**.
+
+#### REAL CK gufusion gemm1 small-M tile sweep (trace-verified: mxgemm=50, mfma_moe1=0; `AITER_FLYDSL_FORCE=0`, GPU0)
+
+| M    | CK 256×32×128 (132 VGPR, 3w) | CK 256×64×128 (186 VGPR, 2w) | FlyDSL |
+| ---- | ---------------------------- | ---------------------------- | ------ |
+| 512  | 169.2 | 171.5 | ~145  |
+| 1024 | 224.1 | **171.2** | 146.8 |
+| 2048 | 272.9 | 251.7 | ~193  |
+
+Real CK tiles are NOT identical (unlike the invalid FlyDSL sweep). **Occupancy is NOT the small-M lever — now confirmed on the real kernel:** the higher-occupancy `256×32×128` (3w) is *slower* (224) than the lower-occupancy `256×64×128` (2w, 171) @1024. Bigger per-wave tile wins even at small M (matches the Attention-FA result). CK's best small-M tile `256×64×128` = 171µs @1024 vs FlyDSL 147 (**+17%**); the residual gap is CK's fixed pipeline/packing cost, not occupancy/tiling. Lowering VGPR / adding low-N tiles is dead. (`256×128×128` @M512 produced no KBENCH — block_m=128 at tiny M.)
