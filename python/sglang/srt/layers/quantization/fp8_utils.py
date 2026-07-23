@@ -163,7 +163,7 @@ if _use_aiter:
 if _is_cuda:
     from sgl_kernel import fp8_scaled_mm
 
-    from sglang.jit_kernel.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
+    from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
     @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
@@ -172,6 +172,36 @@ if _is_cuda:
         M = mat_a.shape[-2]
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
+
+    from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
+
+    @register_custom_op(op_name="flashinfer_bmm_fp8_batched", mutates_args=["out"])
+    def _bmm_fp8_batched_op(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        out: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+    ) -> None:
+        _raw_bmm_fp8_batched(A, B, A_scale, B_scale, out.dtype, out)
+
+    def bmm_fp8(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+        dtype: torch.dtype,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Batched (3D) per-tensor-scale FP8 matmul, via flashinfer's cuBLAS backend."""
+        if out is None:
+            out = torch.empty(
+                (A.shape[0], A.shape[1], B.shape[2]),
+                device=A.device,
+                dtype=dtype,
+            )
+        _bmm_fp8_batched_op(A, B, out, A_scale, B_scale)
+        return out
 
 
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
