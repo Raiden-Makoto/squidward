@@ -69,6 +69,7 @@ from sglang.srt.runtime_context import get_buffer
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_sm100_supported,
     print_warning_once,
@@ -102,28 +103,13 @@ def _all_gather_dsa_trtllm_fp8_kv(
 
 
 _is_hip = is_hip()
-
-
-def _detect_gfx950() -> bool:
-    # gfx950 (MI355X) detection via gcnArchName; get_device_sm() is unreliable on ROCm.
-    if not _is_hip:
-        return False
-    try:
-        return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
-    except Exception:
-        return False
-
-
-# gfx950 supports the dense-MHA prefill fallback via aiter flash_attn_varlen_func.
-_is_gfx950 = _detect_gfx950()
+_IS_GFX95 = is_gfx95_supported()
 
 # Experimental (gfx950, default off): route the dense-MHA prefill fallback through
 # aiter fp8 `mha_batch_prefill_func` (fp8 q/k/v + per-tensor descales) instead of the
 # bf16 `flash_attn_varlen_func`. ~1.14x on the FA kernel at the GLM head_dim-256 shape.
 # fp8 attention is an accuracy trade-off; validate before trusting.
-_use_fp8_dense_attn = (
-    _is_gfx950 and get_bool_env_var("SGLANG_DSA_FP8_DENSE_ATTN")
-)
+_use_fp8_dense_attn = _IS_GFX95 and get_bool_env_var("SGLANG_DSA_FP8_DENSE_ATTN")
 # batch_prefill only compiles a page_size=16 variant at head_dim 256.
 _FP8_DENSE_ATTN_PAGE_SIZE = 16
 
@@ -2603,8 +2589,9 @@ class DeepseekSparseAttnBackend(
         )
 
         # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues.
-        # ROCm (gfx950) always uses the aiter flash_attn_varlen_func path below.
-        if self.device_sm_major >= 10 and not _is_hip:
+        # gfx950 reports device capability sm_(9,5), so it never enters this SM100+
+        # branch and falls through to the aiter flash_attn_varlen_func path below.
+        if self.device_sm_major >= 10:
             import flashinfer
 
             seq_lens = metadata.cache_seqlens_int32
@@ -2704,9 +2691,7 @@ class DeepseekSparseAttnBackend(
                 kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=dev)
                 kv_indptr[1:] = torch.cumsum(seqlens_k // PS, dim=0)
                 kv_indices = torch.arange(total_pages, dtype=torch.int32, device=dev)
-                kv_last_page_lens = torch.full(
-                    (bs,), PS, dtype=torch.int32, device=dev
-                )
+                kv_last_page_lens = torch.full((bs,), PS, dtype=torch.int32, device=dev)
                 dest = None
             else:
                 pages_per_seq = (seqlens_k + (PS - 1)) // PS
@@ -2719,9 +2704,7 @@ class DeepseekSparseAttnBackend(
                 cu_k64 = cu_seqlens_k.to(torch.int64)
                 seq_id = torch.searchsorted(cu_k64[1:], tok, right=True)
                 pos = tok - cu_k64[:-1][seq_id]
-                dest = (kv_indptr.to(torch.int64)[seq_id] + pos // PS) * PS + (
-                    pos % PS
-                )
+                dest = (kv_indptr.to(torch.int64)[seq_id] + pos // PS) * PS + (pos % PS)
             paging = (
                 total_k,
                 total_pages,
@@ -2732,9 +2715,7 @@ class DeepseekSparseAttnBackend(
                 dest,
             )
             forward_batch._fp8_dense_paging = paging
-        (_, total_pages, aligned, kv_indptr, kv_indices, kv_last_page_lens, dest) = (
-            paging
-        )
+        _, total_pages, aligned, kv_indptr, kv_indices, kv_last_page_lens, dest = paging
 
         def _quant(x: torch.Tensor):
             # Fused dynamic per-tensor fp8 quant: reads bf16, writes fp8 in one
@@ -3194,8 +3175,8 @@ class DeepseekSparseAttnBackend(
                 (
                     device_sm == 90
                     or (device_sm >= 100 and device_sm < 110)
-                    or _is_gfx950
-                )  # SM90/SM100 (NVIDIA) or gfx950 (MI355X)
+                    or _IS_GFX95
+                )  # SM90/SM100 (NVIDIA) or gfx95x (MI355X)
                 and max_kv_len
                 <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
                 and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]
