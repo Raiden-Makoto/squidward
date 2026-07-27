@@ -65,6 +65,18 @@ Median isolated gemm1 `us_stage1`, four alternating repetitions on GPU2:
 | 16384 | 648.645 | 687.847 | −5.7% |
 | 32768 | 1071.710 | 1173.645 | −8.7% |
 
+## FlyDSL XCD4 remap A/B
+
+Median isolated gemm1 `us_stage1`, six alternating repetitions on GPU4:
+
+| M | No XCD µs | XCD4 µs | XCD4 delta |
+| ---: | ---: | ---: | ---: |
+| 1024 | 152.297 | 191.346 | +25.6% |
+| 4096 | 304.593 | 282.966 | −7.1% |
+| 8192 | 421.754 | 420.763 | −0.2% |
+| 16384 | 683.359 | 677.419 | −0.9% |
+| 32768 | 1176.155 | 1169.315 | −0.6% |
+
 ## K=256 resource diagnosis at M=16384
 
 Exact rocprof kernel trace and separate single-counter passes:
