@@ -118,6 +118,18 @@ Median isolated gemm1 `us_stage1`, four alternating repetitions on GPU4:
 | 16384 | 642.892 | 644.055 | +0.2% |
 | 32768 | 1054.610 | 1052.945 | −0.2% |
 
+## MFMA-aligned A-fragment experiment
+
+Median isolated K256 M128 gemm1 `us_stage1`, three alternating repetitions on GPU4:
+
+| M | Baseline µs | Aligned A fragment µs | Delta |
+| ---: | ---: | ---: | ---: |
+| 1024 | 215.291 | 215.866 | +0.3% |
+| 4096 | 361.226 | 362.786 | +0.4% |
+| 8192 | 495.863 | 490.383 | −1.1% |
+| 16384 | 765.258 | 764.044 | −0.2% |
+| 32768 | 1312.630 | 1315.490 | +0.2% |
+
 ## K=256 resource diagnosis at M=16384
 
 Exact rocprof kernel trace and separate single-counter passes:
