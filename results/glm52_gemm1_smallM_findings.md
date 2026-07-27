@@ -77,6 +77,23 @@ Median isolated gemm1 `us_stage1`, six alternating repetitions on GPU4:
 | 16384 | 683.359 | 677.419 | −0.9% |
 | 32768 | 1176.155 | 1169.315 | −0.6% |
 
+## M=1024 dynamic instruction differential
+
+GPU4, 25 identical dispatches per single-metric pass:
+
+| Metric | CK K128 M64 | FlyDSL M64 BK256 w2 | CK delta |
+| --- | ---: | ---: | ---: |
+| Grid threads | 410624 | 409600 | +0.2% |
+| `SQ_INSTS_MFMA` | 3158016 | 3158016 | 0.0% |
+| `SQ_INSTS_VALU` | 8869584 | 7383004 | +20.1% |
+| `SQ_INSTS_VALU_FMA_F32` | 1052672 | 0 | +1052672 |
+| `SQ_INSTS_VALU_ADD_F32` | 394752 | 187708 | +110.3% |
+| `SQ_INSTS_VALU_CVT` | 197376 | 0 | +197376 |
+| `SQ_INSTS_VALU_MUL_F32` | 526336 | 432168 | +21.8% |
+| `SQ_INSTS_VALU_TRANS_F32` | 263168 | 263168 | 0.0% |
+| `SQ_INSTS_VALU_INT32` | 1110240 | 1070772 | +3.7% |
+| `SQ_INSTS_VALU_INT64` | 41120 | 127880 | −67.8% |
+
 ## K=256 resource diagnosis at M=16384
 
 Exact rocprof kernel trace and separate single-counter passes:
