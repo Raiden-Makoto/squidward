@@ -106,6 +106,18 @@ Median isolated gemm1 `us_stage1`, six alternating repetitions on GPU4:
 | `SQ_INSTS_VALU_CVT` | 197376 | 197376 | 0.0% |
 | Strict accuracy | pass | pass | — |
 
+## M64 MFMA priority experiment
+
+Median isolated gemm1 `us_stage1`, four alternating repetitions on GPU4:
+
+| M | Baseline µs | M64 priority µs | Delta |
+| ---: | ---: | ---: | ---: |
+| 1024 | 178.070 | 175.092 | −1.7% |
+| 4096 | 309.316 | 309.831 | +0.2% |
+| 8192 | 420.379 | 418.845 | −0.4% |
+| 16384 | 642.892 | 644.055 | +0.2% |
+| 32768 | 1054.610 | 1052.945 | −0.2% |
+
 ## K=256 resource diagnosis at M=16384
 
 Exact rocprof kernel trace and separate single-counter passes:
