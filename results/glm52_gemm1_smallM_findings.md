@@ -53,6 +53,18 @@ Median isolated gemm1 `us_stage1`, three alternating repetitions on GPU2:
 | K256 vs K128 | K256 slower at every M |
 | Correctness | K256 remains GSM8K/MBSTAT validated |
 
+## Same-session K128 vs FlyDSL
+
+Median isolated gemm1 `us_stage1`, four alternating repetitions on GPU2:
+
+| M | K128 CK µs | FlyDSL µs | CK delta |
+| ---: | ---: | ---: | ---: |
+| 1024 | 177.807 | 151.865 | +17.1% |
+| 4096 | 309.852 | 283.250 | +9.4% |
+| 8192 | 419.085 | 425.754 | −1.6% |
+| 16384 | 648.645 | 687.847 | −5.7% |
+| 32768 | 1071.710 | 1173.645 | −8.7% |
+
 ## Invalid historical timings
 
 | M | K=256 µs | Reason invalid |
