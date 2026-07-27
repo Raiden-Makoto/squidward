@@ -10,8 +10,8 @@
 | aiter commit | `433445255` |
 | CK branch | `RM/glm52-a4w4-k256-swizzle-fix` |
 | CK commit | `b1fd91e44` |
-| K=128 tile | `256x128x128x128_1x4`, gufusion_v3 |
-| K=256 tile | `256x128x128x256_1x4`, gufusion_v3 |
+| K=128 candidates | `256x64x128x128_1x4`, `256x128x128x128_1x4`, gufusion_v3 |
+| K=256 candidates | `256x64x128x256_1x4`, `256x128x128x256_1x4`, gufusion_v3 |
 
 ## Correctness
 
@@ -33,14 +33,25 @@
 | K=128 behavior | Preserved |
 | K=256 behavior | Runtime LDS-write swizzle now matches the descriptor read swizzle |
 
-## Performance status
+## Corrected-kernel performance
 
-| Measurement | Status |
+Median isolated gemm1 `us_stage1`, three alternating repetitions on GPU2:
+
+| M | K128 M64 µs | K256 M64 µs | K128 M128 µs | K256 M128 µs | Best K128 µs | Best K256 µs | K256 delta |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 177.068 | 376.090 | 199.959 | 217.045 | 177.068 | 217.045 | +22.6% |
+| 4096 | 308.631 | 812.824 | 314.376 | 361.631 | 308.631 | 361.631 | +17.2% |
+| 8192 | 457.508 | 1350.550 | 421.297 | 490.984 | 421.297 | 490.984 | +16.5% |
+| 16384 | 739.723 | 2398.680 | 651.215 | 775.001 | 651.215 | 775.001 | +19.0% |
+| 32768 | 1300.280 | 4540.910 | 1073.100 | 1354.160 | 1073.100 | 1354.160 | +26.2% |
+
+| Check | Result |
 | --- | --- |
-| Corrected K=256 vs K=128 CK | Not measured |
-| Corrected K=256 vs FlyDSL | Not measured |
-| Full tuner attempt | Did not complete |
-| `--kernel --csv-filter` K=256/K=128/FlyDSL comparison | Invalid dispatch/method |
+| CK-only tuner | K128 selected over K256 for every shared `block_m` |
+| Direct dispatch | Full `kernelName1` verified for every arm |
+| Stage2 control | Identical FlyDSL gemm2 within each paired comparison |
+| K256 vs K128 | K256 slower at every M |
+| Correctness | K256 remains GSM8K/MBSTAT validated |
 
 ## Invalid historical timings
 
@@ -69,21 +80,24 @@ token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,
 
 ```bash
 PYTHONPATH=/sgl-workspace/aiter_dev \
-HIP_VISIBLE_DEVICES=0 \
+HIP_VISIBLE_DEVICES=2 \
 TUNE_ONLY=cktile \
 python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
   -i /tmp/g1_untuned.csv \
-  -o /tmp/g1_tuned.csv \
-  -o2 /tmp/g1_profile.csv \
+  -o /tmp/g1_ck_tuned.csv \
+  -o2 /tmp/g1_ck_profile.csv \
   --all --mp 1 --shape_grouped
 ```
 
-## Result extraction
+## Verification method
 
 | Check | Requirement |
 | --- | --- |
-| Timing source | `us1` from `/tmp/g1_profile.csv` |
-| Comparison | Best K=128 and best K=256 candidates at each M in the same run |
+| Tuner output | `/tmp/g1_ck_profile.csv` |
+| Tuner comparison | Best candidate retained per `block_m`; K128 retained for M64 and M128 |
+| Direct timing | `test_moe_2stage.py --kernel --no-legacy --csv-filter moe_ck2stages` |
+| Repetitions | Three, alternating K128/K256 arms |
+| Timing field | `us_stage1` |
 | Kernel identity | Full `kernelName1` must contain the expected KPerBlock value |
 | Backend | CK Tile only via `TUNE_ONLY=cktile` |
-| Method validation | K=128 curve must remain consistent with the established same-tuner baseline |
+| Control | Same GPU, shape, seed, sorting `block_m`, and FlyDSL gemm2 |
