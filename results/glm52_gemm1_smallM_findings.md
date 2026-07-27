@@ -65,6 +65,27 @@ Median isolated gemm1 `us_stage1`, four alternating repetitions on GPU2:
 | 16384 | 648.645 | 687.847 | −5.7% |
 | 32768 | 1071.710 | 1173.645 | −8.7% |
 
+## K=256 resource diagnosis at M=16384
+
+Exact rocprof kernel trace and separate single-counter passes:
+
+| Metric | K128 M128 | K256 M128 | Delta |
+| --- | ---: | ---: | ---: |
+| Kernel-trace median | 643.085 µs | 795.085 µs | +23.6% |
+| VGPR count | 128 | 200 | +56.3% |
+| LDS per block | 32768 B | 65536 B | +100.0% |
+| Workgroup size | 256 | 256 | 0% |
+| Grid size | 1024 | 1024 | 0% |
+| OccupancyPercent median | 22.193% | 11.561% | −47.9% |
+| MfmaUtil median | 50.545% | 34.198% | −32.3% |
+
+| Trace check | K128 | K256 |
+| --- | --- | --- |
+| KPerBlock in dispatched symbol | 128 | 256 |
+| A-transfer cluster | `Sequence<8,32,1>` | `Sequence<16,16,1>` |
+| TailNumber | 2 | 1 |
+| Kernel identity | Correct | Correct |
+
 ## Invalid historical timings
 
 | M | K=256 µs | Reason invalid |
