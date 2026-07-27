@@ -94,6 +94,18 @@ GPU4, 25 identical dispatches per single-metric pass:
 | `SQ_INSTS_VALU_INT32` | 1110240 | 1070772 | +3.7% |
 | `SQ_INSTS_VALU_INT64` | 41120 | 127880 | −67.8% |
 
+## Reciprocal SiLU experiment at M=1024
+
+Median isolated gemm1 `us_stage1`, six alternating repetitions on GPU4:
+
+| Metric | Generic SiLU | Reciprocal SiLU | Delta |
+| --- | ---: | ---: | ---: |
+| `us_stage1` | 177.593 µs | 176.572 µs | −0.6% |
+| `SQ_INSTS_VALU` | 8869584 | 7553744 | −14.8% |
+| `SQ_INSTS_VALU_FMA_F32` | 1052672 | 263168 | −75.0% |
+| `SQ_INSTS_VALU_CVT` | 197376 | 197376 | 0.0% |
+| Strict accuracy | pass | pass | — |
+
 ## K=256 resource diagnosis at M=16384
 
 Exact rocprof kernel trace and separate single-counter passes:
