@@ -38,6 +38,10 @@ for arg in "$@"; do
       export SGLANG_ENABLE_SPEC_V2=1
       SPEC_ARGS="--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --attention-backend triton"
       ;;
+    --use-aiter|--aiter)
+      export SGLANG_USE_AITER=1
+      export SGLANG_USE_AITER_MOE_GU_ITLV=0 # Disable MOE GU ITLV for AITER or else it messes up the weights
+      ;;
     *)
       # forward any other flag straight to `sglang serve`
       # (e.g. --enable-aiter-allreduce-fusion for A/B sweeps)
