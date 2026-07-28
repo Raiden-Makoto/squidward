@@ -8,6 +8,8 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export SAFETENSORS_FAST_GPU=1
 export SGLANG_ROCM_FUSED_DECODE_MLA=0
 export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
+# only applies to ATOM
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 # fp8 dense projections (q_b_proj/o_proj) -> tuned fp8 a8w8_blockscale_bpreshuffle CK GEMM.
 # Dense GEMM section -8.8ms/-9.5% (o_proj 45.9->27.9). Untuned = +8.8ms regression, so the
 # tuned config below is REQUIRED. The box aiter is stock (config edits are box-local/lost),
@@ -20,6 +22,9 @@ export AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE=${AITER_CONFIG_GEMM_A8W8_BL
 export AITER_CONFIG_FMOE=${AITER_CONFIG_FMOE:-${SCRIPT_DIR}/glm5_fp4_tuned_fmoe.csv}
 
 export HIP_VISIBLE_DEVICES=4,5,6,7
+# Prefer FlyDSL MoE sorting algorithm over default Opus to match ATOM
+# and for consistency with the FlyDSL MoE kernels chosen in the AITER_CONFIG_FMOE CSV.
+export AITER_USE_FLYDSL_MOE_SORTING=1
 
 PROFILE_ARGS=""
 SPEC_ARGS=""
