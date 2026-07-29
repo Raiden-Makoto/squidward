@@ -84,22 +84,6 @@ def _fp8_proj_gemm_enabled(layer: torch.nn.Module) -> bool:
         and getattr(layer, "_fp8_proj_gemm", False)
     )
 
-
-def fp8_proj_decode_fusion_enabled(layer: torch.nn.Module) -> bool:
-    """True iff this layer has a private FP8 weight copy (see
-    `_repack_bf16_to_fp8_block`) AND the M-gate has been explicitly opened to
-    decode-size M (`SGLANG_DSA_FP8_PROJ_M_MIN=0`). Attention forward paths
-    (`forward_mla.py`) use this to decide whether to also route the
-    fused RMSNorm/flatten + FP8-group-quant kernels at decode instead of
-    gating purely on `weight.dtype == float8_e4m3fn` (which never holds for
-    this bf16-typed-weight-with-private-fp8-copy path). Does not change
-    behavior at the default M_MIN=512: only takes effect once a caller has
-    already opted into all-M FP8 for this layer.
-    """
-    if not getattr(layer, "_fp8_proj_ready", False):
-        return False
-    return getattr(layer, "_fp8_proj_m_min", _FP8_PROJ_PREFILL_M_MIN) == 0
-
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.tuned_gemm import tgemm
