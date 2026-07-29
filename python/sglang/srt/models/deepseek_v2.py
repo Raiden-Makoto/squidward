@@ -1701,37 +1701,6 @@ class DeepseekV2AttentionMLA(
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
         )
-        # Opt-in FP8 GEMM (gfx950) for the bf16 dense MLA projections. Marker
-        # only; unquant.py acts on it when SGLANG_DSA_FP8_PROJ_GEMM + gfx950 and
-        # the layer is unquantized (quark-excluded bf16). Only 128-aligned
-        # projections qualify (q_b [.,2048], o_proj [6144,.]); fused_qkv_a
-        # (out=2624) is not 128-aligned, and kv_b_proj is the absorbed-bmm path.
-        # Both q_b_proj and o_proj are FP8 PREFILL-ONLY (default M-gate, M>512): fp8 at
-        # prefill (large-M, clear GEMM win), bf16 at decode. o_proj was briefly gated at
-        # M>16 to also take fp8 for decode M>=32 (small isolated-GEMM win), but that adds
-        # o_proj fp8 + activation-quant WORK to the decode path, which at the prefill<->
-        # decode throughput knee (~c32) contends with the interleaved new-request prefill
-        # and raises TTFT there (+7% median), while every prefill-only optimization
-        # decreases c32 TTFT. The isolated decode-GEMM win (~-3% at M=32) is not worth the
-        # TTFT side-effect, so o_proj stays prefill-only too. Decode side-effects +
-        # analysis: results/glm52_dense_gemm_fp8_vs_bf16_scratch.md.
-        # CONFIRMED NOT A FUSION GAP (2026-07-28): the original regression above was
-        # measured with an UNFUSED decode-side activation quant, raising the question of
-        # whether fusing the quant into q_a_layernorm/the attn-output flatten (matching
-        # the fused RMSNorm/flatten+quant kernels prefill already uses) would close the
-        # gap. Tried (commit 2be493d1c2, reverted in af9eb9c3e3): still a considerable
-        # regression at SGLANG_DSA_FP8_PROJ_M_MIN=0 even with fusion active. So the
-        # prefill<->decode throughput-knee contention is the real cause, not per-call
-        # quant-kernel-launch overhead -- fusion reduces kernel count, not total GPU
-        # work, and doesn't relieve contention. Do not re-attempt decode FP8 for these
-        # layers via kernel fusion alone; if revisited, the fix has to address the
-        # contention/scheduling issue itself.
-        for _fp8_proj_name, _fp8_proj_m_min in (("q_b_proj", None), ("o_proj", None)):
-            _fp8_proj = getattr(self, _fp8_proj_name, None)
-            if _fp8_proj is not None:
-                _fp8_proj._fp8_proj_gemm = True
-                if _fp8_proj_m_min is not None:
-                    _fp8_proj._fp8_proj_m_min = _fp8_proj_m_min
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         if not skip_rope:

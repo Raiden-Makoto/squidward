@@ -175,17 +175,10 @@ class DeepseekMHAForwardMixin:
                 # on gfx95, we can still use fused RMSNorm+FP8 quant, but MUST request
                 # the unquantized output for q_lora; otherwise q_lora becomes the (fp8,scale)
                 # tuple.
-                if _use_aiter_gfx95 and (
-                    self.q_b_proj.weight.dtype == torch.float8_e4m3fn
-                    or getattr(self.q_b_proj, "_fp8_proj_ready", False)
+                if (
+                    _use_aiter_gfx95
+                    and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
                 ):
-                    # Fold q_b's activation quant into q_a_layernorm (one fused kernel)
-                    # instead of q_a_layernorm + a standalone dynamic quant launch. Cuts
-                    # one eager per-layer launch at prefill (host-side idle, see
-                    # results/glm52_dense_gemm_fp8_vs_bf16_scratch.md). forward_mha is the
-                    # prefill/extend path (decode uses forward_mla), so M is always large
-                    # here and q_b is fp8 regardless of its prefill-only M-gate. The tuple
-                    # feeds apply()'s fp8 path via the private _fp8_proj_weight copy.
                     q_quanted, q_lora, _, _ = fused_rms_fp8_group_quant(
                         q,
                         self.q_a_layernorm.weight,
