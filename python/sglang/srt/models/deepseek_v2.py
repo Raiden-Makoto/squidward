@@ -1715,6 +1715,17 @@ class DeepseekV2AttentionMLA(
         # decreases c32 TTFT. The isolated decode-GEMM win (~-3% at M=32) is not worth the
         # TTFT side-effect, so o_proj stays prefill-only too. Decode side-effects +
         # analysis: results/glm52_dense_gemm_fp8_vs_bf16_scratch.md.
+        # CONFIRMED NOT A FUSION GAP (2026-07-28): the original regression above was
+        # measured with an UNFUSED decode-side activation quant, raising the question of
+        # whether fusing the quant into q_a_layernorm/the attn-output flatten (matching
+        # the fused RMSNorm/flatten+quant kernels prefill already uses) would close the
+        # gap. Tried (commit 2be493d1c2, reverted in af9eb9c3e3): still a considerable
+        # regression at SGLANG_DSA_FP8_PROJ_M_MIN=0 even with fusion active. So the
+        # prefill<->decode throughput-knee contention is the real cause, not per-call
+        # quant-kernel-launch overhead -- fusion reduces kernel count, not total GPU
+        # work, and doesn't relieve contention. Do not re-attempt decode FP8 for these
+        # layers via kernel fusion alone; if revisited, the fix has to address the
+        # contention/scheduling issue itself.
         for _fp8_proj_name, _fp8_proj_m_min in (("q_b_proj", None), ("o_proj", None)):
             _fp8_proj = getattr(self, _fp8_proj_name, None)
             if _fp8_proj is not None:
