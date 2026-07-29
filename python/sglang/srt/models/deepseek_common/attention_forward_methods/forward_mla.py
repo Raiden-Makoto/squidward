@@ -29,6 +29,7 @@ from sglang.srt.layers.dcp import (
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
+from sglang.srt.layers.quantization.unquant import fp8_proj_decode_fusion_enabled
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
@@ -300,9 +301,15 @@ class DeepseekMLAForwardMixin:
                     )
                 else:
                     q_lora = None
-                    if (
-                        _use_aiter_gfx95
-                        and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
+                    if _use_aiter_gfx95 and (
+                        self.q_b_proj.weight.dtype == torch.float8_e4m3fn
+                        # GLM-5.2's `_fp8_proj_gemm` marker path keeps
+                        # q_b_proj.weight bf16-typed (private FP8 copy lives
+                        # in `_fp8_proj_weight`), so the dtype check above
+                        # never fires for it. Take the fused path anyway once
+                        # SGLANG_DSA_FP8_PROJ_M_MIN=0 has explicitly opened
+                        # the M-gate to decode-size M for this layer.
+                        or fp8_proj_decode_fusion_enabled(self.q_b_proj)
                     ):
                         if self.use_dsa:
                             q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
@@ -942,7 +949,9 @@ class DeepseekMLAForwardMixin:
                 # _bmm_buf is already (batch, heads, dim) contiguous
                 if self.o_proj.weight.dtype == torch.uint8:
                     attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)
-                elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+                elif self.o_proj.weight.dtype == torch.float8_e4m3fn or (
+                    fp8_proj_decode_fusion_enabled(self.o_proj)
+                ):
                     attn_bmm_output = fused_flatten_fp8_group_quant(
                         _bmm_buf,
                         group_size=128,
@@ -958,7 +967,9 @@ class DeepseekMLAForwardMixin:
             elif self.o_proj.weight.dtype == torch.uint8:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
-            elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+            elif self.o_proj.weight.dtype == torch.float8_e4m3fn or (
+                fp8_proj_decode_fusion_enabled(self.o_proj)
+            ):
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_fp8_group_quant(
                     attn_bmm_output,
