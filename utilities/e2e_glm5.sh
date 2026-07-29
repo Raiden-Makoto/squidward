@@ -8,9 +8,9 @@
 # NOTE on profiling: --profile only writes traces if the SERVER was launched
 # with SGLANG_TORCH_PROFILER_DIR set to a matching dir.
 #
-# A/B is sequential on ONE server: launch baseline (feature flag off), sweep,
-# then relaunch with the feature flag on and sweep again. Same GPUs, same port.
-# There is no simultaneous two-server setup.
+# A/B is sequential on ONE server: launch baseline (flag off), sweep, then
+# relaunch with SGLANG_DSA_FP8_PROJ_GEMM=1 (feature), sweep again. Same GPUs,
+# same port. There is no simultaneous two-server setup.
 #
 # Usage:
 #   bash e2e_glm5.sh [INPUT_LEN] [OUTPUT_LEN] [ENABLE_PROFILE]
