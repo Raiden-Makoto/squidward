@@ -17,6 +17,7 @@ from sglang.srt.layers.dcp import (
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
+from sglang.srt.layers.quantization.unquant import fp8_proj_gemm_active
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -48,10 +49,9 @@ elif _is_musa:
     from sgl_kernel import concat_mla_k
 
 if _use_aiter_gfx95:
-    from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
-
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
+    from sglang.srt.models.deepseek_common.utils import fused_rms_fp8_group_quant
 
 
 def _resolve_attn_backend(forward_batch: ForwardBatch):
@@ -177,15 +177,13 @@ class DeepseekMHAForwardMixin:
                 # tuple.
                 if _use_aiter_gfx95 and (
                     self.q_b_proj.weight.dtype == torch.float8_e4m3fn
-                    or getattr(self.q_b_proj, "_fp8_proj_ready", False)
+                    or fp8_proj_gemm_active(self.q_b_proj)
                 ):
                     # Fold q_b's activation quant into q_a_layernorm (one fused kernel)
                     # instead of q_a_layernorm + a standalone dynamic quant launch. Cuts
                     # one eager per-layer launch at prefill (host-side idle, see
-                    # results/glm52_dense_gemm_fp8_vs_bf16_scratch.md). forward_mha is the
-                    # prefill/extend path (decode uses forward_mla), so M is always large
-                    # here and q_b is fp8 regardless of its prefill-only M-gate. The tuple
-                    # feeds apply()'s fp8 path via the private _fp8_proj_weight copy.
+                    # results/glm52_dense_gemm_fp8_vs_bf16_scratch.md). The tuple feeds
+                    # apply()'s fp8 path via the private _fp8_proj_weight copy.
                     q_quanted, q_lora, _, _ = fused_rms_fp8_group_quant(
                         q,
                         self.q_a_layernorm.weight,
@@ -197,10 +195,8 @@ class DeepseekMHAForwardMixin:
                         dtype_quant=torch.float8_e4m3fn,
                         res1=None,
                         output_unquantized_inp1=True,
-                        transpose_scale=False,
+                        transpose_scale=_use_aiter_bpreshuffle_gfx95,
                     )
-                    if _use_aiter_bpreshuffle_gfx95:
-                        q_quanted = materialize_bpreshuffle_fp8_scale_tuple(q_quanted)
                     q = self.q_b_proj(q_quanted)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )

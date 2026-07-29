@@ -50,6 +50,149 @@ _is_gfx95_supported = is_gfx95_supported()
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
 
+if _use_aiter_gfx95:
+    try:
+        from aiter.ops.fused_qk_rmsnorm_group_quant import (
+            fused_qk_rmsnorm_group_quant as _aiter_fused_qk_rmsnorm_group_quant,
+        )
+        from aiter.ops.quant import (
+            dynamic_per_token_scaled_quant as _aiter_dynamic_per_token_scaled_quant,
+        )
+
+        def fused_rms_fp8_group_quant(
+            inp1: torch.Tensor,
+            inp1_weight: torch.Tensor,
+            inp1_epsilon: float,
+            inp2: Optional[torch.Tensor] = None,
+            inp2_weight: Optional[torch.Tensor] = None,
+            inp2_epsilon: Optional[float] = None,
+            group_size: int = 128,
+            dtype_quant: torch.dtype = torch.float8_e4m3fn,
+            res1: Optional[torch.Tensor] = None,
+            output_unquantized_inp1: bool = False,
+            transpose_scale: bool = False,
+        ):
+            """QK-RMSNorm + FP8 group quant on the aiter HIP kernel.
+
+            Same contract as aiter's Triton `fused_rms_fp8_group_quant` (identical
+            args, and returns `((out1_fp8, out1_scale), out1_bf16, out2, out_res1)`),
+            but dispatched to `module_fused_qk_rmsnorm_group_quant` -- the same HIP
+            kernel the bf16 QK-norm path already uses, just with the quant epilogue
+            enabled. Preferred over Triton because these norms are bandwidth-bound
+            and get called per layer on the decode path, where the Triton kernel is
+            the weaker of the two; it is also what ATOM runs for this step.
+            """
+            m, n1 = inp1.shape
+            num_groups = (n1 + group_size - 1) // group_size
+            out1_fp8 = torch.empty((m, n1), dtype=dtype_quant, device=inp1.device)
+            if transpose_scale:
+                # The blockscale GEMMs want the A-scale as [M, K/128] column-major
+                # (CK: lengths (M/ScaleBlockM, K/ScaleBlockK), strides (1, M/ScaleBlockM)
+                # with ScaleBlockM=1), so let the kernel write that layout directly
+                # instead of materializing it afterwards with .t().contiguous().t().
+                # Returned as a .t() view rather than a .view(), so the strides (1, M)
+                # honestly describe the bytes: CK and the ASM kernel read the scale
+                # pointer without strides, but a Triton GEMM consumer would not.
+                out1_scale = torch.empty(
+                    (num_groups, m), dtype=torch.float32, device=inp1.device
+                ).t()
+            else:
+                out1_scale = torch.empty(
+                    (m, num_groups), dtype=torch.float32, device=inp1.device
+                )
+            out1_bf16 = torch.empty_like(inp1) if output_unquantized_inp1 else None
+            out2 = torch.empty_like(inp2) if inp2 is not None else None
+            out_res1 = torch.empty_like(inp1) if res1 is not None else None
+
+            _aiter_fused_qk_rmsnorm_group_quant(
+                out1_fp8,
+                out1_scale,
+                inp1,
+                inp1_weight,
+                inp1_epsilon,
+                q_out_unquantized=out1_bf16,
+                k_out=out2,
+                q_res_out=out_res1,
+                k=inp2,
+                k_weight=inp2_weight,
+                k_epsilon=inp2_epsilon,
+                q_residual=res1,
+                group_size=group_size,
+                transpose_scale=transpose_scale,
+            )
+            return (out1_fp8, out1_scale), out1_bf16, out2, out_res1
+
+        def flatten_fp8_group_quant(
+            x: torch.Tensor,
+            group_size: int = 128,
+            dtype_quant: torch.dtype = torch.float8_e4m3fn,
+            transpose_scale: bool = False,
+        ):
+            """FP8 per-token-group quant of a flattened `(M, ...)` activation, on HIP.
+
+            Replaces aiter's Triton `fused_flatten_fp8_group_quant` for the o_proj
+            input. The "flatten" it names is a free reshape for a contiguous `x`, so
+            the only real work is the quant, and `dynamic_per_token_scaled_quant`
+            (`module_quant`) does that without Triton. `x` must be contiguous: the
+            HIP entry point asserts `input.is_contiguous()` and `out.is_contiguous()`.
+            """
+            m = x.shape[0]
+            n = x.numel() // m
+            num_groups = n // group_size
+            out = torch.empty((m, n), dtype=dtype_quant, device=x.device)
+            # The kernel writes the scale through a raw pointer, so it needs the
+            # contiguous buffer; the caller gets whichever view honestly describes
+            # the bytes. shuffle_scale stores group g of row m at g*M + m, which is
+            # the [M, K/group] column-major layout the blockscale GEMMs read.
+            if transpose_scale:
+                scale_buf = torch.empty(
+                    (num_groups, m), dtype=torch.float32, device=x.device
+                )
+                scale = scale_buf.t()
+            else:
+                scale_buf = torch.empty(
+                    (m, num_groups), dtype=torch.float32, device=x.device
+                )
+                scale = scale_buf
+            _aiter_dynamic_per_token_scaled_quant(
+                out,
+                x.view(-1, group_size),
+                scale_buf,
+                shuffle_scale=transpose_scale,
+            )
+            return out, scale
+
+    except ImportError:
+        # Pre-ROCm/aiter#2958 builds have no HIP group-quant module.
+        from aiter.ops.triton.fused_fp8_quant import (
+            fused_flatten_fp8_group_quant as _triton_fused_flatten_fp8_group_quant,
+        )
+        from aiter.ops.triton.fused_fp8_quant import (
+            fused_rms_fp8_group_quant as _triton_fused_rms_fp8_group_quant,
+        )
+
+        def flatten_fp8_group_quant(*args, transpose_scale: bool = False, **kwargs):
+            out, scale = _triton_fused_flatten_fp8_group_quant(
+                *args, transpose_scale=transpose_scale, **kwargs
+            )
+            if transpose_scale:
+                m, num_groups = scale.shape
+                scale = scale.view(num_groups, m).t()
+            return out, scale
+
+        def fused_rms_fp8_group_quant(*args, transpose_scale: bool = False, **kwargs):
+            (out1_fp8, out1_scale), *rest = _triton_fused_rms_fp8_group_quant(
+                *args, transpose_scale=transpose_scale, **kwargs
+            )
+            if transpose_scale:
+                # Triton hands back the column-major scale as a `.view(M, K/128)`,
+                # whose contiguous strides misdescribe the transposed bytes. Re-tag it
+                # as the (1, M)-strided view that matches, so every consumer -- not
+                # just the stride-blind CK/ASM GEMMs -- reads it correctly.
+                m, num_groups = out1_scale.shape
+                out1_scale = out1_scale.view(num_groups, m).t()
+            return (out1_fp8, out1_scale), *rest
+
 
 _is_cublas_ge_129 = is_nvidia_cublas_version_ge_12_9()
 

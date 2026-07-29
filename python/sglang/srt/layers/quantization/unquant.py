@@ -32,7 +32,6 @@ from sglang.srt.layers.utils import MultiPlatformOp, copy_or_rebind_param
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
-    get_int_env_var,
     is_cpu,
     is_gfx95_supported,
     is_hip,
@@ -65,16 +64,14 @@ _is_gfx95_supported = is_gfx95_supported()
 # marker (the quark-excluded GLM-5.2 MLA q_a/q_b/o_proj) on the aiter FP8 CK GEMM
 # instead of the bf16 tgemm. Load-time block-quant bf16 -> FP8 e4m3 + 128x128
 # scale (+ bpreshuffle) kept as a private FP8 copy; the bf16 weight is retained.
-# PREFILL-ONLY: only the large-M (prefill) GEMM takes the FP8 path; decode
-# (small-M cuda-graph batch sizes) stays bf16, because the small-M FP8 GEMM
-# regresses vs bf16 (see results/glm52_i1k_o1k_baseline_scratch.md). Default off.
+# ALL-OR-NOTHING: when on, every call runs FP8 -- prefill and decode alike -- and
+# the activation quant is always folded into the kernel that already produces the
+# activation (q_a_layernorm for q_b_proj, the attn-output flatten for o_proj), so
+# the FP8 GEMM is never paid for alongside a standalone quant launch. When off,
+# every call stays bf16. There is deliberately no token-count gate: a per-M split
+# meant the fused producers could not be used for the decode half, which left
+# decode paying an unfused quant and made the two halves un-A/B-able. Default off.
 _DSA_FP8_PROJ_GEMM = get_bool_env_var("SGLANG_DSA_FP8_PROJ_GEMM")
-# Token-count gate: tokens beyond this count are treated as prefill and take the
-# FP8 projection GEMM. Decode cuda-graph batch sizes top out at 512, so M <= 512
-# stays bf16 by default. Set SGLANG_DSA_FP8_PROJ_M_MIN=0 to also run decode on FP8
-# (all-fp8): valid once q_b's activation-quant is fused into q_a_layernorm and
-# o_proj's inline-quant fp8 still beats bf16 at small M.
-_FP8_PROJ_PREFILL_M_MIN = get_int_env_var("SGLANG_DSA_FP8_PROJ_M_MIN", 512)
 
 
 def _fp8_proj_gemm_enabled(layer: torch.nn.Module) -> bool:
@@ -83,6 +80,20 @@ def _fp8_proj_gemm_enabled(layer: torch.nn.Module) -> bool:
         and _is_gfx95_supported
         and getattr(layer, "_fp8_proj_gemm", False)
     )
+
+
+def fp8_proj_gemm_active(layer: torch.nn.Module) -> bool:
+    """Whether this projection runs the FP8 GEMM, and hence wants an FP8 activation.
+
+    The gate for callers that can fold the activation quant into the kernel feeding
+    this projection. Deliberately NOT `weight.dtype == float8_e4m3fn`: these layers
+    keep a bf16 `layer.weight` alongside a private FP8 copy, so the dtype test that
+    guards the natively-FP8 fused paths can never fire for them. `apply()` below
+    keys off the same flag, so a caller that pre-quantizes is always matched by an
+    FP8 GEMM that consumes it.
+    """
+    return getattr(layer, "_fp8_proj_ready", False)
+
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -232,14 +243,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     @staticmethod
     def _repack_bf16_to_fp8_block(layer: torch.nn.Module) -> None:
-        # Prefill-only FP8: precompute an FP8 e4m3 (+128x128 UE8M0 scale) copy of
-        # the bf16 projection weight for the large-M (prefill) GEMM, matching the
-        # aiter CK bpreshuffle w8a8-block path. Keep the bf16 weight as
-        # layer.weight so decode (small-M) runs the original bf16 GEMM. Storing the
-        # FP8 copy in private attrs (not layer.weight) also keeps the layer
-        # bf16-typed, so the MLA forward never pre-quantizes the activation for it
-        # and decode receives a plain bf16 tensor. Validated on gfx950: CK FP8
-        # output matches the torch block-fp8 reference to cos>0.9994.
+        # Precompute an FP8 e4m3 (+128x128 UE8M0 scale) copy of the bf16 projection
+        # weight, matching the aiter CK bpreshuffle w8a8-block path. Validated on
+        # gfx950: CK FP8 output matches the torch block-fp8 reference to cos>0.9994.
+        # The FP8 copy lives in private attrs rather than replacing layer.weight so
+        # the layer stays bf16-typed, which keeps every `weight.dtype == fp8` test in
+        # the model code (each of which implies a natively-FP8 checkpoint) from
+        # firing; the fused activation-quant producers gate on
+        # `fp8_proj_gemm_active` instead. It also leaves the bf16 weight in place as
+        # the fallback when the feature is off.
         from aiter.ops.shuffle import shuffle_weight
 
         from sglang.srt.layers.quantization.fp8_utils import (
@@ -253,8 +265,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
         fp8_w, w_scale = quant_weight_ue8m0(w, [128, 128])
         if _use_aiter_bpreshuffle_gfx95:
             fp8_w = shuffle_weight(fp8_w, (16, 16))
-        # Private FP8 copy (not a Parameter, not layer.weight) used only by the
-        # prefill branch in apply(); layer.weight stays bf16 for decode.
         layer._fp8_proj_weight = fp8_w.contiguous()
         layer._fp8_proj_weight_scale = w_scale.contiguous()
         layer._fp8_proj_ready = True
@@ -265,47 +275,35 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if getattr(layer, "_fp8_proj_ready", False):
-            # Prefill-only FP8 gate. Compute the token count M; prefill (large M)
-            # takes the tuned FP8 CK GEMM (using the private FP8 weight copy),
-            # decode (M <= _FP8_PROJ_PREFILL_M_MIN — the cuda-graph batch sizes)
-            # falls through to the bf16 GEMM below, since small-M FP8 regresses vs
-            # bf16 (TTFT/TPOT). See results/glm52_i1k_o1k_baseline_scratch.md.
+        if fp8_proj_gemm_active(layer):
+            # All-FP8: every call takes the tuned FP8 CK GEMM against the private
+            # FP8 weight copy, at any M. `x` normally arrives as a pre-quantized
+            # (fp8_act, scale) tuple from the fused producer; the plain-tensor case
+            # is the fallback for call sites with nothing to fuse into, where the
+            # GEMM wrapper quantizes inline.
+            from sglang.srt.layers.quantization.fp8_utils import (
+                aiter_w8a8_block_fp8_linear,
+            )
+
             if isinstance(x, tuple):
                 x_q, x_scale = x
-                m_tokens = x_q.shape[0]
-            else:
-                m_tokens = x.numel() // x.shape[-1]
-
-            # Prefill-only M-gate: both q_b_proj and o_proj use the default
-            # (_FP8_PROJ_PREFILL_M_MIN, M>512 -> fp8; decode's small M -> bf16). A
-            # pre-quantized (fp8_act, scale) tuple only arrives at prefill (from the
-            # fused RMSNorm+quant path), so the tuple short-circuit keeps FP8 for it.
-            _m_min = getattr(layer, "_fp8_proj_m_min", _FP8_PROJ_PREFILL_M_MIN)
-            if m_tokens > _m_min or isinstance(x, tuple):
-                from sglang.srt.layers.quantization.fp8_utils import (
-                    aiter_w8a8_block_fp8_linear,
-                )
-
-                if isinstance(x, tuple):
-                    return aiter_w8a8_block_fp8_linear(
-                        x_q,
-                        layer._fp8_proj_weight,
-                        [128, 128],
-                        layer._fp8_proj_weight_scale,
-                        input_scale=x_scale,
-                        bias=bias,
-                    )
-                out = aiter_w8a8_block_fp8_linear(
-                    x.view(-1, x.shape[-1]),
+                return aiter_w8a8_block_fp8_linear(
+                    x_q,
                     layer._fp8_proj_weight,
                     [128, 128],
                     layer._fp8_proj_weight_scale,
-                    input_scale=None,
+                    input_scale=x_scale,
                     bias=bias,
                 )
-                return out.view(*x.shape[:-1], -1)
-            # decode: fall through to the bf16 GEMM (layer.weight stays bf16)
+            out = aiter_w8a8_block_fp8_linear(
+                x.view(-1, x.shape[-1]),
+                layer._fp8_proj_weight,
+                [128, 128],
+                layer._fp8_proj_weight_scale,
+                input_scale=None,
+                bias=bias,
+            )
+            return out.view(*x.shape[:-1], -1)
 
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
