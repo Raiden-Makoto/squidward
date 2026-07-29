@@ -46,26 +46,89 @@ constexpr auto next_pow2(uint32_t target, uint32_t factor = 1) {
   return power;
 }
 
+// Rotate one head row in place, reading and writing as T. Factored out so the
+// q and k branches can run different (same-size) dtypes -- e.g. fp16 q emitted
+// by a fused QK-norm while k stays bf16. When cache_out is non-null the rotated
+// row is additionally stored there (the fused KV-store k path); predicated so
+// the q and k branches keep one instruction stream per instantiation.
+// CacheType is the cos_sin_cache element type; only the interleaved path reads
+// it as anything other than float.
+template <typename T, bool kIsNeox, int64_t kRopeDim, int64_t kVecSize, typename CacheType = float>
+__device__ __forceinline__ void
+rope_rotate_head(void* input, const void* cos_ptr, const void* sin_ptr, uint32_t lane_id, void* cache_out = nullptr) {
+  using namespace device;
+  using T2 = packed_t<T>;
+  using Storage = AlignedVector<T2, kVecSize>;
+  if constexpr (kIsNeox) {
+    using CacheStorage = AlignedVector<fp32x2_t, kVecSize>;
+    const auto input_x = input;
+    const auto input_y = pointer::offset(input, (kRopeDim / 2) * sizeof(T));
+    auto input_vec_x = load_as<Storage>(input_x, lane_id);
+    auto input_vec_y = load_as<Storage>(input_y, lane_id);
+    const auto cos_pair = load_as<CacheStorage>(cos_ptr, lane_id);
+    const auto sin_pair = load_as<CacheStorage>(sin_ptr, lane_id);
+#pragma unroll
+    for (int64_t j = 0; j < kVecSize; ++j) {
+      const auto [x0, x1] = cast<fp32x2_t>(input_vec_x[j]);
+      const auto [y0, y1] = cast<fp32x2_t>(input_vec_y[j]);
+      const auto [cos_0, cos_1] = cos_pair[j];
+      const auto [sin_0, sin_1] = sin_pair[j];
+      const auto out_x0 = x0 * cos_0 - y0 * sin_0;
+      const auto out_y0 = x0 * sin_0 + y0 * cos_0;
+      const auto out_x1 = x1 * cos_1 - y1 * sin_1;
+      const auto out_y1 = x1 * sin_1 + y1 * cos_1;
+      input_vec_x[j] = cast<T2, fp32x2_t>({out_x0, out_x1});
+      input_vec_y[j] = cast<T2, fp32x2_t>({out_y0, out_y1});
+    }
+    store_as<Storage>(input_x, input_vec_x, lane_id);
+    store_as<Storage>(input_y, input_vec_y, lane_id);
+    if (cache_out != nullptr) {
+      store_as<Storage>(cache_out, input_vec_x, lane_id);
+      const auto cache_out_y = pointer::offset(cache_out, (kRopeDim / 2) * sizeof(T));
+      store_as<Storage>(cache_out_y, input_vec_y, lane_id);
+    }
+  } else {
+    using CacheStorage = AlignedVector<CacheType, kVecSize>;
+    auto input_vec = load_as<Storage>(input, lane_id);
+    const auto cos_vec = load_as<CacheStorage>(cos_ptr, lane_id);
+    const auto sin_vec = load_as<CacheStorage>(sin_ptr, lane_id);
+#pragma unroll
+    for (int64_t j = 0; j < kVecSize; ++j) {
+      const auto [x, y] = cast<fp32x2_t>(input_vec[j]);
+      const auto cos = static_cast<float>(cos_vec[j]);
+      const auto sin = static_cast<float>(sin_vec[j]);
+      const auto out_x = x * cos - y * sin;
+      const auto out_y = x * sin + y * cos;
+      input_vec[j] = cast<T2, fp32x2_t>({out_x, out_y});
+    }
+    store_as<Storage>(input, input_vec, lane_id);
+    if (cache_out != nullptr) {
+      store_as<Storage>(cache_out, input_vec, lane_id);
+    }
+  }
+}
+
 template <
     bool kIsNeox,
     int64_t kRopeDim,
     bool kUsePDL,
     typename DType,
+    typename QDType,
     typename IdType,
     uint32_t kWorkThreads,
     typename CacheType = float>
 __global__ void fused_rope_kernel(const __grid_constant__ FusedRopeParams params) {
   using namespace device;
-  static_assert(kIsNeox ? std::is_same_v<CacheType, float> : true,
-                "bf16 cos_sin_cache is only supported for the interleaved (non-neox) path");
+  static_assert(
+      kIsNeox ? std::is_same_v<CacheType, float> : true,
+      "bf16 cos_sin_cache is only supported for the interleaved (non-neox) path");
 
   constexpr int64_t kCosSinStrideBytes = kRopeDim * sizeof(CacheType);
   constexpr int64_t kVecSize = next_pow2(kRopeDim, (2 * kWorkThreads * (1 + kIsNeox)));
-  using DType2 = packed_t<DType>;
-  using InputStorage = AlignedVector<DType2, kVecSize>;
   constexpr int64_t kDimPerThread = kVecSize * 2 * (1 + kIsNeox);
   constexpr uint32_t kLaneCount = kRopeDim / kDimPerThread;
   static_assert(kRopeDim % kDimPerThread == 0 && kLaneCount <= kWorkThreads);
+  static_assert(sizeof(QDType) == sizeof(DType), "q/k must be same-size dtypes");
 
   const auto &[
     q, k, cos_sin_cache_ptr, positions, // pointers
@@ -99,60 +162,32 @@ __global__ void fused_rope_kernel(const __grid_constant__ FusedRopeParams params
     const auto input = pointer::offset(input_, head_id * head_stride_bytes);
     const auto cos_ptr = pointer::offset(cos_cache_ptr, pos * kCosSinStrideBytes);
     const auto sin_ptr = pointer::offset(sin_cache_ptr, pos * kCosSinStrideBytes);
-    if constexpr (kIsNeox) {
-      using CacheStorage = AlignedVector<fp32x2_t, kVecSize>;
-      const auto input_x = input;
-      const auto input_y = pointer::offset(input, (kRopeDim / 2) * sizeof(DType));
-      auto input_vec_x = load_as<InputStorage>(input_x, lane_id);
-      auto input_vec_y = load_as<InputStorage>(input_y, lane_id);
-      const auto cos_pair = load_as<CacheStorage>(cos_ptr, lane_id);
-      const auto sin_pair = load_as<CacheStorage>(sin_ptr, lane_id);
-#pragma unroll
-      for (int64_t j = 0; j < kVecSize; ++j) {
-        const auto [x0, x1] = cast<fp32x2_t>(input_vec_x[j]);
-        const auto [y0, y1] = cast<fp32x2_t>(input_vec_y[j]);
-        const auto [cos_0, cos_1] = cos_pair[j];
-        const auto [sin_0, sin_1] = sin_pair[j];
-        const auto out_x0 = x0 * cos_0 - y0 * sin_0;
-        const auto out_y0 = x0 * sin_0 + y0 * cos_0;
-        const auto out_x1 = x1 * cos_1 - y1 * sin_1;
-        const auto out_y1 = x1 * sin_1 + y1 * cos_1;
-        input_vec_x[j] = cast<DType2, fp32x2_t>({out_x0, out_x1});
-        input_vec_y[j] = cast<DType2, fp32x2_t>({out_y0, out_y1});
-      }
-      store_as<InputStorage>(input_x, input_vec_x, lane_id);
-      store_as<InputStorage>(input_y, input_vec_y, lane_id);
+    if (load_q) {
+      rope_rotate_head<QDType, kIsNeox, kRopeDim, kVecSize, CacheType>(input, cos_ptr, sin_ptr, lane_id);
     } else {
-      using CacheStorage = AlignedVector<CacheType, kVecSize>;
-      auto input_vec = load_as<InputStorage>(input, lane_id);
-      const auto cos_vec = load_as<CacheStorage>(cos_ptr, lane_id);
-      const auto sin_vec = load_as<CacheStorage>(sin_ptr, lane_id);
-#pragma unroll
-      for (int64_t j = 0; j < kVecSize; ++j) {
-        const auto [x, y] = cast<fp32x2_t>(input_vec[j]);
-        const auto cos = static_cast<float>(cos_vec[j]);
-        const auto sin = static_cast<float>(sin_vec[j]);
-        const auto out_x = x * cos - y * sin;
-        const auto out_y = x * sin + y * cos;
-        input_vec[j] = cast<DType2, fp32x2_t>({out_x, out_y});
-      }
-      store_as<InputStorage>(input, input_vec, lane_id);
+      rope_rotate_head<DType, kIsNeox, kRopeDim, kVecSize, CacheType>(input, cos_ptr, sin_ptr, lane_id);
     }
   }
 
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <bool kIsNeox, int64_t kRopeDim, bool kUsePDL, typename DType, typename IdType, uint32_t kWorkThreads>
+template <
+    bool kIsNeox,
+    int64_t kRopeDim,
+    bool kUsePDL,
+    typename DType,
+    typename QDType,
+    typename IdType,
+    uint32_t kWorkThreads>
 __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStoreParams params) {
   using namespace device;
 
   constexpr int64_t kCosSinStrideBytes = kRopeDim * sizeof(float);
   constexpr int64_t kVecSize = kRopeDim / (2 * kWorkThreads * (1 + kIsNeox));
-  using DType2 = packed_t<DType>;
-  using InputStorage = AlignedVector<DType2, kVecSize>;
   constexpr int64_t kDimPerThread = kVecSize * 2 * (1 + kIsNeox);
   static_assert(kRopeDim == kDimPerThread * kWorkThreads);
+  static_assert(sizeof(QDType) == sizeof(DType), "q/k must be same-size dtypes");
 
   const auto& [base_params, v_ptr, k_cache, v_cache, out_loc, v_stride_bytes, cache_stride_bytes] = params;
   const auto &[
@@ -189,55 +224,12 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
     const auto input = pointer::offset(input_, head_id * head_stride_bytes);
     const auto cos_ptr = pointer::offset(cos_cache_ptr, pos * kCosSinStrideBytes);
     const auto sin_ptr = pointer::offset(sin_cache_ptr, pos * kCosSinStrideBytes);
-    if constexpr (kIsNeox) {
-      using CacheStorage = AlignedVector<fp32x2_t, kVecSize>;
-      const auto input_x = input;
-      const auto input_y = pointer::offset(input, (kRopeDim / 2) * sizeof(DType));
-      auto input_vec_x = load_as<InputStorage>(input_x, lane_id);
-      auto input_vec_y = load_as<InputStorage>(input_y, lane_id);
-      const auto cos_pair = load_as<CacheStorage>(cos_ptr, lane_id);
-      const auto sin_pair = load_as<CacheStorage>(sin_ptr, lane_id);
-#pragma unroll
-      for (int64_t j = 0; j < kVecSize; ++j) {
-        const auto [x0, x1] = cast<fp32x2_t>(input_vec_x[j]);
-        const auto [y0, y1] = cast<fp32x2_t>(input_vec_y[j]);
-        const auto [cos_0, cos_1] = cos_pair[j];
-        const auto [sin_0, sin_1] = sin_pair[j];
-        const auto out_x0 = x0 * cos_0 - y0 * sin_0;
-        const auto out_y0 = x0 * sin_0 + y0 * cos_0;
-        const auto out_x1 = x1 * cos_1 - y1 * sin_1;
-        const auto out_y1 = x1 * sin_1 + y1 * cos_1;
-        input_vec_x[j] = cast<DType2, fp32x2_t>({out_x0, out_x1});
-        input_vec_y[j] = cast<DType2, fp32x2_t>({out_y0, out_y1});
-      }
-      store_as<InputStorage>(input, input_vec_x, lane_id);
-      const auto input_y_out = pointer::offset(input, (kRopeDim / 2) * sizeof(DType));
-      store_as<InputStorage>(input_y_out, input_vec_y, lane_id);
-      if (!load_q) {
-        const auto k_out = pointer::offset(k_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
-        store_as<InputStorage>(k_out, input_vec_x, lane_id);
-        const auto k_out_y = pointer::offset(k_out, (kRopeDim / 2) * sizeof(DType));
-        store_as<InputStorage>(k_out_y, input_vec_y, lane_id);
-      }
+    if (load_q) {
+      // q rotates in place only (no cache store); may be a different dtype.
+      rope_rotate_head<QDType, kIsNeox, kRopeDim, kVecSize>(input, cos_ptr, sin_ptr, lane_id);
     } else {
-      using CacheStorage = AlignedVector<float, kVecSize>;
-      auto input_vec = load_as<InputStorage>(input, lane_id);
-      const auto cos_vec = load_as<CacheStorage>(cos_ptr, lane_id);
-      const auto sin_vec = load_as<CacheStorage>(sin_ptr, lane_id);
-#pragma unroll
-      for (int64_t j = 0; j < kVecSize; ++j) {
-        const auto [x, y] = cast<fp32x2_t>(input_vec[j]);
-        const auto cos = cos_vec[j];
-        const auto sin = sin_vec[j];
-        const auto out_x = x * cos - y * sin;
-        const auto out_y = x * sin + y * cos;
-        input_vec[j] = cast<DType2, fp32x2_t>({out_x, out_y});
-      }
-      store_as<InputStorage>(input, input_vec, lane_id);
-      if (!load_q) {
-        const auto k_out = pointer::offset(k_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
-        store_as<InputStorage>(k_out, input_vec, lane_id);
-      }
+      const auto k_out = pointer::offset(k_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
+      rope_rotate_head<DType, kIsNeox, kRopeDim, kVecSize>(input, cos_ptr, sin_ptr, lane_id, k_out);
     }
   }
 
@@ -256,19 +248,30 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <bool kIsNeox, int64_t kRopeDim, bool kUsePDL, typename DType, typename CacheType = float>
+// QDType (default = DType) is q's dtype; k/v/caches use DType. Same-size
+// dtypes only (fp16 q with bf16 k for the fp8-KV fp16-Q feed). CacheType is the
+// cos_sin_cache dtype (interleaved path only).
+template <
+    bool kIsNeox,
+    int64_t kRopeDim,
+    bool kUsePDL,
+    typename DType,
+    typename QDType = DType,
+    typename CacheType = float>
 struct FusedRopeKernel {
   static constexpr uint32_t kDimPerThread = std::gcd(16 / sizeof(DType), kRopeDim);
   static constexpr uint32_t kWorkThreads = next_pow2(kRopeDim, kDimPerThread);
   static constexpr bool kSupportFused = kWorkThreads * kDimPerThread == kRopeDim;
   static_assert(kRopeDim % kDimPerThread == 0);
   static_assert(kBlockSize % kWorkThreads == 0);
+  static_assert(sizeof(QDType) == sizeof(DType), "q/k must be same-size dtypes");
 
   template <typename IdType>
   static constexpr auto _kernel_0 =
-      fused_rope_kernel<kIsNeox, kRopeDim, kUsePDL, DType, IdType, kWorkThreads, CacheType>;
+      fused_rope_kernel<kIsNeox, kRopeDim, kUsePDL, DType, QDType, IdType, kWorkThreads, CacheType>;
   template <typename IdType>
-  static constexpr auto _kernel_1 = fused_rope_store_kernel<kIsNeox, kRopeDim, kUsePDL, DType, IdType, kWorkThreads>;
+  static constexpr auto _kernel_1 =
+      fused_rope_store_kernel<kIsNeox, kRopeDim, kUsePDL, DType, QDType, IdType, kWorkThreads>;
 
   static auto get_num_sm(DLDevice device) {
     static const auto kNumSM = host::runtime::get_sm_count(device.device_id);
@@ -294,7 +297,7 @@ struct FusedRopeKernel {
     device.set_options<kDLCUDA>();
     TensorMatcher({N, Q, D})  // q input
         .with_strides({Dq, Dd, 1})
-        .with_dtype<DType>()
+        .with_dtype<QDType>()
         .with_device(device)
         .verify(q);
     TensorMatcher({N, K, D})  // k input
@@ -392,7 +395,7 @@ struct FusedRopeKernel {
 
     TensorMatcher({N, Q, D})  // q input
         .with_strides({Dq, Dd, 1})
-        .with_dtype<DType>()
+        .with_dtype<QDType>()
         .with_device(device)
         .verify(q);
     TensorMatcher({N, K, D})  // k input

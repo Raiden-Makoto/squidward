@@ -31,9 +31,14 @@ def _jit_fused_rope_module(
     is_neox: bool,
     rope_dim: int,
     dtype: torch.dtype,
+    q_dtype: torch.dtype,
     cache_dtype: torch.dtype = torch.float32,
 ) -> Module:
-    args = make_cpp_args(is_neox, rope_dim, is_arch_support_pdl(), dtype, cache_dtype)
+    # q_dtype supports a same-size mixed-dtype q, e.g. fp16 q with bf16 k;
+    # k/v/caches use dtype.
+    args = make_cpp_args(
+        is_neox, rope_dim, is_arch_support_pdl(), dtype, q_dtype, cache_dtype
+    )
     return load_jit(
         "fused_rope",
         *args,
@@ -140,7 +145,9 @@ def apply_rope_inplace(
         rope_dim: Rotary embedding dimension. Defaults to cos_sin_cache.size(-1).
     """
     rope_dim = rope_dim or cos_sin_cache.size(-1)
-    module = _jit_fused_rope_module(is_neox, rope_dim, q.dtype, cos_sin_cache.dtype)
+    module = _jit_fused_rope_module(
+        is_neox, rope_dim, k.dtype, q.dtype, cos_sin_cache.dtype
+    )
     module.run_rope(q, k, cos_sin_cache, positions)
 
 
@@ -178,7 +185,7 @@ def apply_rope_inplace_with_kvcache(
     """
     rope_dim = rope_dim or cos_sin_cache.size(-1)
     v = v.view_as(k)
-    module = _jit_fused_rope_module(is_neox, rope_dim, q.dtype)
+    module = _jit_fused_rope_module(is_neox, rope_dim, k.dtype, q.dtype)
     module.run_rope_store(q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc)
 
 
