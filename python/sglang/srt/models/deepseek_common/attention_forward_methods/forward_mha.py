@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Tuple, Union
 
 import torch
 
@@ -13,9 +13,6 @@ from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
     filter_dcp_local_kv_indices,
-)
-from sglang.srt.layers.quantization.fp8_utils import (
-    materialize_bpreshuffle_fp8_scale_tuple,
 )
 from sglang.srt.layers.quantization.unquant import fp8_proj_gemm_active
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -51,7 +48,10 @@ elif _is_musa:
 if _use_aiter_gfx95:
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
-    from sglang.srt.models.deepseek_common.utils import fused_rms_fp8_group_quant
+    from sglang.srt.models.deepseek_common.utils import (
+        flatten_fp8_group_quant,
+        fused_rms_fp8_group_quant,
+    )
 
 
 def _resolve_attn_backend(forward_batch: ForwardBatch):
@@ -59,6 +59,25 @@ def _resolve_attn_backend(forward_batch: ForwardBatch):
     if isinstance(backend, TboAttnBackend):
         backend = backend.primary
     return backend
+
+
+def _maybe_quant_o_proj_input(
+    self: DeepseekV2AttentionMLA, attn_output: torch.Tensor
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Quantize the flattened attention output when o_proj runs the FP8 GEMM.
+
+    Without this the prefill path hands o_proj a BF16 tensor and the GEMM wrapper
+    quantizes it inline, which costs an extra scale transpose on top of the quant
+    itself. The decode path already pre-quantizes (see forward_mla).
+    """
+    if not fp8_proj_gemm_active(self.o_proj) or not attn_output.is_contiguous():
+        return attn_output
+    return flatten_fp8_group_quant(
+        attn_output,
+        group_size=128,
+        dtype_quant=torch.float8_e4m3fn,
+        transpose_scale=_use_aiter_bpreshuffle_gfx95,
+    )
 
 
 def _forward_dsa_indexer_for_mha(
@@ -237,10 +256,8 @@ class DeepseekMHAForwardMixin:
                     dtype_quant=torch.float8_e4m3fn,
                     res1=None,
                     output_unquantized_inp1=False,
-                    transpose_scale=False,
+                    transpose_scale=_use_aiter_bpreshuffle_gfx95,
                 )
-                if _use_aiter_bpreshuffle_gfx95:
-                    q = materialize_bpreshuffle_fp8_scale_tuple(q)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             else:
                 q = self.q_a_layernorm(q)
@@ -268,10 +285,8 @@ class DeepseekMHAForwardMixin:
                 dtype_quant=torch.float8_e4m3fn,
                 res1=None,
                 output_unquantized_inp1=True,  # return unqaunt kv_a
-                transpose_scale=False,
+                transpose_scale=_use_aiter_bpreshuffle_gfx95,
             )
-            if _use_aiter_bpreshuffle_gfx95:
-                kv_a_quanted = materialize_bpreshuffle_fp8_scale_tuple(kv_a_quanted)
 
         else:
             kv_a = self.kv_a_layernorm(kv_a)
@@ -381,7 +396,7 @@ class DeepseekMHAForwardMixin:
     ) -> torch.Tensor:
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(_maybe_quant_o_proj_input(self, attn_output))
         return output
 
     def forward_normal_chunked_kv_prepare(
@@ -435,7 +450,7 @@ class DeepseekMHAForwardMixin:
             )
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(_maybe_quant_o_proj_input(self, attn_output))
         return output
 
     def forward_normal_one_shot_prepare(

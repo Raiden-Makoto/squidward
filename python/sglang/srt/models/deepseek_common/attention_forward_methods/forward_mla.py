@@ -27,7 +27,7 @@ from sglang.srt.layers.dcp import (
     dcp_a2a_lse_reduce,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
-    materialize_bpreshuffle_fp8_scale_tuple,
+    retag_bpreshuffle_fp8_scale_tuple,
 )
 from sglang.srt.layers.quantization.unquant import fp8_proj_gemm_active
 from sglang.srt.layers.radix_attention import unified_attention_with_output
@@ -979,12 +979,10 @@ class DeepseekMLAForwardMixin:
                     attn_bmm_output,
                     group_size=128,
                     dtype_quant=torch.float8_e4m3fn,
-                    transpose_scale=False,
+                    transpose_scale=_use_aiter_bpreshuffle_gfx95,
                 )
                 if _use_aiter_bpreshuffle_gfx95:
-                    attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
-                        attn_bmm_output
-                    )
+                    attn_bmm_output = retag_bpreshuffle_fp8_scale_tuple(attn_bmm_output)
             else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 

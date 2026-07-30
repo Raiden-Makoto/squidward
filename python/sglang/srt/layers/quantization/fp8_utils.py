@@ -124,6 +124,32 @@ def materialize_bpreshuffle_fp8_scale_tuple(
     )
 
 
+def retag_bpreshuffle_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Re-tag a quant kernel's ``transpose_scale=True`` output as a ``.t()`` view.
+
+    Kernels asked for the column-major bpreshuffle scale write the bytes in that
+    layout but hand back an ``[M, K/128]``-shaped tensor with contiguous strides,
+    which misdescribes them. The GEMMs read the scale pointer without strides so
+    they are indifferent, but everything else (Triton consumers, ``as_strided``
+    re-views, debugging) needs the strides to be honest.
+    """
+    if scale.dim() != 2:
+        return scale
+    m, num_groups = scale.shape
+    return scale.reshape(-1).view(num_groups, m).t()
+
+
+def retag_bpreshuffle_fp8_scale_tuple(
+    value: Tuple[torch.Tensor, ...],
+) -> Tuple[torch.Tensor, ...]:
+    """Re-tag the scale slot in FP8 ``(q_input, x_scale, ...)`` tuples."""
+    return (
+        value[0],
+        retag_bpreshuffle_fp8_scale(value[1]),
+        *value[2:],
+    )
+
+
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
     if _FORCE_CK_W8A8:
         return False
@@ -974,14 +1000,16 @@ def aiter_w8a8_block_fp8_linear(
         elif use_triton and _use_aiter_bpreshuffle_gfx95:
             x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
     else:
-        materialize_bpreshuffle_scale = _use_aiter_bpreshuffle_gfx95 and not use_triton
+        # Let the quant kernel write the column-major scale the bpreshuffle GEMM
+        # reads, instead of quantizing row-major and transposing afterwards.
+        want_bpreshuffle_scale = _use_aiter_bpreshuffle_gfx95 and not use_triton
         q_input, x_scale = aiter_per1x128_quant(
             input_2d,
             quant_dtype=aiter.dtypes.fp8,
-            transpose_scale=False,
+            transpose_scale=want_bpreshuffle_scale,
         )
-        if materialize_bpreshuffle_scale:
-            x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
+        if want_bpreshuffle_scale:
+            x_scale = retag_bpreshuffle_fp8_scale(x_scale)
 
     if use_triton:
         gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
