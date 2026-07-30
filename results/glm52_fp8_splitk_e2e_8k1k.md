@@ -8,9 +8,9 @@ every value the mean over 3 reps of that rep's median. Feature = `SGLANG_DSA_FP8
 with split-K rows in `utilities/glm5_a8w8_blockscale_bpreshuffle_tuned.csv` (q_b_proj 4096×2048
 M 1–16, o_proj 6144×4096 M 1–24, splitK 2–3).
 
-Arms A and C: sglang `RM/glm51` @ `9be13849b7`. Arm B: @ `12c2f247e4` (adds the prefill o_proj
-pre-quant and drops the bpreshuffle scale materialize; both gated on the feature flag, so the
-A baseline is unchanged by it and is not re-measured).
+Arm A: sglang `RM/glm51` @ `9be13849b7`. Arm B: @ `12c2f247e4` (adds the prefill o_proj pre-quant
+and drops the bpreshuffle scale materialize; both gated on the feature flag, so the A baseline is
+unchanged by it and is not re-measured).
 
 A. Baseline, bf16 dense proj (`SGLANG_DSA_FP8_PROJ_GEMM=0`):
 
@@ -30,13 +30,8 @@ B. Feature on, fp8 dense proj + split-K + prefill o_proj pre-quant (Δ vs baseli
 | 64          | 14511     | −0.4% | 26.96    | −0.2% | 40.01     | −0.3% | 55397     | −0.4% | 1182.6       | +0.3% |
 
 
-C. Feature on, before the prefill o_proj pre-quant (`9be13849b7`), same arms (Δ vs baseline):
-
-
-| concurrency | TTFT (ms) | Δ     | ITL (ms) | Δ     | TPOT (ms) | Δ     | E2EL (ms) | Δ     | output tok/s | Δ     |
-| ----------- | --------- | ----- | -------- | ----- | --------- | ----- | --------- | ----- | ------------ | ----- |
-| 16          | 4024      | +1.6% | 16.33    | −0.9% | 19.31     | −0.9% | 23734     | −0.7% | 690.2        | +0.7% |
-| 64          | 14445     | −0.8% | 26.98    | −0.1% | 40.02     | −0.3% | 55415     | −0.3% | 1182.0       | +0.3% |
-
+Same feature arm at `9be13849b7`, before the prefill o_proj pre-quant, 3-rep means —
+TTFT / ITL / TPOT / E2EL / output tok/s: 16 = 4024 / 16.33 / 19.31 / 23734 / 690.2,
+64 = 14445 / 26.98 / 40.02 / 55415 / 1182.0.
 
 GSM8K (1319 questions, 5-shot, parallel 200) at `12c2f247e4`, feature on: 0.928, invalid 0.000.
