@@ -1,13 +1,8 @@
 # GLM-5.2-MXFP4 fp8 dense proj GEMM split-K — e2e 8k/1k
 
-Box `smci355-ccs-aus-m12-17`, container `macui-glm5`, image
-`raidenmakoto916/raidenmakoto:glm52-fork-aiter0724-ckaf7118-ckgemm1`, GPUs 4-7, TP4,
-`--kv-cache-dtype fp8_e4m3`, aiter `/sgl-workspace/aiter_dev` (split-K build, `AITER_PATH`).
-sglang `RM/glm51` @ `12c2f247e4` (arm B) and `9be13849b7` (arm A).
-`CONCURRENCY="16 64" REPS=3 bash utilities/e2e_glm5.sh 8192 1024`, one server per arm, each value
-the mean over 3 reps of that rep's median. Feature = `SGLANG_DSA_FP8_PROJ_GEMM=1` with split-K rows
-in `utilities/glm5_a8w8_blockscale_bpreshuffle_tuned.csv` (q_b_proj 4096×2048 M 1–16, o_proj
-6144×4096 M 1–24, splitK 2–3). GSM8K at `12c2f247e4` feature on, 1319 questions 5-shot: 0.928.
+`RM/glm51` @ `12c2f247e4` (B), `9be13849b7` (A), image
+`raidenmakoto916/raidenmakoto:glm52-fork-aiter0724-ckaf7118-ckgemm1`.
+`bash utilities/run_glm52.sh`, then `CONCURRENCY="16 64" REPS=3 bash utilities/e2e_glm5.sh 8192 1024`.
 
 A. Baseline, bf16 dense proj (`SGLANG_DSA_FP8_PROJ_GEMM=0`):
 
