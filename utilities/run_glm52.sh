@@ -5,6 +5,22 @@ export PYTHONPATH=/sgl-workspace/squidward/python:${PYTHONPATH}
 MODEL=${HF_HOME:-/root/hf_home}/hub/models--amd--GLM-5.2-MXFP4/snapshots/386bd0e4ec821f7b07975701cec3c3b953a5576a
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
+# The tuned CSV below carries split-K rows for the a8w8 blockscale bpreshuffle
+# GEMM. Stock aiter has no KBatch plumbing (ROCm/aiter#4448) and stock CK has no
+# split-K in the device op (ROCm/rocm-libraries#10146), so it aborts during
+# cuda-graph capture on those rows. Shadow the installed aiter with a checkout
+# carrying both until they land. Set AITER_PATH="" to force stock aiter.
+AITER_PATH=${AITER_PATH-/sgl-workspace/aiter_dev}
+if [[ -n "${AITER_PATH}" ]]; then
+  if [[ -d "${AITER_PATH}/aiter" ]]; then
+    export PYTHONPATH=${PYTHONPATH}:${AITER_PATH}
+  else
+    echo "run_glm52.sh: AITER_PATH=${AITER_PATH} has no aiter package;" \
+         "split-K rows in the tuned CSV will abort under stock aiter" >&2
+    exit 1
+  fi
+fi
+
 export SAFETENSORS_FAST_GPU=1
 # Master aiter switch (env-only, upstream default off); whole GLM-5.2 gfx950 path needs it.
 export SGLANG_USE_AITER=${SGLANG_USE_AITER:-1}
