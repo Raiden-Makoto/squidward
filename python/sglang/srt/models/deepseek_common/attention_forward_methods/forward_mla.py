@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -156,6 +157,15 @@ if _use_aiter:
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
+
+    _aiter_bmm_supports_ptpc_output = (
+        "emit_ptpc"
+        in inspect.signature(
+            batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
+        ).parameters
+    )
+else:
+    _aiter_bmm_supports_ptpc_output = False
 if _use_aiter_gfx95:
     # Triton flatten+quant is still needed for the non-`_bmm_buf` fallback, whose
     # input is a strided transpose the HIP quant cannot take (it asserts
@@ -212,6 +222,23 @@ if _use_aiter_gfx95:
             output_unquantized_inp1=output_unquantized_inp1,
             transpose_scale=_use_aiter_bpreshuffle_gfx95,
         )
+
+
+def _get_ptpc_v_bmm_buffers(self, m: int, b: int, n: int, device: torch.device):
+    cache = getattr(self, "_ptpc_v_bmm_buffers", None)
+    if cache is None:
+        cache = {}
+        self._ptpc_v_bmm_buffers = cache
+    key = (device, m, b, n)
+    if key not in cache:
+        cache[key] = (
+            torch.empty((m, b, n), dtype=torch.bfloat16, device=device),
+            torch.empty((m, b * n), dtype=torch.float8_e4m3fn, device=device),
+            torch.empty((m, 1), dtype=torch.float32, device=device),
+            torch.zeros((m,), dtype=torch.float32, device=device),
+            torch.zeros((m,), dtype=torch.int32, device=device),
+        )
+    return cache[key]
 
 
 def _should_defer_dsa_cp_kv_gather(
@@ -1092,6 +1119,7 @@ class DeepseekMLAForwardMixin:
 
             _kvb_v = kv_b_lora_v_prepare(self, attn_output)
 
+        _bmm_ptpc_output = None
         if self.use_deep_gemm_bmm:
             (
                 attn_output_val,
@@ -1148,31 +1176,71 @@ class DeepseekMLAForwardMixin:
                     # (heads, tokens, v) and needed a transpose(0,1).flatten copy =
                     # a per-layer direct_copy (elementwise_manual_unroll ~5us/layer),
                     # which ATOM / the MXFP4 path do not pay.
-                    _bmm_buf = torch.empty(
-                        attn_output.shape[0],
-                        self.num_local_heads,
-                        self.w_vc.shape[-1],
-                        device=attn_output.device,
-                        dtype=torch.bfloat16,
+                    use_fused_ptpc_output = (
+                        _aiter_bmm_supports_ptpc_output
+                        and fp8_proj_gemm_active(self.o_proj)
+                        and fp8_proj_uses_ptpc(self.o_proj)
+                        and _kvb_v is None
+                        and not is_kv_b_lora_active(self)
                     )
-                    batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-                        X=attn_output,
-                        WQ=self.w_vc.transpose(-1, -2),
-                        w_scale=self.w_scale,
-                        group_size=128,
-                        YQ=_bmm_buf,
-                        transpose_bm=True,
-                        transpose_bm_in=True,
-                        dtype=torch.bfloat16,
-                    )
-                    attn_bmm_output = _bmm_buf
+                    if use_fused_ptpc_output:
+                        (
+                            _bmm_buf,
+                            y_ptpc,
+                            y_scale,
+                            row_amax,
+                            row_counter,
+                        ) = _get_ptpc_v_bmm_buffers(
+                            self,
+                            int(attn_output.shape[0]),
+                            self.num_local_heads,
+                            self.w_vc.shape[-1],
+                            attn_output.device,
+                        )
+                        _bmm_ptpc_output = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+                            X=attn_output,
+                            WQ=self.w_vc.transpose(-1, -2),
+                            w_scale=self.w_scale,
+                            group_size=128,
+                            YQ=_bmm_buf,
+                            transpose_bm=True,
+                            transpose_bm_in=True,
+                            dtype=torch.bfloat16,
+                            emit_ptpc=True,
+                            YQ_ptpc=y_ptpc,
+                            y_scale=y_scale,
+                            row_amax=row_amax,
+                            row_counter=row_counter,
+                        )
+                        attn_bmm_output = _bmm_ptpc_output
+                    else:
+                        _bmm_buf = torch.empty(
+                            attn_output.shape[0],
+                            self.num_local_heads,
+                            self.w_vc.shape[-1],
+                            device=attn_output.device,
+                            dtype=torch.bfloat16,
+                        )
+                        batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+                            X=attn_output,
+                            WQ=self.w_vc.transpose(-1, -2),
+                            w_scale=self.w_scale,
+                            group_size=128,
+                            YQ=_bmm_buf,
+                            transpose_bm=True,
+                            transpose_bm_in=True,
+                            dtype=torch.bfloat16,
+                        )
+                        attn_bmm_output = _bmm_buf
                 else:
                     attn_bmm_output = torch.bmm(
                         attn_output.to(torch.bfloat16).transpose(0, 1),
                         self.w_vc.to(torch.bfloat16) * self.w_scale,
                     )
 
-            if _bmm_buf is not None:
+            if _bmm_ptpc_output is not None:
+                attn_bmm_output = _bmm_ptpc_output
+            elif _bmm_buf is not None:
                 # _bmm_buf is already (batch, heads, dim) contiguous
                 if self.o_proj.weight.dtype == torch.uint8:
                     attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)
