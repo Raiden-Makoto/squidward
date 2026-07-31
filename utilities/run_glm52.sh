@@ -10,8 +10,10 @@ export SGLANG_USE_AITER=${SGLANG_USE_AITER:-1}
 export SGLANG_ROCM_FUSED_DECODE_MLA=0
 export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4  # ATOM only
-# Tuned MoE (fmoe) config: left unset so aiter merges its own configs/tuned_fmoe.csv
-# with configs/model_configs/*tuned_fmoe*.csv, i.e. the stock glm5_fp4 rows.
+# Tuned MoE (fmoe) config: in-repo copy whose M>=16384 rows route gemm1 to the CK
+# gufusion kernel under test. Unset it to fall back to stock aiter (all FlyDSL).
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+export AITER_CONFIG_FMOE=${AITER_CONFIG_FMOE:-${SCRIPT_DIR}/glm5_fp4_tuned_fmoe.csv}
 
 export HIP_VISIBLE_DEVICES=4,5,6,7
 export AITER_USE_FLYDSL_MOE_SORTING=1  # match ATOM + the FlyDSL gemm1 kernels stock aiter tunes to
