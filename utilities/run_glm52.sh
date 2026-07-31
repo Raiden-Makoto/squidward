@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # GLM-5.2-MXFP4 launcher (gfx950).
 #
-export PYTHONPATH=/sgl-workspace/squidward/python:${PYTHONPATH}
+export PYTHONPATH=/sgl-workspace/squidward-fp8/python:${PYTHONPATH}
 MODEL=${HF_HOME:-/root/hf_home}/hub/models--amd--GLM-5.2-MXFP4/snapshots/386bd0e4ec821f7b07975701cec3c3b953a5576a
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
@@ -10,7 +10,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # split-K in the device op (ROCm/rocm-libraries#10146), so it aborts during
 # cuda-graph capture on those rows. Shadow the installed aiter with a checkout
 # carrying both until they land. Set AITER_PATH="" to force stock aiter.
-AITER_PATH=${AITER_PATH-/sgl-workspace/aiter_dev}
+AITER_PATH=${AITER_PATH-/sgl-workspace/aiter_fp8}
 if [[ -n "${AITER_PATH}" ]]; then
   if [[ -d "${AITER_PATH}/aiter" ]]; then
     export PYTHONPATH=${PYTHONPATH}:${AITER_PATH}
