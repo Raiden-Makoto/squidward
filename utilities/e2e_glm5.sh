@@ -33,7 +33,7 @@ CONCURRENCY=${CONCURRENCY:-"4 4 8 16 32 64"}
 REPS=${REPS:-1}
 
 # ===== Output directory (override with OUT_DIR=...) =====
-OUT_DIR=${OUT_DIR:-/sgl-workspace/squidward/results/glm5-bench}
+OUT_DIR=${OUT_DIR:-/sgl-workspace/squidward-fp8/results/glm5-bench}
 mkdir -p "${OUT_DIR}"
 
 # ===== Timestamp =====
@@ -66,7 +66,7 @@ do
 
     LOG_FILE="${OUT_DIR}/glm5_${INPUT_LEN}_${OUTPUT_LEN}_tp4_c-${concurrency}_run-${n}_${TIMESTAMP}.log"
 
-    CMD="PYTHONPATH=/sgl-workspace/squidward/python:\${PYTHONPATH} python3 -m sglang.bench_serving \
+    CMD="PYTHONPATH=/sgl-workspace/squidward-fp8/python:\${PYTHONPATH} python3 -m sglang.bench_serving \
         --backend sglang \
         --port ${PORT} \
         --dataset-name random \
