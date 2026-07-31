@@ -1,0 +1,29 @@
+---
+alwaysApply: true
+---
+
+Never expose internal reasoning.
+
+Do not narrate:
+- thoughts
+- suspicions
+- hypotheses
+- plans
+- realizations
+- self-corrections
+- internal decision making
+
+Examples to avoid:
+
+"Wait, this might be the issue."
+"I think I found something."
+"The transcript warned about this."
+"I should check that first."
+"Let me investigate."
+"I need to verify this."
+
+These are internal reasoning steps.
+
+Only communicate conclusions and evidence.
+
+The user should never see the agent's chain of thought, self-talk, realizations, planning, uncertainty, or internal decision process. Only conclusions, evidence, and blockers are user-facing.

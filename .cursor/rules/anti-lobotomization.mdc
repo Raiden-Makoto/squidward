@@ -1,0 +1,169 @@
+---
+description: Prevent Lobotomization
+alwaysApply: true
+---
+
+
+# Context Persistence Rules
+
+## Treat Previous Discoveries As Ground Truth
+
+Before re-investigating a problem, search the conversation history for prior discoveries.
+
+Do not rediscover information that has already been established.
+
+Examples:
+
+Already known:
+
+* Correct build command
+* Deployment command
+* Test command
+* Repository layout
+* Location of relevant files
+* Required environment variables
+* Previous root-cause analysis
+
+Bad:
+
+* Start searching from scratch.
+
+Good:
+
+* Locate the prior discovery and continue from there.
+
+---
+
+## Search History Before Searching The Repository
+
+When blocked, check whether the answer already exists in:
+
+1. Conversation history
+2. Project memory files
+3. Existing notes
+4. Prior findings
+
+Only then perform new investigation.
+
+Rule:
+
+> Previously discovered information is more trustworthy than a fresh guess.
+> Before spending more than 2 minutes investigating a problem, search conversation history for prior findings on the same topic.
+
+---
+
+## Preserve Operational Knowledge
+
+Operational knowledge must survive summarization.
+
+Examples:
+
+* Common commands
+* Build commands
+* Deployment commands
+* Startup scripts
+* Benchmark commands
+* Environment setup
+* Important file locations
+* Team conventions
+* Repository-specific workflows
+
+These are not temporary conversation details.
+
+They are project state.
+
+Treat them as durable knowledge.
+
+---
+
+## Do Not Regress
+
+After learning something, future actions must incorporate that knowledge.
+
+Bad:
+
+Day 1:
+
+* Learns startup script is ./scripts/start_server.sh
+
+Day 2:
+
+* Searches entire repository trying to figure out how to start the server.
+
+Good:
+
+Day 2:
+
+* Uses ./scripts/start_server.sh immediately.
+
+Rule:
+
+> Once something is known, it remains known until disproven.
+
+---
+
+## Prefer Retrieval Over Re-Derivation
+
+When uncertainty exists:
+
+Bad:
+
+* Guess.
+* Reinvestigate.
+* Invent a new workflow.
+
+Good:
+
+* Search history.
+* Search notes.
+* Search project memory.
+* Retrieve prior findings.
+
+Only investigate if retrieval fails.
+
+---
+
+## Summaries Are Not Sufficient
+
+Conversation summaries are lossy.
+
+When important operational details may have been compressed away:
+
+* Search the transcript.
+* Search project memory.
+* Search notes.
+* Search prior reports.
+
+Do not assume the summary contains everything.
+
+---
+
+## Detect Thrashing
+
+Signs of thrashing:
+
+* Repeating previous investigations.
+* Rediscovering known commands.
+* Reopening previously analyzed files.
+* Asking questions already answered.
+* Proposing workflows previously rejected.
+
+When thrashing is detected:
+
+Stop.
+
+Retrieve prior findings before continuing.
+
+---
+
+## Project Knowledge Is An Asset
+
+Every discovery should reduce future work.
+
+Never behave as if:
+
+* Previous investigations never happened.
+* Previous conclusions never existed.
+* Previous commands were never identified.
+
+Accumulated knowledge should compound over time.
