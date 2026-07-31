@@ -3,7 +3,6 @@
 #
 export PYTHONPATH=/sgl-workspace/squidward/python:${PYTHONPATH}
 MODEL=${HF_HOME:-/root/hf_home}/hub/models--amd--GLM-5.2-MXFP4/snapshots/386bd0e4ec821f7b07975701cec3c3b953a5576a
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 export SAFETENSORS_FAST_GPU=1
 # Master aiter switch (env-only, upstream default off); whole GLM-5.2 gfx950 path needs it.
@@ -11,11 +10,11 @@ export SGLANG_USE_AITER=${SGLANG_USE_AITER:-1}
 export SGLANG_ROCM_FUSED_DECODE_MLA=0
 export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4  # ATOM only
-# Tuned MoE (fmoe) config: upstream aiter glm5_fp4 tiles.
-export AITER_CONFIG_FMOE=${AITER_CONFIG_FMOE:-${SCRIPT_DIR}/glm5_fp4_tuned_fmoe.csv}
+# Tuned MoE (fmoe) config: left unset so aiter merges its own configs/tuned_fmoe.csv
+# with configs/model_configs/*tuned_fmoe*.csv, i.e. the stock glm5_fp4 rows.
 
 export HIP_VISIBLE_DEVICES=4,5,6,7
-export AITER_USE_FLYDSL_MOE_SORTING=1  # match ATOM + the FlyDSL kernels in AITER_CONFIG_FMOE
+export AITER_USE_FLYDSL_MOE_SORTING=1  # match ATOM + the FlyDSL gemm1 kernels stock aiter tunes to
 
 PROFILE_ARGS=""
 SPEC_ARGS=""
