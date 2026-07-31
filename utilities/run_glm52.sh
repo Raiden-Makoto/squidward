@@ -27,8 +27,10 @@ export SGLANG_USE_AITER=${SGLANG_USE_AITER:-1}
 export SGLANG_ROCM_FUSED_DECODE_MLA=0
 export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4  # ATOM only
-# All-fp8 dense q_b/o_proj CK GEMM w/ fused activation quant. =0 for all-bf16.
+# All-fp8 dense q_b/o_proj GEMM w/ fused activation quant. =0 for all-bf16.
 export SGLANG_DSA_FP8_PROJ_GEMM=${SGLANG_DSA_FP8_PROJ_GEMM:-1}
+# FP8 projection A/B: 0 = 1x128/128x128 blockscale, 1 = PTPC.
+export SGLANG_USE_DSA_FP8_PROJ_PTPC=${SGLANG_USE_DSA_FP8_PROJ_PTPC:-0}
 # Tuned a8w8_blockscale_bpreshuffle rows (also upstream via ROCm/aiter#4243); pin in-repo copy.
 export AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE=${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE:-${SCRIPT_DIR}/glm5_a8w8_blockscale_bpreshuffle_tuned.csv}
 # Tuned MoE (fmoe) config: upstream aiter glm5_fp4 tiles.

@@ -14,7 +14,10 @@ from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_extend,
     filter_dcp_local_kv_indices,
 )
-from sglang.srt.layers.quantization.unquant import fp8_proj_gemm_active
+from sglang.srt.layers.quantization.unquant import (
+    fp8_proj_gemm_active,
+    fp8_proj_uses_ptpc,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -50,7 +53,9 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
     from sglang.srt.models.deepseek_common.utils import (
         flatten_fp8_group_quant,
+        flatten_fp8_per_token_quant,
         fused_rms_fp8_group_quant,
+        fused_rms_fp8_per_token_quant,
     )
 
 
@@ -72,6 +77,11 @@ def _maybe_quant_o_proj_input(
     """
     if not fp8_proj_gemm_active(self.o_proj) or not attn_output.is_contiguous():
         return attn_output
+    if fp8_proj_uses_ptpc(self.o_proj):
+        return flatten_fp8_per_token_quant(
+            attn_output,
+            dtype_quant=torch.float8_e4m3fn,
+        )
     return flatten_fp8_group_quant(
         attn_output,
         group_size=128,
@@ -203,19 +213,32 @@ class DeepseekMHAForwardMixin:
                     # one eager per-layer launch at prefill (host-side idle, see
                     # results/glm52_dense_gemm_fp8_vs_bf16_scratch.md). The tuple feeds
                     # apply()'s fp8 path via the private _fp8_proj_weight copy.
-                    q_quanted, q_lora, _, _ = fused_rms_fp8_group_quant(
-                        q,
-                        self.q_a_layernorm.weight,
-                        self.q_a_layernorm.variance_epsilon,
-                        None,
-                        None,
-                        None,
-                        group_size=128,
-                        dtype_quant=torch.float8_e4m3fn,
-                        res1=None,
-                        output_unquantized_inp1=True,
-                        transpose_scale=_use_aiter_bpreshuffle_gfx95,
-                    )
+                    if fp8_proj_uses_ptpc(self.q_b_proj):
+                        q_quanted, q_lora, _, _ = fused_rms_fp8_per_token_quant(
+                            q,
+                            self.q_a_layernorm.weight,
+                            self.q_a_layernorm.variance_epsilon,
+                            None,
+                            None,
+                            None,
+                            dtype_quant=torch.float8_e4m3fn,
+                            res1=None,
+                            output_unquantized_inp1=True,
+                        )
+                    else:
+                        q_quanted, q_lora, _, _ = fused_rms_fp8_group_quant(
+                            q,
+                            self.q_a_layernorm.weight,
+                            self.q_a_layernorm.variance_epsilon,
+                            None,
+                            None,
+                            None,
+                            group_size=128,
+                            dtype_quant=torch.float8_e4m3fn,
+                            res1=None,
+                            output_unquantized_inp1=True,
+                            transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                        )
                     q = self.q_b_proj(q_quanted)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )

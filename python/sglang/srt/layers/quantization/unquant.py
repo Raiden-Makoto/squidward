@@ -61,9 +61,10 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95_supported = is_gfx95_supported()
 # Opt-in (gfx950): run bf16 dense projections that carry a `_fp8_proj_gemm`
-# marker (the quark-excluded GLM-5.2 MLA q_a/q_b/o_proj) on the aiter FP8 CK GEMM
-# instead of the bf16 tgemm. Load-time block-quant bf16 -> FP8 e4m3 + 128x128
-# scale (+ bpreshuffle) kept as a private FP8 copy; the bf16 weight is retained.
+# marker (the quark-excluded GLM-5.2 MLA q_a/q_b/o_proj) on an aiter FP8 GEMM
+# instead of the bf16 tgemm. The private FP8 weight copy uses either 128x128
+# block scaling or PTPC (per-channel weight scaling), selected at load time.
+# The bf16 weight is retained.
 # ALL-OR-NOTHING: when on, every call runs FP8 -- prefill and decode alike -- and
 # the activation quant is always folded into the kernel that already produces the
 # activation (q_a_layernorm for q_b_proj, the attn-output flatten for o_proj), so
@@ -93,6 +94,11 @@ def fp8_proj_gemm_active(layer: torch.nn.Module) -> bool:
     FP8 GEMM that consumes it.
     """
     return getattr(layer, "_fp8_proj_ready", False)
+
+
+def fp8_proj_uses_ptpc(layer: torch.nn.Module) -> bool:
+    """Whether an active private FP8 projection uses PTPC instead of blockscale."""
+    return getattr(layer, "_fp8_proj_use_ptpc", False)
 
 
 if _use_aiter:
@@ -236,16 +242,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _fp8_proj_gemm_enabled(layer):
-            self._repack_bf16_to_fp8_block(layer)
+            self._repack_bf16_to_fp8(layer)
             return
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
 
     @staticmethod
-    def _repack_bf16_to_fp8_block(layer: torch.nn.Module) -> None:
-        # Precompute an FP8 e4m3 (+128x128 UE8M0 scale) copy of the bf16 projection
-        # weight, matching the aiter CK bpreshuffle w8a8-block path. Validated on
-        # gfx950: CK FP8 output matches the torch block-fp8 reference to cos>0.9994.
+    def _repack_bf16_to_fp8(layer: torch.nn.Module) -> None:
+        # Precompute a bpreshuffled FP8 e4m3 copy of the bf16 projection weight.
+        # Blockscale uses 128x128 UE8M0 scales; PTPC uses one scale per output
+        # channel. Both retain the original bf16 parameter for the feature-off arm.
         # The FP8 copy lives in private attrs rather than replacing layer.weight so
         # the layer stays bf16-typed, which keeps every `weight.dtype == fp8` test in
         # the model code (each of which implies a natively-FP8 checkpoint) from
@@ -262,11 +268,18 @@ class UnquantizedLinearMethod(LinearMethodBase):
         w = layer.weight.data
         if w.dtype != torch.bfloat16 or w.dim() != 2:
             return
-        fp8_w, w_scale = quant_weight_ue8m0(w, [128, 128])
+        use_ptpc = envs.SGLANG_USE_DSA_FP8_PROJ_PTPC.get()
+        if use_ptpc:
+            import aiter
+
+            fp8_w, w_scale = aiter.pertoken_quant(w, quant_dtype=aiter.dtypes.fp8)
+        else:
+            fp8_w, w_scale = quant_weight_ue8m0(w, [128, 128])
         if _use_aiter_bpreshuffle_gfx95:
             fp8_w = shuffle_weight(fp8_w, (16, 16))
         layer._fp8_proj_weight = fp8_w.contiguous()
         layer._fp8_proj_weight_scale = w_scale.contiguous()
+        layer._fp8_proj_use_ptpc = use_ptpc
         layer._fp8_proj_ready = True
 
     def apply(
@@ -276,15 +289,23 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if fp8_proj_gemm_active(layer):
-            # All-FP8: every call takes the tuned FP8 CK GEMM against the private
-            # FP8 weight copy, at any M. `x` normally arrives as a pre-quantized
+            # All-FP8: every call takes the selected tuned FP8 GEMM against the
+            # private FP8 weight copy, at any M. `x` normally arrives as a pre-quantized
             # (fp8_act, scale) tuple from the fused producer; the plain-tensor case
             # is the fallback for call sites with nothing to fuse into, where the
             # GEMM wrapper quantizes inline.
             from sglang.srt.layers.quantization.fp8_utils import (
                 aiter_w8a8_block_fp8_linear,
+                apply_fp8_ptpc_linear,
             )
 
+            if fp8_proj_uses_ptpc(layer):
+                return apply_fp8_ptpc_linear(
+                    x,
+                    layer._fp8_proj_weight,
+                    layer._fp8_proj_weight_scale,
+                    bias=bias,
+                )
             if isinstance(x, tuple):
                 x_q, x_scale = x
                 return aiter_w8a8_block_fp8_linear(

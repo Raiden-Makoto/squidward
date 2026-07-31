@@ -555,6 +555,11 @@ class Envs:
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # Select per-token activation / per-channel weight FP8 for the opt-in
+    # GLM-5.2 dense projection path. False keeps 1x128 activation /
+    # 128x128 weight block scaling. Only effective with
+    # SGLANG_DSA_FP8_PROJ_GEMM=1.
+    SGLANG_USE_DSA_FP8_PROJ_PTPC = EnvBool(False)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override
