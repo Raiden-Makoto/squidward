@@ -236,7 +236,7 @@ def _get_ptpc_v_bmm_buffers(self, m: int, b: int, n: int, device: torch.device):
             torch.empty((m, b * n), dtype=torch.float8_e4m3fn, device=device),
             torch.empty((m, 1), dtype=torch.float32, device=device),
             torch.zeros((m,), dtype=torch.float32, device=device),
-            torch.zeros((3 * m,), dtype=torch.int32, device=device),
+            torch.zeros((m,), dtype=torch.int32, device=device),
         )
     return cache[key]
 
@@ -1178,7 +1178,6 @@ class DeepseekMLAForwardMixin:
                     # which ATOM / the MXFP4 path do not pay.
                     use_fused_ptpc_output = (
                         _aiter_bmm_supports_ptpc_output
-                        and attn_output.shape[0] <= 64
                         and fp8_proj_gemm_active(self.o_proj)
                         and fp8_proj_uses_ptpc(self.o_proj)
                         and _kvb_v is None
