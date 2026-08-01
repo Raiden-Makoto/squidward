@@ -287,6 +287,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
             import aiter
 
             fp8_w, w_scale = aiter.pertoken_quant(w, quant_dtype=aiter.dtypes.fp8)
+            if mode == "mixed":
+                w_scale = w_scale.expand(w.shape[0], w.shape[1] // 128).contiguous()
         else:
             fp8_w, w_scale = quant_weight_ue8m0(w, [128, 128])
         if _use_aiter_bpreshuffle_gfx95:
@@ -322,10 +324,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 )
             if fp8_proj_uses_mixed(layer):
                 import aiter
-                from aiter.ops.quant import per_group_quant_hip
-                from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
-                    gemm_a8w8_group_channel_preshuffle,
+                from aiter.ops.gemm_op_a8w8 import (
+                    gemm_a8w8_mixedscale_bpreshuffle_cktile,
                 )
+                from aiter.ops.quant import per_group_quant_hip
 
                 x_shape = x[0].shape if isinstance(x, tuple) else x.shape
                 if isinstance(x, tuple):
@@ -339,11 +341,17 @@ class UnquantizedLinearMethod(LinearMethodBase):
                         transpose_scale=False,
                     )
                 weight = layer._fp8_proj_weight
-                out = gemm_a8w8_group_channel_preshuffle(
+                out = torch.empty(
+                    (x_q.numel() // x_q.shape[-1], weight.shape[0]),
+                    dtype=torch.bfloat16,
+                    device=x_q.device,
+                )
+                gemm_a8w8_mixedscale_bpreshuffle_cktile(
                     x_q.view(-1, x_q.shape[-1]),
-                    weight.view(weight.shape[0] // 16, weight.shape[1] * 16),
+                    weight,
                     x_scale,
                     layer._fp8_proj_weight_scale,
+                    out,
                 )
                 if bias is not None:
                     out = out + bias
