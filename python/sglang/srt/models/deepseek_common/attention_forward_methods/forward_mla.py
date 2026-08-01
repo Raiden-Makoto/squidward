@@ -1161,6 +1161,7 @@ class DeepseekMLAForwardMixin:
                             transpose_bm_in=True,
                             dtype=torch.bfloat16,
                             emit_group_quant=True,
+                            transpose_group_scale=True,
                         )
                     else:
                         _bmm_buf = torch.empty(
@@ -1204,10 +1205,7 @@ class DeepseekMLAForwardMixin:
                             _bmm_buf,
                             group_size=128,
                             dtype_quant=torch.float8_e4m3fn,
-                            transpose_scale=(
-                                _use_aiter_bpreshuffle_gfx95
-                                and not fp8_proj_uses_mixed(self.o_proj)
-                            ),
+                            transpose_scale=_use_aiter_bpreshuffle_gfx95,
                         )
                 else:
                     attn_bmm_output = _bmm_buf.flatten(1, 2)
@@ -1232,14 +1230,9 @@ class DeepseekMLAForwardMixin:
                         attn_bmm_output,
                         group_size=128,
                         dtype_quant=torch.float8_e4m3fn,
-                        transpose_scale=(
-                            _use_aiter_bpreshuffle_gfx95
-                            and not fp8_proj_uses_mixed(self.o_proj)
-                        ),
+                        transpose_scale=_use_aiter_bpreshuffle_gfx95,
                     )
-                    if _use_aiter_bpreshuffle_gfx95 and not fp8_proj_uses_mixed(
-                        self.o_proj
-                    ):
+                    if _use_aiter_bpreshuffle_gfx95:
                         attn_bmm_output = retag_bpreshuffle_fp8_scale_tuple(
                             attn_bmm_output
                         )

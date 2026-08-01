@@ -287,14 +287,18 @@ class UnquantizedLinearMethod(LinearMethodBase):
             import aiter
 
             fp8_w, w_scale = aiter.pertoken_quant(w, quant_dtype=aiter.dtypes.fp8)
-            if mode == "mixed":
-                w_scale = w_scale.expand(w.shape[0], w.shape[1] // 128).contiguous()
         else:
             fp8_w, w_scale = quant_weight_ue8m0(w, [128, 128])
         if _use_aiter_bpreshuffle_gfx95:
             fp8_w = shuffle_weight(fp8_w, (16, 16))
         layer._fp8_proj_weight = fp8_w.contiguous()
         layer._fp8_proj_weight_scale = w_scale.contiguous()
+        if mode == "mixed":
+            layer._fp8_proj_weight_block_scale = torch.ones(
+                (w.shape[0] // 128, w.shape[1] // 128),
+                dtype=torch.float32,
+                device=w.device,
+            )
         layer._fp8_proj_mode = mode
         layer._fp8_proj_ready = True
 
@@ -325,7 +329,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if fp8_proj_uses_mixed(layer):
                 import aiter
                 from aiter.ops.gemm_op_a8w8 import (
-                    gemm_a8w8_mixedscale_bpreshuffle_cktile,
+                    gemm_a8w8_mixedscale_bpreshuffle,
                 )
                 from aiter.ops.quant import per_group_quant_hip
 
@@ -338,7 +342,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                         x_2d,
                         quant_dtype=aiter.dtypes.fp8,
                         group_size=128,
-                        transpose_scale=False,
+                        transpose_scale=True,
                     )
                 weight = layer._fp8_proj_weight
                 out = torch.empty(
@@ -346,10 +350,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
                     dtype=torch.bfloat16,
                     device=x_q.device,
                 )
-                gemm_a8w8_mixedscale_bpreshuffle_cktile(
+                gemm_a8w8_mixedscale_bpreshuffle(
                     x_q.view(-1, x_q.shape[-1]),
                     weight,
                     x_scale,
+                    layer._fp8_proj_weight_block_scale,
                     layer._fp8_proj_weight_scale,
                     out,
                 )
