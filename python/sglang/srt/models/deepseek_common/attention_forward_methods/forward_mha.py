@@ -16,6 +16,7 @@ from sglang.srt.layers.dcp import (
 )
 from sglang.srt.layers.quantization.unquant import (
     fp8_proj_gemm_active,
+    fp8_proj_uses_mixed,
     fp8_proj_uses_ptpc,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -86,7 +87,9 @@ def _maybe_quant_o_proj_input(
         attn_output,
         group_size=128,
         dtype_quant=torch.float8_e4m3fn,
-        transpose_scale=_use_aiter_bpreshuffle_gfx95,
+        transpose_scale=(
+            _use_aiter_bpreshuffle_gfx95 and not fp8_proj_uses_mixed(self.o_proj)
+        ),
     )
 
 
@@ -237,7 +240,10 @@ class DeepseekMHAForwardMixin:
                             dtype_quant=torch.float8_e4m3fn,
                             res1=None,
                             output_unquantized_inp1=True,
-                            transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                            transpose_scale=(
+                                _use_aiter_bpreshuffle_gfx95
+                                and not fp8_proj_uses_mixed(self.q_b_proj)
+                            ),
                         )
                     q = self.q_b_proj(q_quanted)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim

@@ -1885,7 +1885,7 @@ class DeepseekV2AttentionMLA(
         for _fp8_proj_name in ("q_b_proj", "o_proj"):
             _fp8_proj = getattr(self, _fp8_proj_name, None)
             if _fp8_proj is not None:
-                _fp8_proj._fp8_proj_gemm = True
+                _fp8_proj._fp8_proj_gemm = _fp8_proj_name
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         if not skip_rope:

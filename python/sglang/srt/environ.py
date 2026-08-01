@@ -560,6 +560,11 @@ class Envs:
     # 128x128 weight block scaling. Only effective with
     # SGLANG_DSA_FP8_PROJ_GEMM=1.
     SGLANG_USE_DSA_FP8_PROJ_PTPC = EnvBool(False)
+    # Select the FP8 projection scaling contract: blockscale, ptpc, or mixed.
+    # Mixed applies group-128 activation / per-channel weight scaling to o_proj
+    # while retaining blockscale for q_b_proj. When unset, the legacy PTPC
+    # boolean above selects between ptpc and blockscale.
+    SGLANG_DSA_FP8_PROJ_MODE = EnvStr(None)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override

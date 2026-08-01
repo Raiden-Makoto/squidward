@@ -32,6 +32,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.unquant import (
     fp8_proj_gemm_active,
+    fp8_proj_uses_mixed,
     fp8_proj_uses_ptpc,
 )
 from sglang.srt.layers.radix_attention import unified_attention_with_output
@@ -210,7 +211,9 @@ if _use_aiter_gfx95:
             dtype_quant=torch.float8_e4m3fn,
             res1=None,
             output_unquantized_inp1=output_unquantized_inp1,
-            transpose_scale=_use_aiter_bpreshuffle_gfx95,
+            transpose_scale=(
+                _use_aiter_bpreshuffle_gfx95 and not fp8_proj_uses_mixed(layer)
+            ),
         )
 
 
@@ -1148,24 +1151,36 @@ class DeepseekMLAForwardMixin:
                     # (heads, tokens, v) and needed a transpose(0,1).flatten copy =
                     # a per-layer direct_copy (elementwise_manual_unroll ~5us/layer),
                     # which ATOM / the MXFP4 path do not pay.
-                    _bmm_buf = torch.empty(
-                        attn_output.shape[0],
-                        self.num_local_heads,
-                        self.w_vc.shape[-1],
-                        device=attn_output.device,
-                        dtype=torch.bfloat16,
-                    )
-                    batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-                        X=attn_output,
-                        WQ=self.w_vc.transpose(-1, -2),
-                        w_scale=self.w_scale,
-                        group_size=128,
-                        YQ=_bmm_buf,
-                        transpose_bm=True,
-                        transpose_bm_in=True,
-                        dtype=torch.bfloat16,
-                    )
-                    attn_bmm_output = _bmm_buf
+                    if fp8_proj_uses_mixed(self.o_proj):
+                        attn_bmm_output = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+                            X=attn_output,
+                            WQ=self.w_vc.transpose(-1, -2),
+                            w_scale=self.w_scale,
+                            group_size=128,
+                            transpose_bm=True,
+                            transpose_bm_in=True,
+                            dtype=torch.bfloat16,
+                            emit_group_quant=True,
+                        )
+                    else:
+                        _bmm_buf = torch.empty(
+                            attn_output.shape[0],
+                            self.num_local_heads,
+                            self.w_vc.shape[-1],
+                            device=attn_output.device,
+                            dtype=torch.bfloat16,
+                        )
+                        batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+                            X=attn_output,
+                            WQ=self.w_vc.transpose(-1, -2),
+                            w_scale=self.w_scale,
+                            group_size=128,
+                            YQ=_bmm_buf,
+                            transpose_bm=True,
+                            transpose_bm_in=True,
+                            dtype=torch.bfloat16,
+                        )
+                        attn_bmm_output = _bmm_buf
                 else:
                     attn_bmm_output = torch.bmm(
                         attn_output.to(torch.bfloat16).transpose(0, 1),
@@ -1189,13 +1204,20 @@ class DeepseekMLAForwardMixin:
                             _bmm_buf,
                             group_size=128,
                             dtype_quant=torch.float8_e4m3fn,
-                            transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                            transpose_scale=(
+                                _use_aiter_bpreshuffle_gfx95
+                                and not fp8_proj_uses_mixed(self.o_proj)
+                            ),
                         )
                 else:
                     attn_bmm_output = _bmm_buf.flatten(1, 2)
             elif self.o_proj.weight.dtype == torch.uint8:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
+            elif fp8_proj_uses_mixed(self.o_proj) and isinstance(
+                attn_bmm_output, tuple
+            ):
+                pass
             elif self.o_proj.weight.dtype == torch.float8_e4m3fn or (
                 fp8_proj_gemm_active(self.o_proj)
             ):
@@ -1210,9 +1232,14 @@ class DeepseekMLAForwardMixin:
                         attn_bmm_output,
                         group_size=128,
                         dtype_quant=torch.float8_e4m3fn,
-                        transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                        transpose_scale=(
+                            _use_aiter_bpreshuffle_gfx95
+                            and not fp8_proj_uses_mixed(self.o_proj)
+                        ),
                     )
-                    if _use_aiter_bpreshuffle_gfx95:
+                    if _use_aiter_bpreshuffle_gfx95 and not fp8_proj_uses_mixed(
+                        self.o_proj
+                    ):
                         attn_bmm_output = retag_bpreshuffle_fp8_scale_tuple(
                             attn_bmm_output
                         )

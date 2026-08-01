@@ -98,7 +98,12 @@ def fp8_proj_gemm_active(layer: torch.nn.Module) -> bool:
 
 def fp8_proj_uses_ptpc(layer: torch.nn.Module) -> bool:
     """Whether an active private FP8 projection uses PTPC instead of blockscale."""
-    return getattr(layer, "_fp8_proj_use_ptpc", False)
+    return getattr(layer, "_fp8_proj_mode", "blockscale") == "ptpc"
+
+
+def fp8_proj_uses_mixed(layer: torch.nn.Module) -> bool:
+    """Whether this projection uses group-128 A and per-channel W scales."""
+    return getattr(layer, "_fp8_proj_mode", "blockscale") == "mixed"
 
 
 if _use_aiter:
@@ -268,8 +273,17 @@ class UnquantizedLinearMethod(LinearMethodBase):
         w = layer.weight.data
         if w.dtype != torch.bfloat16 or w.dim() != 2:
             return
-        use_ptpc = envs.SGLANG_USE_DSA_FP8_PROJ_PTPC.get()
-        if use_ptpc:
+        mode = envs.SGLANG_DSA_FP8_PROJ_MODE.get()
+        if mode is None:
+            mode = "ptpc" if envs.SGLANG_USE_DSA_FP8_PROJ_PTPC.get() else "blockscale"
+        if mode not in ("blockscale", "ptpc", "mixed"):
+            raise ValueError(
+                "SGLANG_DSA_FP8_PROJ_MODE must be blockscale, ptpc, or mixed; "
+                f"got {mode!r}"
+            )
+        if mode == "mixed" and getattr(layer, "_fp8_proj_gemm", None) != "o_proj":
+            mode = "blockscale"
+        if mode in ("ptpc", "mixed"):
             import aiter
 
             fp8_w, w_scale = aiter.pertoken_quant(w, quant_dtype=aiter.dtypes.fp8)
@@ -279,7 +293,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             fp8_w = shuffle_weight(fp8_w, (16, 16))
         layer._fp8_proj_weight = fp8_w.contiguous()
         layer._fp8_proj_weight_scale = w_scale.contiguous()
-        layer._fp8_proj_use_ptpc = use_ptpc
+        layer._fp8_proj_mode = mode
         layer._fp8_proj_ready = True
 
     def apply(
@@ -306,6 +320,34 @@ class UnquantizedLinearMethod(LinearMethodBase):
                     layer._fp8_proj_weight_scale,
                     bias=bias,
                 )
+            if fp8_proj_uses_mixed(layer):
+                import aiter
+                from aiter.ops.quant import per_group_quant_hip
+                from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
+                    gemm_a8w8_group_channel_preshuffle,
+                )
+
+                x_shape = x[0].shape if isinstance(x, tuple) else x.shape
+                if isinstance(x, tuple):
+                    x_q, x_scale = x
+                else:
+                    x_2d = x.view(-1, x.shape[-1])
+                    x_q, x_scale = per_group_quant_hip(
+                        x_2d,
+                        quant_dtype=aiter.dtypes.fp8,
+                        group_size=128,
+                        transpose_scale=False,
+                    )
+                weight = layer._fp8_proj_weight
+                out = gemm_a8w8_group_channel_preshuffle(
+                    x_q.view(-1, x_q.shape[-1]),
+                    weight.view(weight.shape[0] // 16, weight.shape[1] * 16),
+                    x_scale,
+                    layer._fp8_proj_weight_scale,
+                )
+                if bias is not None:
+                    out = out + bias
+                return out.view(*x_shape[:-1], out.shape[-1])
             if isinstance(x, tuple):
                 x_q, x_scale = x
                 return aiter_w8a8_block_fp8_linear(
