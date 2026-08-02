@@ -36,7 +36,7 @@ export AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE=${AITER_CONFIG_GEMM_A8W8_BL
 # Tuned MoE (fmoe) config: upstream aiter glm5_fp4 tiles.
 export AITER_CONFIG_FMOE=${AITER_CONFIG_FMOE:-${SCRIPT_DIR}/glm5_fp4_tuned_fmoe.csv}
 
-export HIP_VISIBLE_DEVICES=4,5,6,7
+export HIP_VISIBLE_DEVICES=4,5,6,7 # these GPUs are visible by default
 export AITER_USE_FLYDSL_MOE_SORTING=1  # match ATOM + the FlyDSL kernels in AITER_CONFIG_FMOE
 
 PROFILE_ARGS=""
@@ -59,6 +59,9 @@ for arg in "$@"; do
       # Kept for backwards compat so old launch commands still parse.
       export SGLANG_USE_AITER=1
       ALLREDUCE_FUSION="--enable-aiter-allreduce-fusion"
+      ;;
+    --switch-gpu)
+      export HIP_VISIBLE_DEVICES=0,1,2,3
       ;;
     *)
       # forward any other flag straight to `sglang serve`
