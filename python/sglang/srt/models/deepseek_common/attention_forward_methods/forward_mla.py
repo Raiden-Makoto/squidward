@@ -32,9 +32,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.unquant import (
     fp8_proj_gemm_active,
+    fp8_proj_num_sequences,
     fp8_proj_use_o_proj_at_m,
     fp8_proj_uses_mixed,
-    fp8_proj_uses_ptpc_at_m,
+    fp8_proj_uses_ptpc_at_batch,
+    tag_fp8_proj_input,
 )
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
@@ -188,10 +190,11 @@ if _use_aiter_gfx95:
         inp2_epsilon,
         *,
         output_unquantized_inp1,
+        num_sequences,
     ):
-        concrete_m = inp1.numel() // inp1.shape[-1]
-        if fp8_proj_uses_ptpc_at_m(layer, concrete_m):
-            return fused_rms_fp8_per_token_quant(
+        use_ptpc = fp8_proj_uses_ptpc_at_batch(layer, num_sequences)
+        if use_ptpc:
+            result = fused_rms_fp8_per_token_quant(
                 inp1,
                 inp1_weight,
                 inp1_epsilon,
@@ -202,21 +205,28 @@ if _use_aiter_gfx95:
                 res1=None,
                 output_unquantized_inp1=output_unquantized_inp1,
             )
-        return fused_rms_fp8_group_quant(
-            inp1,
-            inp1_weight,
-            inp1_epsilon,
-            inp2,
-            inp2_weight,
-            inp2_epsilon,
-            group_size=128,
-            dtype_quant=torch.float8_e4m3fn,
-            res1=None,
-            output_unquantized_inp1=output_unquantized_inp1,
-            transpose_scale=(
-                _use_aiter_bpreshuffle_gfx95 and not fp8_proj_uses_mixed(layer)
-            ),
-        )
+        else:
+            result = fused_rms_fp8_group_quant(
+                inp1,
+                inp1_weight,
+                inp1_epsilon,
+                inp2,
+                inp2_weight,
+                inp2_epsilon,
+                group_size=128,
+                dtype_quant=torch.float8_e4m3fn,
+                res1=None,
+                output_unquantized_inp1=output_unquantized_inp1,
+                transpose_scale=(
+                    _use_aiter_bpreshuffle_gfx95 and not fp8_proj_uses_mixed(layer)
+                ),
+            )
+        if getattr(layer, "_fp8_proj_mode", None) == "hybrid":
+            result = (
+                tag_fp8_proj_input(result[0], use_ptpc=use_ptpc),
+                *result[1:],
+            )
+        return result
 
 
 def _should_defer_dsa_cp_kv_gather(
@@ -472,6 +482,7 @@ class DeepseekMLAForwardMixin:
                                 self.kv_a_layernorm.weight,
                                 self.kv_a_layernorm.variance_epsilon,
                                 output_unquantized_inp1=True,
+                                num_sequences=fp8_proj_num_sequences(forward_batch),
                             )
                             q = q_quanted
                         else:
@@ -484,6 +495,7 @@ class DeepseekMLAForwardMixin:
                                 self.kv_a_layernorm.weight,
                                 self.kv_a_layernorm.variance_epsilon,
                                 output_unquantized_inp1=False,
+                                num_sequences=fp8_proj_num_sequences(forward_batch),
                             )
 
                     elif _use_aiter:
@@ -1089,7 +1101,9 @@ class DeepseekMLAForwardMixin:
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         concrete_o_proj_m = attn_output.shape[0]
         use_fp8_o_proj = fp8_proj_use_o_proj_at_m(self.o_proj, concrete_o_proj_m)
-        use_ptpc_o_proj = fp8_proj_uses_ptpc_at_m(self.o_proj, concrete_o_proj_m)
+        use_ptpc_o_proj = fp8_proj_uses_ptpc_at_batch(
+            self.o_proj, fp8_proj_num_sequences(forward_batch)
+        )
 
         _kvb_v = None
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
@@ -1210,6 +1224,10 @@ class DeepseekMLAForwardMixin:
                             dtype_quant=torch.float8_e4m3fn,
                             transpose_scale=_use_aiter_bpreshuffle_gfx95,
                         )
+                    if getattr(self.o_proj, "_fp8_proj_mode", None) == "hybrid":
+                        attn_bmm_output = tag_fp8_proj_input(
+                            attn_bmm_output, use_ptpc=use_ptpc_o_proj
+                        )
                 else:
                     attn_bmm_output = _bmm_buf.flatten(1, 2)
             elif self.o_proj.weight.dtype == torch.uint8:
@@ -1237,6 +1255,10 @@ class DeepseekMLAForwardMixin:
                         attn_bmm_output = retag_bpreshuffle_fp8_scale_tuple(
                             attn_bmm_output
                         )
+                if getattr(self.o_proj, "_fp8_proj_mode", None) == "hybrid":
+                    attn_bmm_output = tag_fp8_proj_input(
+                        attn_bmm_output, use_ptpc=use_ptpc_o_proj
+                    )
             else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
@@ -1314,6 +1336,15 @@ class DeepseekMLAForwardMixin:
                 group_size=128,
                 dtype_quant=torch.float8_e4m3fn,
                 transpose_scale=_use_aiter_bpreshuffle_gfx95,
+            )
+        if (
+            use_fp8_o_proj
+            and getattr(self.o_proj, "_fp8_proj_mode", None) == "hybrid"
+            and isinstance(attn_bmm_output, tuple)
+            and len(attn_bmm_output) == 2
+        ):
+            attn_bmm_output = tag_fp8_proj_input(
+                attn_bmm_output, use_ptpc=use_ptpc_o_proj
             )
         output, _ = self.o_proj(attn_bmm_output)
 

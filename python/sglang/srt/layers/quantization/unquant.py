@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,8 @@ _is_gfx95_supported = is_gfx95_supported()
 # marker (the quark-excluded GLM-5.2 MLA q_a/q_b/o_proj) on an aiter FP8 GEMM
 # instead of the bf16 tgemm. The private FP8 weight copy uses either 128x128
 # block scaling or PTPC (per-channel weight scaling), selected at load time.
-# Hybrid mode retains both copies and selects between them from concrete M.
+# Hybrid mode retains both copies and selects between them from the exact
+# per-forward sequence count.
 # The bf16 weight is retained.
 # q_b remains FP8 at every M. Mixed-mode o_proj can select BF16 below an
 # M threshold; its producer returns a tuple only for FP8 and a tensor for BF16,
@@ -98,12 +99,33 @@ def fp8_proj_uses_ptpc(layer: torch.nn.Module) -> bool:
     return getattr(layer, "_fp8_proj_mode", "blockscale") == "ptpc"
 
 
-def fp8_proj_uses_ptpc_at_m(layer: torch.nn.Module, m: int) -> bool:
-    """Resolve the projection's scale contract from a concrete flattened M."""
+def fp8_proj_uses_ptpc_at_batch(layer: torch.nn.Module, num_sequences: int) -> bool:
+    """Resolve the projection's scale contract from the forward sequence count."""
     mode = getattr(layer, "_fp8_proj_mode", "blockscale")
     return mode == "ptpc" or (
-        mode == "hybrid" and m >= envs.SGLANG_DSA_FP8_PROJ_HYBRID_M_MIN.get()
+        mode == "hybrid"
+        and num_sequences >= envs.SGLANG_DSA_FP8_PROJ_HYBRID_SEQ_MIN.get()
     )
+
+
+def fp8_proj_num_sequences(forward_batch) -> int:
+    """Return the real sequence count, excluding CUDA-graph padding slots."""
+    return forward_batch.batch_size - getattr(forward_batch, "num_padding", 0)
+
+
+def tag_fp8_proj_input(
+    value: Tuple[torch.Tensor, torch.Tensor], *, use_ptpc: bool
+) -> Tuple[torch.Tensor, torch.Tensor, bool]:
+    """Attach the producer-selected hybrid scale contract to an activation tuple."""
+    return value[0], value[1], use_ptpc
+
+
+def _fp8_proj_tuple_uses_ptpc(x) -> bool:
+    if not isinstance(x, tuple) or len(x) < 3 or not isinstance(x[2], bool):
+        raise RuntimeError(
+            "hybrid FP8 projection requires a producer-tagged activation tuple"
+        )
+    return x[2]
 
 
 def fp8_proj_uses_mixed(layer: torch.nn.Module) -> bool:
@@ -361,10 +383,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 apply_fp8_ptpc_linear,
             )
 
-            x_value = x[0] if isinstance(x, tuple) else x
-            concrete_m = x_value.numel() // x_value.shape[-1]
-            use_ptpc = fp8_proj_uses_ptpc_at_m(layer, concrete_m)
-            if getattr(layer, "_fp8_proj_mode", "blockscale") == "hybrid":
+            mode = getattr(layer, "_fp8_proj_mode", "blockscale")
+            use_ptpc = mode == "ptpc"
+            if mode == "hybrid":
+                use_ptpc = _fp8_proj_tuple_uses_ptpc(x)
                 if use_ptpc:
                     weight = layer._fp8_proj_ptpc_weight
                     weight_scale = layer._fp8_proj_ptpc_weight_scale
@@ -377,7 +399,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
             if use_ptpc:
                 return apply_fp8_ptpc_linear(
-                    x,
+                    x[:2] if isinstance(x, tuple) else x,
                     weight,
                     weight_scale,
                     bias=bias,
@@ -417,7 +439,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                     out = out + bias
                 return out.view(*x_shape[:-1], out.shape[-1])
             if isinstance(x, tuple):
-                x_q, x_scale = x
+                x_q, x_scale = x[:2]
                 return aiter_w8a8_block_fp8_linear(
                     x_q,
                     weight,

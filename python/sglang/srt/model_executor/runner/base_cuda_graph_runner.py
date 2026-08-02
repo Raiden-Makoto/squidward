@@ -22,6 +22,7 @@ from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import (
@@ -70,6 +71,13 @@ def get_batch_sizes_to_capture(
     server_args = model_runner.server_args
     capture_bs = list(server_args.cuda_graph_config.decode.bs)
     num_max_requests = model_runner.req_to_token_pool.size
+    if envs.SGLANG_DSA_FP8_PROJ_MODE.get() == "hybrid":
+        # Keep graph padding from crossing the hybrid projection contract
+        # boundary. Batches below the crossover may pad to seq_min - 1, while
+        # seq_min itself selects a distinct PTPC graph.
+        hybrid_boundary = envs.SGLANG_DSA_FP8_PROJ_HYBRID_SEQ_MIN.get() - 1
+        if hybrid_boundary > 0:
+            capture_bs.append(hybrid_boundary)
 
     mul_base = get_cuda_graph_batch_size_alignment(server_args)
     # TBO splits each request's rows across two micro-batches, so the

@@ -16,8 +16,10 @@ from sglang.srt.layers.dcp import (
 )
 from sglang.srt.layers.quantization.unquant import (
     fp8_proj_gemm_active,
+    fp8_proj_num_sequences,
     fp8_proj_use_o_proj_at_m,
-    fp8_proj_uses_ptpc_at_m,
+    fp8_proj_uses_ptpc_at_batch,
+    tag_fp8_proj_input,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
@@ -68,7 +70,9 @@ def _resolve_attn_backend(forward_batch: ForwardBatch):
 
 
 def _maybe_quant_o_proj_input(
-    self: DeepseekV2AttentionMLA, attn_output: torch.Tensor
+    self: DeepseekV2AttentionMLA,
+    attn_output: torch.Tensor,
+    forward_batch: ForwardBatch,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Quantize the flattened attention output when o_proj runs the FP8 GEMM.
 
@@ -79,17 +83,24 @@ def _maybe_quant_o_proj_input(
     if not fp8_proj_use_o_proj_at_m(self.o_proj, attn_output.shape[0]):
         return attn_output
     attn_output = attn_output.contiguous()
-    if fp8_proj_uses_ptpc_at_m(self.o_proj, attn_output.shape[0]):
-        return flatten_fp8_per_token_quant(
+    use_ptpc = fp8_proj_uses_ptpc_at_batch(
+        self.o_proj, fp8_proj_num_sequences(forward_batch)
+    )
+    if use_ptpc:
+        value = flatten_fp8_per_token_quant(
             attn_output,
             dtype_quant=torch.float8_e4m3fn,
         )
-    return flatten_fp8_group_quant(
-        attn_output,
-        group_size=128,
-        dtype_quant=torch.float8_e4m3fn,
-        transpose_scale=_use_aiter_bpreshuffle_gfx95,
-    )
+    else:
+        value = flatten_fp8_group_quant(
+            attn_output,
+            group_size=128,
+            dtype_quant=torch.float8_e4m3fn,
+            transpose_scale=_use_aiter_bpreshuffle_gfx95,
+        )
+    if getattr(self.o_proj, "_fp8_proj_mode", None) == "hybrid":
+        value = tag_fp8_proj_input(value, use_ptpc=use_ptpc)
+    return value
 
 
 def _forward_dsa_indexer_for_mha(
@@ -215,8 +226,10 @@ class DeepseekMHAForwardMixin:
                     # one eager per-layer launch at prefill (host-side idle, see
                     # results/glm52_dense_gemm_fp8_vs_bf16_scratch.md). The tuple feeds
                     # apply()'s fp8 path via the private _fp8_proj_weight copy.
-                    concrete_q_proj_m = q.numel() // q.shape[-1]
-                    if fp8_proj_uses_ptpc_at_m(self.q_b_proj, concrete_q_proj_m):
+                    use_ptpc = fp8_proj_uses_ptpc_at_batch(
+                        self.q_b_proj, fp8_proj_num_sequences(forward_batch)
+                    )
+                    if use_ptpc:
                         q_quanted, q_lora, _, _ = fused_rms_fp8_per_token_quant(
                             q,
                             self.q_a_layernorm.weight,
@@ -241,6 +254,10 @@ class DeepseekMHAForwardMixin:
                             res1=None,
                             output_unquantized_inp1=True,
                             transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                        )
+                    if getattr(self.q_b_proj, "_fp8_proj_mode", None) == "hybrid":
+                        q_quanted = tag_fp8_proj_input(
+                            q_quanted, use_ptpc=use_ptpc
                         )
                     q = self.q_b_proj(q_quanted)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
@@ -422,7 +439,9 @@ class DeepseekMHAForwardMixin:
     ) -> torch.Tensor:
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        output, _ = self.o_proj(_maybe_quant_o_proj_input(self, attn_output))
+        output, _ = self.o_proj(
+            _maybe_quant_o_proj_input(self, attn_output, forward_batch)
+        )
         return output
 
     def forward_normal_chunked_kv_prepare(
@@ -476,7 +495,9 @@ class DeepseekMHAForwardMixin:
             )
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        output, _ = self.o_proj(_maybe_quant_o_proj_input(self, attn_output))
+        output, _ = self.o_proj(
+            _maybe_quant_o_proj_input(self, attn_output, forward_batch)
+        )
         return output
 
     def forward_normal_one_shot_prepare(

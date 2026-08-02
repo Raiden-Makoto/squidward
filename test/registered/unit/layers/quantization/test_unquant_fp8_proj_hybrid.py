@@ -12,7 +12,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
-    fp8_proj_uses_ptpc_at_m,
+    fp8_proj_num_sequences,
+    fp8_proj_uses_ptpc_at_batch,
+    tag_fp8_proj_input,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -33,27 +35,42 @@ def _hybrid_layer():
 
 
 class TestHybridFp8Proj(CustomTestCase):
-    def test_m15_m16_contract_boundary(self):
+    def test_sequence_count_15_16_contract_boundary(self):
         layer = _hybrid_layer()
-        with envs.SGLANG_DSA_FP8_PROJ_HYBRID_M_MIN.override(16):
-            self.assertFalse(fp8_proj_uses_ptpc_at_m(layer, 15))
-            self.assertTrue(fp8_proj_uses_ptpc_at_m(layer, 16))
+        with envs.SGLANG_DSA_FP8_PROJ_HYBRID_SEQ_MIN.override(16):
+            self.assertFalse(fp8_proj_uses_ptpc_at_batch(layer, 15))
+            self.assertTrue(fp8_proj_uses_ptpc_at_batch(layer, 16))
 
             layer._fp8_proj_mode = "blockscale"
-            self.assertFalse(fp8_proj_uses_ptpc_at_m(layer, 16))
+            self.assertFalse(fp8_proj_uses_ptpc_at_batch(layer, 16))
             layer._fp8_proj_mode = "ptpc"
-            self.assertTrue(fp8_proj_uses_ptpc_at_m(layer, 15))
+            self.assertTrue(fp8_proj_uses_ptpc_at_batch(layer, 15))
             layer._fp8_proj_mode = "mixed"
-            self.assertFalse(fp8_proj_uses_ptpc_at_m(layer, 16))
+            self.assertFalse(fp8_proj_uses_ptpc_at_batch(layer, 16))
 
-    def test_consumer_matches_m15_m16_contract_and_weights(self):
+    def test_large_prefill_uses_sequence_count_not_token_m(self):
+        layer = _hybrid_layer()
+        forward_batch = SimpleNamespace(batch_size=8)
+        token_m = 8192
+        self.assertGreaterEqual(token_m, 16)
+        self.assertEqual(fp8_proj_num_sequences(forward_batch), 8)
+        self.assertFalse(
+            fp8_proj_uses_ptpc_at_batch(
+                layer, fp8_proj_num_sequences(forward_batch)
+            )
+        )
+
+    def test_cuda_graph_padding_is_excluded_from_sequence_count(self):
+        forward_batch = SimpleNamespace(batch_size=16, num_padding=1)
+        self.assertEqual(fp8_proj_num_sequences(forward_batch), 15)
+
+    def test_consumer_uses_authoritative_producer_tag_and_weights(self):
         layer = _hybrid_layer()
         method = UnquantizedLinearMethod()
         block_out = torch.empty((15, 128), dtype=torch.bfloat16)
         ptpc_out = torch.empty((16, 128), dtype=torch.bfloat16)
 
         with (
-            envs.SGLANG_DSA_FP8_PROJ_HYBRID_M_MIN.override(16),
             mock.patch.object(
                 fp8_utils,
                 "aiter_w8a8_block_fp8_linear",
@@ -65,28 +82,47 @@ class TestHybridFp8Proj(CustomTestCase):
                 return_value=ptpc_out,
             ) as ptpc_gemm,
         ):
-            m15_input = (
-                torch.empty((15, 128), dtype=torch.uint8),
-                torch.empty((15, 1)),
+            block_input = tag_fp8_proj_input(
+                (
+                    torch.empty((8192, 128), dtype=torch.uint8),
+                    torch.empty((64, 1)),
+                ),
+                use_ptpc=False,
             )
-            self.assertIs(method.apply(layer, m15_input), block_out)
+            self.assertIs(method.apply(layer, block_input), block_out)
             block_gemm.assert_called_once()
             self.assertIs(
                 block_gemm.call_args.args[1], layer._fp8_proj_blockscale_weight
             )
-            self.assertIs(block_gemm.call_args.kwargs["input_scale"], m15_input[1])
+            self.assertIs(
+                block_gemm.call_args.kwargs["input_scale"], block_input[1]
+            )
             ptpc_gemm.assert_not_called()
 
-            m16_input = (
-                torch.empty((2, 8, 128), dtype=torch.uint8),
-                torch.empty((16, 1)),
+            ptpc_input = tag_fp8_proj_input(
+                (
+                    torch.empty((2, 8, 128), dtype=torch.uint8),
+                    torch.empty((16, 1)),
+                ),
+                use_ptpc=True,
             )
-            self.assertIs(method.apply(layer, m16_input), ptpc_out)
+            self.assertIs(method.apply(layer, ptpc_input), ptpc_out)
             ptpc_gemm.assert_called_once()
-            self.assertIs(ptpc_gemm.call_args.args[1], layer._fp8_proj_ptpc_weight)
+            self.assertIs(
+                ptpc_gemm.call_args.args[1], layer._fp8_proj_ptpc_weight
+            )
             self.assertIs(
                 ptpc_gemm.call_args.args[2], layer._fp8_proj_ptpc_weight_scale
             )
+
+    def test_consumer_rejects_untagged_hybrid_tuple(self):
+        layer = _hybrid_layer()
+        value = (
+            torch.empty((8, 128), dtype=torch.uint8),
+            torch.empty((8, 1)),
+        )
+        with self.assertRaisesRegex(RuntimeError, "producer-tagged"):
+            UnquantizedLinearMethod().apply(layer, value)
 
     def test_hybrid_load_retains_both_weight_contracts(self):
         layer = torch.nn.Linear(128, 128, bias=False, dtype=torch.bfloat16)
