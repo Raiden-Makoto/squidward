@@ -65,13 +65,9 @@ _is_gfx95_supported = is_gfx95_supported()
 # instead of the bf16 tgemm. The private FP8 weight copy uses either 128x128
 # block scaling or PTPC (per-channel weight scaling), selected at load time.
 # The bf16 weight is retained.
-# ALL-OR-NOTHING: when on, every call runs FP8 -- prefill and decode alike -- and
-# the activation quant is always folded into the kernel that already produces the
-# activation (q_a_layernorm for q_b_proj, the attn-output flatten for o_proj), so
-# the FP8 GEMM is never paid for alongside a standalone quant launch. When off,
-# every call stays bf16. There is deliberately no token-count gate: a per-M split
-# meant the fused producers could not be used for the decode half, which left
-# decode paying an unfused quant and made the two halves un-A/B-able. Default off.
+# q_b remains FP8 at every M. Mixed-mode o_proj can select BF16 below an
+# M threshold; its producer returns a tuple only for FP8 and a tensor for BF16,
+# so the BF16 arm never performs activation quantization. Default off.
 _DSA_FP8_PROJ_GEMM = get_bool_env_var("SGLANG_DSA_FP8_PROJ_GEMM")
 
 
@@ -104,6 +100,19 @@ def fp8_proj_uses_ptpc(layer: torch.nn.Module) -> bool:
 def fp8_proj_uses_mixed(layer: torch.nn.Module) -> bool:
     """Whether this projection uses group-128 A and per-channel W scales."""
     return getattr(layer, "_fp8_proj_mode", "blockscale") == "mixed"
+
+
+def fp8_proj_use_o_proj_at_m(layer: torch.nn.Module, m: int) -> bool:
+    """Whether o_proj's producer should return an FP8 activation at this M.
+
+    The threshold only gates mixed-mode o_proj. Other active projection modes
+    retain their all-FP8 behavior, and q_b does not call this predicate.
+    """
+    if not fp8_proj_gemm_active(layer):
+        return False
+    if not fp8_proj_uses_mixed(layer):
+        return True
+    return m >= envs.SGLANG_DSA_FP8_PROJ_O_PROJ_M_MIN.get()
 
 
 if _use_aiter:
@@ -308,12 +317,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if fp8_proj_gemm_active(layer):
-            # All-FP8: every call takes the selected tuned FP8 GEMM against the
-            # private FP8 weight copy, at any M. `x` normally arrives as a pre-quantized
-            # (fp8_act, scale) tuple from the fused producer; the plain-tensor case
-            # is the fallback for call sites with nothing to fuse into, where the
-            # GEMM wrapper quantizes inline.
+        # Mixed o_proj's producer is authoritative: a tuple selects FP8, while
+        # a tensor selects BF16. Do not re-evaluate the M threshold here.
+        is_mixed_o_proj = (
+            fp8_proj_gemm_active(layer)
+            and fp8_proj_uses_mixed(layer)
+            and getattr(layer, "_fp8_proj_gemm", None) == "o_proj"
+        )
+        if fp8_proj_gemm_active(layer) and (
+            not is_mixed_o_proj or isinstance(x, tuple)
+        ):
+            # The selected FP8 GEMM consumes a pre-quantized (fp8_act, scale)
+            # tuple when its producer supports the authoritative contract.
+            # Other FP8 projection modes retain the plain-tensor inline-quant
+            # fallback.
             from sglang.srt.layers.quantization.fp8_utils import (
                 aiter_w8a8_block_fp8_linear,
                 apply_fp8_ptpc_linear,

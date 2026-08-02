@@ -32,6 +32,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.unquant import (
     fp8_proj_gemm_active,
+    fp8_proj_use_o_proj_at_m,
     fp8_proj_uses_mixed,
     fp8_proj_uses_ptpc,
 )
@@ -1085,6 +1086,7 @@ class DeepseekMLAForwardMixin:
                 )
                 attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+        use_fp8_o_proj = fp8_proj_use_o_proj_at_m(self.o_proj, attn_output.shape[0])
 
         _kvb_v = None
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
@@ -1151,7 +1153,7 @@ class DeepseekMLAForwardMixin:
                     # (heads, tokens, v) and needed a transpose(0,1).flatten copy =
                     # a per-layer direct_copy (elementwise_manual_unroll ~5us/layer),
                     # which ATOM / the MXFP4 path do not pay.
-                    if fp8_proj_uses_mixed(self.o_proj):
+                    if fp8_proj_uses_mixed(self.o_proj) and use_fp8_o_proj:
                         attn_bmm_output = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                             X=attn_output,
                             WQ=self.w_vc.transpose(-1, -2),
@@ -1192,9 +1194,7 @@ class DeepseekMLAForwardMixin:
                 # _bmm_buf is already (batch, heads, dim) contiguous
                 if self.o_proj.weight.dtype == torch.uint8:
                     attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)
-                elif self.o_proj.weight.dtype == torch.float8_e4m3fn or (
-                    fp8_proj_gemm_active(self.o_proj)
-                ):
+                elif self.o_proj.weight.dtype == torch.float8_e4m3fn or use_fp8_o_proj:
                     if fp8_proj_uses_ptpc(self.o_proj):
                         attn_bmm_output = flatten_fp8_per_token_quant(
                             _bmm_buf,
@@ -1216,9 +1216,7 @@ class DeepseekMLAForwardMixin:
                 attn_bmm_output, tuple
             ):
                 pass
-            elif self.o_proj.weight.dtype == torch.float8_e4m3fn or (
-                fp8_proj_gemm_active(self.o_proj)
-            ):
+            elif self.o_proj.weight.dtype == torch.float8_e4m3fn or use_fp8_o_proj:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 if fp8_proj_uses_ptpc(self.o_proj):
                     attn_bmm_output = flatten_fp8_per_token_quant(
@@ -1302,6 +1300,17 @@ class DeepseekMLAForwardMixin:
         elif is_kv_b_lora_active(self):
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
+            )
+        if (
+            use_fp8_o_proj
+            and fp8_proj_uses_mixed(self.o_proj)
+            and not isinstance(attn_bmm_output, tuple)
+        ):
+            attn_bmm_output = flatten_fp8_group_quant(
+                attn_bmm_output.contiguous(),
+                group_size=128,
+                dtype_quant=torch.float8_e4m3fn,
+                transpose_scale=_use_aiter_bpreshuffle_gfx95,
             )
         output, _ = self.o_proj(attn_bmm_output)
 

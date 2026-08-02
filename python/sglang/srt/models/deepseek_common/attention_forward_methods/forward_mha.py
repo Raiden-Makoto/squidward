@@ -16,6 +16,7 @@ from sglang.srt.layers.dcp import (
 )
 from sglang.srt.layers.quantization.unquant import (
     fp8_proj_gemm_active,
+    fp8_proj_use_o_proj_at_m,
     fp8_proj_uses_ptpc,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -75,8 +76,9 @@ def _maybe_quant_o_proj_input(
     quantizes it inline, which costs an extra scale transpose on top of the quant
     itself. The decode path already pre-quantizes (see forward_mla).
     """
-    if not fp8_proj_gemm_active(self.o_proj) or not attn_output.is_contiguous():
+    if not fp8_proj_use_o_proj_at_m(self.o_proj, attn_output.shape[0]):
         return attn_output
+    attn_output = attn_output.contiguous()
     if fp8_proj_uses_ptpc(self.o_proj):
         return flatten_fp8_per_token_quant(
             attn_output,

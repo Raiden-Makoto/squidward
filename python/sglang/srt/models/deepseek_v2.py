@@ -1873,15 +1873,10 @@ class DeepseekV2AttentionMLA(
         # the layer is unquantized (quark-excluded bf16). Only 128-aligned
         # projections qualify (q_b [.,2048], o_proj [6144,.]); fused_qkv_a
         # (out=2624) is not 128-aligned, and kv_b_proj is the absorbed-bmm path.
-        # Both projections are all-or-nothing: with the flag on, q_b_proj and o_proj
-        # run FP8 at every M, prefill and decode alike, and always take the fused
-        # activation-quant producers (q_a_layernorm / the attn-output flatten). An
-        # earlier prefill-only M-gate is not the shape to return to: because the fused
-        # producers had to be gated on the FP8 GEMM being selected, and the GEMM in
-        # turn accepted any pre-quantized activation regardless of M, the two decisions
-        # could not be varied independently, so decode FP8 was only ever measured
-        # unfused and with the tuned bf16 QK-norm displaced. Prior (M-gated) numbers:
-        # results/glm52_dense_gemm_fp8_vs_bf16_scratch.md.
+        # q_b_proj remains FP8 at every M. Mixed-mode o_proj may cross over to
+        # BF16 below SGLANG_DSA_FP8_PROJ_O_PROJ_M_MIN; its producer returns a tuple
+        # only for FP8 and a BF16 tensor otherwise, and apply() treats that
+        # representation as authoritative so the two decisions cannot drift.
         for _fp8_proj_name in ("q_b_proj", "o_proj"):
             _fp8_proj = getattr(self, _fp8_proj_name, None)
             if _fp8_proj is not None:

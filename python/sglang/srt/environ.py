@@ -565,6 +565,10 @@ class Envs:
     # while retaining blockscale for q_b_proj. When unset, the legacy PTPC
     # boolean above selects between ptpc and blockscale.
     SGLANG_DSA_FP8_PROJ_MODE = EnvStr(None)
+    # Minimum flattened token count M at which mixed-mode o_proj uses FP8.
+    # Zero preserves the experimental all-FP8 behavior. The predicate is
+    # inclusive: M >= threshold selects FP8; smaller M selects BF16.
+    SGLANG_DSA_FP8_PROJ_O_PROJ_M_MIN = EnvInt(0)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override
