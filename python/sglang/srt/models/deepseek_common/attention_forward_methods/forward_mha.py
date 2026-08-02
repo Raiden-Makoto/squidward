@@ -17,7 +17,7 @@ from sglang.srt.layers.dcp import (
 from sglang.srt.layers.quantization.unquant import (
     fp8_proj_gemm_active,
     fp8_proj_use_o_proj_at_m,
-    fp8_proj_uses_ptpc,
+    fp8_proj_uses_ptpc_at_m,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
@@ -79,7 +79,7 @@ def _maybe_quant_o_proj_input(
     if not fp8_proj_use_o_proj_at_m(self.o_proj, attn_output.shape[0]):
         return attn_output
     attn_output = attn_output.contiguous()
-    if fp8_proj_uses_ptpc(self.o_proj):
+    if fp8_proj_uses_ptpc_at_m(self.o_proj, attn_output.shape[0]):
         return flatten_fp8_per_token_quant(
             attn_output,
             dtype_quant=torch.float8_e4m3fn,
@@ -215,7 +215,8 @@ class DeepseekMHAForwardMixin:
                     # one eager per-layer launch at prefill (host-side idle, see
                     # results/glm52_dense_gemm_fp8_vs_bf16_scratch.md). The tuple feeds
                     # apply()'s fp8 path via the private _fp8_proj_weight copy.
-                    if fp8_proj_uses_ptpc(self.q_b_proj):
+                    concrete_q_proj_m = q.numel() // q.shape[-1]
+                    if fp8_proj_uses_ptpc_at_m(self.q_b_proj, concrete_q_proj_m):
                         q_quanted, q_lora, _, _ = fused_rms_fp8_per_token_quant(
                             q,
                             self.q_a_layernorm.weight,

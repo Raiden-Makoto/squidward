@@ -64,6 +64,7 @@ _is_gfx95_supported = is_gfx95_supported()
 # marker (the quark-excluded GLM-5.2 MLA q_a/q_b/o_proj) on an aiter FP8 GEMM
 # instead of the bf16 tgemm. The private FP8 weight copy uses either 128x128
 # block scaling or PTPC (per-channel weight scaling), selected at load time.
+# Hybrid mode retains both copies and selects between them from concrete M.
 # The bf16 weight is retained.
 # q_b remains FP8 at every M. Mixed-mode o_proj can select BF16 below an
 # M threshold; its producer returns a tuple only for FP8 and a tensor for BF16,
@@ -95,6 +96,14 @@ def fp8_proj_gemm_active(layer: torch.nn.Module) -> bool:
 def fp8_proj_uses_ptpc(layer: torch.nn.Module) -> bool:
     """Whether an active private FP8 projection uses PTPC instead of blockscale."""
     return getattr(layer, "_fp8_proj_mode", "blockscale") == "ptpc"
+
+
+def fp8_proj_uses_ptpc_at_m(layer: torch.nn.Module, m: int) -> bool:
+    """Resolve the projection's scale contract from a concrete flattened M."""
+    mode = getattr(layer, "_fp8_proj_mode", "blockscale")
+    return mode == "ptpc" or (
+        mode == "hybrid" and m >= envs.SGLANG_DSA_FP8_PROJ_HYBRID_M_MIN.get()
+    )
 
 
 def fp8_proj_uses_mixed(layer: torch.nn.Module) -> bool:
@@ -265,7 +274,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def _repack_bf16_to_fp8(layer: torch.nn.Module) -> None:
         # Precompute a bpreshuffled FP8 e4m3 copy of the bf16 projection weight.
         # Blockscale uses 128x128 UE8M0 scales; PTPC uses one scale per output
-        # channel. Both retain the original bf16 parameter for the feature-off arm.
+        # channel. Hybrid retains both copies. All modes retain the original bf16
+        # parameter for the feature-off arm.
         # The FP8 copy lives in private attrs rather than replacing layer.weight so
         # the layer stays bf16-typed, which keeps every `weight.dtype == fp8` test in
         # the model code (each of which implies a natively-FP8 checkpoint) from
@@ -285,23 +295,38 @@ class UnquantizedLinearMethod(LinearMethodBase):
         mode = envs.SGLANG_DSA_FP8_PROJ_MODE.get()
         if mode is None:
             mode = "ptpc" if envs.SGLANG_USE_DSA_FP8_PROJ_PTPC.get() else "blockscale"
-        if mode not in ("blockscale", "ptpc", "mixed"):
+        if mode not in ("blockscale", "ptpc", "mixed", "hybrid"):
             raise ValueError(
-                "SGLANG_DSA_FP8_PROJ_MODE must be blockscale, ptpc, or mixed; "
-                f"got {mode!r}"
+                "SGLANG_DSA_FP8_PROJ_MODE must be blockscale, ptpc, mixed, "
+                f"or hybrid; got {mode!r}"
             )
         if mode == "mixed" and getattr(layer, "_fp8_proj_gemm", None) != "o_proj":
             mode = "blockscale"
-        if mode in ("ptpc", "mixed"):
+        if mode == "hybrid":
+            block_weight, block_scale = quant_weight_ue8m0(w, [128, 128])
             import aiter
 
-            fp8_w, w_scale = aiter.pertoken_quant(w, quant_dtype=aiter.dtypes.fp8)
+            ptpc_weight, ptpc_scale = aiter.pertoken_quant(
+                w, quant_dtype=aiter.dtypes.fp8
+            )
+            if _use_aiter_bpreshuffle_gfx95:
+                block_weight = shuffle_weight(block_weight, (16, 16))
+                ptpc_weight = shuffle_weight(ptpc_weight, (16, 16))
+            layer._fp8_proj_blockscale_weight = block_weight.contiguous()
+            layer._fp8_proj_blockscale_weight_scale = block_scale.contiguous()
+            layer._fp8_proj_ptpc_weight = ptpc_weight.contiguous()
+            layer._fp8_proj_ptpc_weight_scale = ptpc_scale.contiguous()
         else:
-            fp8_w, w_scale = quant_weight_ue8m0(w, [128, 128])
-        if _use_aiter_bpreshuffle_gfx95:
-            fp8_w = shuffle_weight(fp8_w, (16, 16))
-        layer._fp8_proj_weight = fp8_w.contiguous()
-        layer._fp8_proj_weight_scale = w_scale.contiguous()
+            if mode in ("ptpc", "mixed"):
+                import aiter
+
+                fp8_w, w_scale = aiter.pertoken_quant(w, quant_dtype=aiter.dtypes.fp8)
+            else:
+                fp8_w, w_scale = quant_weight_ue8m0(w, [128, 128])
+            if _use_aiter_bpreshuffle_gfx95:
+                fp8_w = shuffle_weight(fp8_w, (16, 16))
+            layer._fp8_proj_weight = fp8_w.contiguous()
+            layer._fp8_proj_weight_scale = w_scale.contiguous()
         if mode == "mixed":
             layer._fp8_proj_weight_block_scale = torch.ones(
                 (w.shape[0] // 128, w.shape[1] // 128),
@@ -336,11 +361,25 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 apply_fp8_ptpc_linear,
             )
 
-            if fp8_proj_uses_ptpc(layer):
+            x_value = x[0] if isinstance(x, tuple) else x
+            concrete_m = x_value.numel() // x_value.shape[-1]
+            use_ptpc = fp8_proj_uses_ptpc_at_m(layer, concrete_m)
+            if getattr(layer, "_fp8_proj_mode", "blockscale") == "hybrid":
+                if use_ptpc:
+                    weight = layer._fp8_proj_ptpc_weight
+                    weight_scale = layer._fp8_proj_ptpc_weight_scale
+                else:
+                    weight = layer._fp8_proj_blockscale_weight
+                    weight_scale = layer._fp8_proj_blockscale_weight_scale
+            else:
+                weight = layer._fp8_proj_weight
+                weight_scale = layer._fp8_proj_weight_scale
+
+            if use_ptpc:
                 return apply_fp8_ptpc_linear(
                     x,
-                    layer._fp8_proj_weight,
-                    layer._fp8_proj_weight_scale,
+                    weight,
+                    weight_scale,
                     bias=bias,
                 )
             if fp8_proj_uses_mixed(layer):
@@ -361,7 +400,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
                         group_size=128,
                         transpose_scale=True,
                     )
-                weight = layer._fp8_proj_weight
                 out = torch.empty(
                     (x_q.numel() // x_q.shape[-1], weight.shape[0]),
                     dtype=torch.bfloat16,
@@ -372,7 +410,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                     weight,
                     x_scale,
                     layer._fp8_proj_weight_block_scale,
-                    layer._fp8_proj_weight_scale,
+                    weight_scale,
                     out,
                 )
                 if bias is not None:
@@ -382,17 +420,17 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 x_q, x_scale = x
                 return aiter_w8a8_block_fp8_linear(
                     x_q,
-                    layer._fp8_proj_weight,
+                    weight,
                     [128, 128],
-                    layer._fp8_proj_weight_scale,
+                    weight_scale,
                     input_scale=x_scale,
                     bias=bias,
                 )
             out = aiter_w8a8_block_fp8_linear(
                 x.view(-1, x.shape[-1]),
-                layer._fp8_proj_weight,
+                weight,
                 [128, 128],
-                layer._fp8_proj_weight_scale,
+                weight_scale,
                 input_scale=None,
                 bias=bias,
             )

@@ -34,7 +34,7 @@ from sglang.srt.layers.quantization.unquant import (
     fp8_proj_gemm_active,
     fp8_proj_use_o_proj_at_m,
     fp8_proj_uses_mixed,
-    fp8_proj_uses_ptpc,
+    fp8_proj_uses_ptpc_at_m,
 )
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
@@ -189,7 +189,8 @@ if _use_aiter_gfx95:
         *,
         output_unquantized_inp1,
     ):
-        if fp8_proj_uses_ptpc(layer):
+        concrete_m = inp1.numel() // inp1.shape[-1]
+        if fp8_proj_uses_ptpc_at_m(layer, concrete_m):
             return fused_rms_fp8_per_token_quant(
                 inp1,
                 inp1_weight,
@@ -1086,7 +1087,9 @@ class DeepseekMLAForwardMixin:
                 )
                 attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-        use_fp8_o_proj = fp8_proj_use_o_proj_at_m(self.o_proj, attn_output.shape[0])
+        concrete_o_proj_m = attn_output.shape[0]
+        use_fp8_o_proj = fp8_proj_use_o_proj_at_m(self.o_proj, concrete_o_proj_m)
+        use_ptpc_o_proj = fp8_proj_uses_ptpc_at_m(self.o_proj, concrete_o_proj_m)
 
         _kvb_v = None
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
@@ -1195,7 +1198,7 @@ class DeepseekMLAForwardMixin:
                 if self.o_proj.weight.dtype == torch.uint8:
                     attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)
                 elif self.o_proj.weight.dtype == torch.float8_e4m3fn or use_fp8_o_proj:
-                    if fp8_proj_uses_ptpc(self.o_proj):
+                    if use_ptpc_o_proj:
                         attn_bmm_output = flatten_fp8_per_token_quant(
                             _bmm_buf,
                             dtype_quant=torch.float8_e4m3fn,
@@ -1218,7 +1221,7 @@ class DeepseekMLAForwardMixin:
                 pass
             elif self.o_proj.weight.dtype == torch.float8_e4m3fn or use_fp8_o_proj:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
-                if fp8_proj_uses_ptpc(self.o_proj):
+                if use_ptpc_o_proj:
                     attn_bmm_output = flatten_fp8_per_token_quant(
                         attn_bmm_output.contiguous(),
                         dtype_quant=torch.float8_e4m3fn,

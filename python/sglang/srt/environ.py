@@ -560,11 +560,15 @@ class Envs:
     # 128x128 weight block scaling. Only effective with
     # SGLANG_DSA_FP8_PROJ_GEMM=1.
     SGLANG_USE_DSA_FP8_PROJ_PTPC = EnvBool(False)
-    # Select the FP8 projection scaling contract: blockscale, ptpc, or mixed.
+    # Select the FP8 projection scaling contract: blockscale, ptpc, mixed, or
+    # hybrid. Hybrid retains both blockscale and PTPC weights and selects PTPC
+    # for concrete M >= SGLANG_DSA_FP8_PROJ_HYBRID_M_MIN.
     # Mixed applies group-128 activation / per-channel weight scaling to o_proj
     # while retaining blockscale for q_b_proj. When unset, the legacy PTPC
     # boolean above selects between ptpc and blockscale.
     SGLANG_DSA_FP8_PROJ_MODE = EnvStr(None)
+    # Inclusive concrete-M crossover for hybrid q_b_proj and o_proj.
+    SGLANG_DSA_FP8_PROJ_HYBRID_M_MIN = EnvInt(16)
     # Minimum flattened token count M at which mixed-mode o_proj uses FP8.
     # Zero preserves the experimental all-FP8 behavior. The predicate is
     # inclusive: M >= threshold selects FP8; smaller M selects BF16.
