@@ -55,9 +55,7 @@ class TestHybridFp8Proj(CustomTestCase):
         self.assertGreaterEqual(token_m, 16)
         self.assertEqual(fp8_proj_num_sequences(forward_batch), 8)
         self.assertFalse(
-            fp8_proj_uses_ptpc_at_batch(
-                layer, fp8_proj_num_sequences(forward_batch)
-            )
+            fp8_proj_uses_ptpc_at_batch(layer, fp8_proj_num_sequences(forward_batch))
         )
 
     def test_cuda_graph_padding_is_excluded_from_sequence_count(self):
@@ -94,9 +92,7 @@ class TestHybridFp8Proj(CustomTestCase):
             self.assertIs(
                 block_gemm.call_args.args[1], layer._fp8_proj_blockscale_weight
             )
-            self.assertIs(
-                block_gemm.call_args.kwargs["input_scale"], block_input[1]
-            )
+            self.assertIs(block_gemm.call_args.kwargs["input_scale"], block_input[1])
             ptpc_gemm.assert_not_called()
 
             ptpc_input = tag_fp8_proj_input(
@@ -108,9 +104,7 @@ class TestHybridFp8Proj(CustomTestCase):
             )
             self.assertIs(method.apply(layer, ptpc_input), ptpc_out)
             ptpc_gemm.assert_called_once()
-            self.assertIs(
-                ptpc_gemm.call_args.args[1], layer._fp8_proj_ptpc_weight
-            )
+            self.assertIs(ptpc_gemm.call_args.args[1], layer._fp8_proj_ptpc_weight)
             self.assertIs(
                 ptpc_gemm.call_args.args[2], layer._fp8_proj_ptpc_weight_scale
             )

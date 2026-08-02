@@ -256,9 +256,7 @@ class DeepseekMHAForwardMixin:
                             transpose_scale=_use_aiter_bpreshuffle_gfx95,
                         )
                     if getattr(self.q_b_proj, "_fp8_proj_mode", None) == "hybrid":
-                        q_quanted = tag_fp8_proj_input(
-                            q_quanted, use_ptpc=use_ptpc
-                        )
+                        q_quanted = tag_fp8_proj_input(q_quanted, use_ptpc=use_ptpc)
                     q = self.q_b_proj(q_quanted)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
