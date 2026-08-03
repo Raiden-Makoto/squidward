@@ -12,35 +12,32 @@ Container exec: `docker exec <CONTAINER> bash -lc "..."`. Always export
 `/sgl-workspace/squidward`.
 
 **Container name does NOT imply workstream — always verify the running container, its
-branch, and its live server before acting; do not assume `dsv4`.** A box can host
-several containers on different branches.
+branch, and its live server before acting.** A box can host several containers on
+different branches.
 
-## quanta box — gfx942 / CDNA3 (MI300X/MI325X, mi30x)
-- Host: `quanta-ccs-aus-f11-40.cs-aus.dcgpu`
-- Container `dsv4`, image `rocm/sgl-dev:...-rocm720-mi30x-...`
-- This is the fp8 **e4m3fnuz** box (the gfx942 fp8 fixes target this arch).
-
-## gbt box — gfx950 / CDNA4 (MI350X/MI355X, mi35x)  ← A GLM-5.2 BOX
+## gbt box — gfx950 / CDNA4 (MI350X/MI355X, mi35x)  — NOT VERIFIED
 - Host: `gbt350-odcdh2-b13-1.png-odc.dcgpu`
-- **GLM-5.2 work runs in the `glm5` container** (NOT `dsv4`): fork on branch
-  `RM/glm51`, image `rocm/sgl-dev:v0.5.14-rocm720-mi35x-20260706`, GLM-5.2-MXFP4
-  server on port 8552 (`docker exec glm5 bash -lc "..."`).
-- Container config: `/dev/kfd`+`/dev/dri`, `--ipc=host --shm-size=64g --network=host`,
-  `--cap-add SYS_PTRACE`, `--group-add video render`, `--security-opt seccomp=unconfined
-  --security-opt label=disable`, `-v /home/macui/hf_home:/root/hf_home`,
-  `-v /home/macui/spongebob:/sgl-workspace/squidward`, `-e HF_HOME=/root/hf_home`.
-- This is the fp8 **e4m3fn** box (gfx950). Our gfx942 fixes are arch-gated, so gfx950 is unaffected.
+- gfx950, fp8 **e4m3fn**. Not used for GLM-5.2 since the move to m12-17, and the
+  container/image details here are unverified — enumerate `docker ps` and confirm
+  the mounts before relying on this box.
 
 ## m12-17 box — gfx950 / CDNA4 (MI355X, mi35x)  ← ACTIVE GLM-5.2 BOX
-- Host: `smci355-ccs-aus-m12-17.cs-aus.dcgpu`
-- **GLM-5.2 work runs in the `glm5` container** (NOT `dsv4`): fork at
-  `/sgl-workspace/squidward` on branch `RM/glm51`, image
-  `rocm/sgl-dev:v0.5.14-rocm7_14-mi35x-test-20260706`, GLM-5.2-MXFP4 server on port 8552.
-- **`HF_HOME=/data/macui/hf_home`** (NOT `/root/hf_home`). Model lives at
+- Host: `smci355-ccs-aus-m12-17.cs-aus.dcgpu`, gfx950, fp8 **e4m3fn**, 256 CUs, 160 KB LDS/CU.
+- **Container `macui-glm5`**, image
+  `raidenmakoto916/raidenmakoto:glm52-fork-aiter0724-ckaf7118-ckgemm1` (aiter 0724 base,
+  CK `af7118e34`). `docker exec macui-glm5 bash -lc "..."`. GLM-5.2-MXFP4 server on port 8552.
+- Only mount is `/data:/data`; the source trees live **inside** the container, so there is no
+  host-side edit path — code reaches the box by push + fetch, never by editing files there.
+- **`HF_HOME=/data/macui/hf_home`**. Model at
   `/data/macui/hf_home/hub/models--amd--GLM-5.2-MXFP4/snapshots/386bd0e4ec821f7b07975701cec3c3b953a5576a`.
-- Use **GPUs 0-3** for GLM-5.2 (`HIP_VISIBLE_DEVICES=0,1,2,3`); the box is shared with
-  other containers (`ci_sglang`, `akao_*`, CI runners) — do not touch them.
-- gfx950 fp8 **e4m3fn**.
+- Server trees (`/sgl-workspace/`): `squidward` = `RM/glm51`, `squidward-gemm1` =
+  `RM/glm52-ckgemm1`, `squidward-fp8` = the fp8 workstream, `squidward-main` = upstream ref.
+- aiter trees (`/sgl-workspace/`): `aiter` = stock, pip-editable, **never touch**;
+  `aiter-gemm1` = CK gemm1 (`RM/glm52-mxfp4-moe-ck-gemm1` + CK `RM/glm52-a4w4-k256-swizzle-fix`);
+  `aiter_fp8`, `aiter_fp8_mixed`, `aiter_fp8_mixed_ck` = fp8 workstreams, not ours.
+- `utilities/run_glm52.sh` pins **GPUs 4-7** (`HIP_VISIBLE_DEVICES=4,5,6,7`). The box is shared
+  with CI runners and other users' containers — check `rocm-smi` for idle GPUs first and never
+  touch containers that are not yours.
 
 Follow `remote-box-rules.mdc` for all box-safety constraints (no upstream edits, no pip install,
 box never ahead of local, no git-state changes without explicit instruction, etc.).
