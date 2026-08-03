@@ -5,21 +5,42 @@ alwaysApply: true
 
 # Known Remote GPU Boxes
 
-Two remote boxes are in use. Both run a `dsv4` container. SSH form:
+Remote GPU boxes in use. SSH form:
 `ssh -o ConnectTimeout=25 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null macui@<HOST> '<cmd>'`
-Container exec: `docker exec dsv4 bash -lc "..."`. Always export
+Container exec: `docker exec <CONTAINER> bash -lc "..."`. Always export
 `PYTHONPATH=/sgl-workspace/squidward/python:${PYTHONPATH}` for python; the fork lives at
 `/sgl-workspace/squidward`.
+
+**Container name does NOT imply workstream — always verify the running container, its
+branch, and its live server before acting; do not assume `dsv4`.** A box can host
+several containers on different branches.
 
 ## quanta box — gfx942 / CDNA3 (MI300X/MI325X, mi30x)
 - Host: `quanta-ccs-aus-f11-40.cs-aus.dcgpu`
 - Container `dsv4`, image `rocm/sgl-dev:...-rocm720-mi30x-...`
 - This is the fp8 **e4m3fnuz** box (the gfx942 fp8 fixes target this arch).
 
-## gbt box — gfx950 / CDNA4 (MI350X/MI355X, mi35x)
+## gbt box — gfx950 / CDNA4 (MI350X/MI355X, mi35x)  ← A GLM-5.2 BOX
 - Host: `gbt350-odcdh2-b13-1.png-odc.dcgpu`
-- Container `dsv4`, image `rocm/sgl-dev:v0.5.13-rocm720-mi35x-20260612`
+- **GLM-5.2 work runs in the `glm5` container** (NOT `dsv4`): fork on branch
+  `RM/glm51`, image `rocm/sgl-dev:v0.5.14-rocm720-mi35x-20260706`, GLM-5.2-MXFP4
+  server on port 8552 (`docker exec glm5 bash -lc "..."`).
+- Container config: `/dev/kfd`+`/dev/dri`, `--ipc=host --shm-size=64g --network=host`,
+  `--cap-add SYS_PTRACE`, `--group-add video render`, `--security-opt seccomp=unconfined
+  --security-opt label=disable`, `-v /home/macui/hf_home:/root/hf_home`,
+  `-v /home/macui/spongebob:/sgl-workspace/squidward`, `-e HF_HOME=/root/hf_home`.
 - This is the fp8 **e4m3fn** box (gfx950). Our gfx942 fixes are arch-gated, so gfx950 is unaffected.
+
+## m12-17 box — gfx950 / CDNA4 (MI355X, mi35x)  ← ACTIVE GLM-5.2 BOX
+- Host: `smci355-ccs-aus-m12-17.cs-aus.dcgpu`
+- **GLM-5.2 work runs in the `glm5` container** (NOT `dsv4`): fork at
+  `/sgl-workspace/squidward` on branch `RM/glm51`, image
+  `rocm/sgl-dev:v0.5.14-rocm7_14-mi35x-test-20260706`, GLM-5.2-MXFP4 server on port 8552.
+- **`HF_HOME=/data/macui/hf_home`** (NOT `/root/hf_home`). Model lives at
+  `/data/macui/hf_home/hub/models--amd--GLM-5.2-MXFP4/snapshots/386bd0e4ec821f7b07975701cec3c3b953a5576a`.
+- Use **GPUs 0-3** for GLM-5.2 (`HIP_VISIBLE_DEVICES=0,1,2,3`); the box is shared with
+  other containers (`ci_sglang`, `akao_*`, CI runners) — do not touch them.
+- gfx950 fp8 **e4m3fn**.
 
 Follow `remote-box-rules.mdc` for all box-safety constraints (no upstream edits, no pip install,
 box never ahead of local, no git-state changes without explicit instruction, etc.).
