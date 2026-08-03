@@ -1,0 +1,70 @@
+Block,BlockLayers,DecoderSubmodule,LeafModule,KernelName,Calls,Total_us,PerLayer_us
+A,3,AllReduce(TP),RowParallelLinear,"ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)",12,6982.9,581.91
+A,3,DenseMLP,MergedColumnParallelLinear,"nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT",9,6736.6,561.38
+A,3,DenseMLP,MergedColumnParallelLinear,"nvjet_sm100_tst_256x128_64x5_2x2_2cta_h_bz_TNT",3,3612.1,301.01
+A,3,DenseMLP,RowParallelLinear,"nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT",12,4942.5,411.88
+A,3,DenseMLP,SiluAndMul,"void (anonymous namespace)::act_and_mul_kernel<__nv_bfloat16, ((anonymous namespace)::ActivationKind)0, true, false>((anonymous namespace)::ActivationParams)",12,873.2,72.76
+L,78,AllReduce(TP),DeepseekV2DecoderLayer,"ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)",312,188269.1,603.43
+L,78,Attn(MLA),ColumnParallelLinear,"nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT",312,57316.5,183.71
+L,78,Attn(MLA),DeepseekV2AttentionMLA,"nvjet_sm100_tst_256x256_64x4_2x1_2cta_v_bz_TNT",234,18278.9,58.59
+L,78,Attn(MLA),DeepseekV2AttentionMLA,"nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT",234,15404.0,49.37
+L,78,Attn(MLA),DeepseekV2AttentionMLA,"nvjet_sm100_tst_256x240_64x4_2x1_2cta_v_bz_TNT",78,8943.9,28.67
+L,78,Attn(MLA),DeepseekV2AttentionMLA,"nvjet_sm100_tst_128x240_64x6_2x1_2cta_v_bz_TNT",78,7567.5,24.25
+L,78,Attn(MLA),Indexer,"(anonymous namespace)::topk_transform_prefill_kernel((anonymous namespace)::FastTopKParams, int*, int const*, long, int const*, long)",84,48668.3,155.99
+L,78,Attn(MLA),Indexer,"void deep_gemm::sm100_mqa_logits<false, 32u, 128u, false, 4u, 256u, 3u, 5u, 148u, 128u, 256u, float, float, 2u>(unsigned int, unsigned int, unsigned int, unsigned int const*, unsigned int const*, floa",84,24482.1,78.47
+L,78,Attn(MLA),Indexer,"void (anonymous namespace)::fused_q_indexer_rope_hadamard_quant<__nv_bfloat16, long, true, true, false>((anonymous namespace)::FusedQIndexerRopeHadamardQuantParams)",84,13084.7,41.94
+L,78,Attn(MLA),Indexer,"Memcpy DtoD (Device -> Device)",84,3831.5,12.28
+L,78,Attn(MLA),Indexer,"void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::array<char*, 1ul> >(int, at::native::FillFunctor<int>, std::array<char*, 1ul>)",84,1779.4,5.70
+L,78,Attn(MLA),Indexer,"void (anonymous namespace)::fused_k_indexer_norm_rope_store<__nv_bfloat16, long, true, 6>((anonymous namespace)::FusedKIndexerNormRopeStoreParams)",84,709.7,2.27
+L,78,Attn(MLA),Indexer,"_get_k_and_s_triton_kernel",84,400.4,1.28
+L,78,Attn(MLA),RMSNorm,"kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel_object_at__tensorptrbf16gmemalign16oi642048i64div81_tensorptrbf16gmemalign16o20481_tensorptrbf16gmemalign16oi642048i64div81_0",312,9272.6,29.72
+L,78,Attn(MLA),RMSNorm,"kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel_object_at__tensorptrbf16gmemalign16oi64512i64div81_tensorptrbf16gmemalign16o5121_tensorptrbf16gmemalign16oi64512i64div81____0",312,2824.4,9.05
+L,78,Attn(MLA),RadixAttention,"fmhaSm100fKernel_QkvE4m3OBfloat16HQk576HV512PagedKvDenseStaticTokenSparseP1VarSeqQ16Kv128PersistentSwapsAbForGen",312,914284.8,2930.40
+L,78,Attn(MLA),RadixAttention,"void flashinfer::RopeQuantizeKernel<true, 16u, 1u, __nv_bfloat16, long, __nv_fp8_e4m3>(__nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_fp8_e4m3*, __nv_fp8_e4m3*, __nv_fp8_e4m3*, _",312,41582.1,133.28
+L,78,Attn(MLA),RadixAttention,"void (anonymous namespace)::set_mla_kv_buffer_kernel<512l, 64l, 8, true, long>((anonymous namespace)::SetMlaKVBufferParams)",312,1723.2,5.52
+L,78,Attn(MLA),RadixAttention,"void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",1,2.3,0.01
+L,78,Attn(MLA),ReplicatedLinear,"nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT",156,82404.1,264.12
+L,78,Attn(MLA),ReplicatedLinear,"nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT",162,32042.8,102.70
+L,78,Attn(MLA),ReplicatedLinear,"nvjet_sm100_tst_176x128_64x8_1x2_2cta_h_bz_TNN",78,24124.9,77.32
+L,78,Attn(MLA),ReplicatedLinear,"nvjet_sm100_tst_160x192_64x4_1x4_h_bz_TNN",42,3078.8,9.87
+L,78,Attn(MLA),ReplicatedLinear,"nvjet_sm100_tst_160x128_64x6_1x4_h_bz_TNN",21,1089.8,3.49
+L,78,Attn(MLA),ReplicatedLinear,"nvjet_sm100_tst_80x128_64x10_2x2_2cta_h_bz_TNN",21,662.5,2.12
+L,78,Attn(MLA),RowParallelLinear,"nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT",312,169793.7,544.21
+L,78,Norm/Residual,RMSNorm,"kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64614461441_tensorptrbf16gmemalign128oi64614461441_tensorptrbf16gme_0",620,83554.7,267.80
+L,78,Norm/Residual,RMSNorm,"kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64614461441_tensorptrbf16gmemalign16o61441_tensorptrbf16gmemalign128oi64614461441___T_0",4,273.3,0.88
+B,75,AllReduce(TP),DeepseekV2MoE,"ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)",300,177769.9,592.57
+B,75,MoE,DeepseekV2MoE,"void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul> >(int, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul>)",300,30859.0,102.86
+B,75,MoE,FusedMoE,"bmm_E2m1_E2m1E2m1_Fp32_Ab16_Bb16_Cb16_t128x128x512u2_s2x2x2x2x1x2_et128x32_m128x128x64_c1x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_fCp_bN_ldgsts_ldgstsSf_rgTma_clmp_swiGlu_lbW4_lsfbW4_dynB_sm100f",300,280828.0,936.09
+B,75,MoE,FusedMoE,"bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x128x256u2_s6_et128x128_m256x128x64_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f",300,133723.8,445.75
+B,75,MoE,FusedMoE,"void moe::dev::finalize::finalizeKernelVecLoad<moe::dev::finalize::KernelParams<cutlass::bfloat16_t, cutlass::bfloat16_t, 4, false> >(moe::dev::finalize::KernelParams<cutlass::bfloat16_t, cutlass::bfl",225,80219.7,267.40
+B,75,MoE,FusedMoE,"kernel_cutlass_kernel_flashinferquantizationkernelsnvfp4_quantizeNVFP4QuantizeTMAKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1819201_TVLayoutDst1819201_Valuetypebf16_tensor000o966411121_0",300,16379.4,54.60
+B,75,MoE,FusedMoE,"Memcpy DtoD (Device -> Device)",150,15101.4,50.34
+B,75,MoE,FusedMoE,"void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, std::array<char*, 1ul> >(int, at::native::FillFunctor<c10::BFloat16>, std::array<char*, 1ul>)",150,11690.4,38.97
+B,75,MoE,FusedMoE,"void moe::dev::finalize::finalizeKernelVecLoad<moe::dev::finalize::KernelParams<cutlass::bfloat16_t, cutlass::bfloat16_t, 4, true> >(moe::dev::finalize::KernelParams<cutlass::bfloat16_t, cutlass::bflo",75,10683.8,35.61
+B,75,MoE,FusedMoE,"void moe::dev::routing::routingCustom::routingIndicesHistogramScoresKernel<moe::dev::routing::routingCustom::KernelParams<float, __nv_bfloat16, 256, 8, moe::dev::routing::TopKExpertSelect<moe::dev::ro",300,6519.5,21.73
+B,75,MoE,FusedMoE,"void moe::dev::routing::routingIndicesCoopKernel<moe::dev::routing::routingCustom::KernelParams<float, __nv_bfloat16, 256, 8, moe::dev::routing::TopKExpertSelect<moe::dev::routing::NoOpPreprocess, moe",300,2484.7,8.28
+B,75,MoE,FusedMoE,"void moe::dev::routing::routingInitExpertCounts<moe::dev::routing::routingCustom::KernelParams<float, __nv_bfloat16, 256, 8, moe::dev::routing::TopKExpertSelect<moe::dev::routing::NoOpPreprocess, moe:",300,479.6,1.60
+B,75,MoE,MergedColumnParallelLinear,"nvjet_sm100_tst_256x256_64x4_2x2_2cta_h_bz_TNT",150,28621.1,95.40
+B,75,MoE,MergedColumnParallelLinear,"nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT",150,14062.6,46.88
+B,75,MoE,MoEGate,"nvjet_sm100_tss_128x192_64x7_2x2_2cta_h_bz_TNT",150,10425.1,34.75
+B,75,MoE,MoEGate,"nvjet_sm100_tss_128x256_64x6_2x2_2cta_h_bz_TNT",75,3548.4,11.83
+B,75,MoE,MoEGate,"nvjet_sm100_tss_128x128_64x9_2x2_2cta_h_bz_TNT",75,2057.7,6.86
+B,75,MoE,RowParallelLinear,"nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT",225,20090.7,66.97
+B,75,MoE,RowParallelLinear,"nvjet_sm100_tst_128x192_64x7_2x1_2cta_v_bz_TNT",75,2698.9,9.00
+B,75,MoE,SiluAndMul,"void (anonymous namespace)::act_and_mul_kernel<__nv_bfloat16, ((anonymous namespace)::ActivationKind)0, true, false>((anonymous namespace)::ActivationParams)",300,4838.2,16.13
+G,1,AllReduce(TP),VocabParallelEmbedding,"ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)",4,3016.8,754.20
+G,1,DeepseekV2Model,DeepseekV2Model,"void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, std::array<char*, 1ul> >(int, at::native::FillFunctor<float>, std::array<char*, 1ul>)",4,7.5,1.87
+G,1,LogitsProcessor,LogitsProcessor,"nvjet_sm100_tst_192x8_64x8_2x1_v_bz_splitK_TNT",4,362.4,90.59
+G,1,LogitsProcessor,LogitsProcessor,"_all_gather_kernel_inner",4,88.6,22.14
+G,1,LogitsProcessor,LogitsProcessor,"void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, ",4,20.9,5.23
+G,1,LogitsProcessor,LogitsProcessor,"void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, std::a",4,16.4,4.10
+G,1,LogitsProcessor,LogitsProcessor,"void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#4}::operator()() const::{lambda(long)#1}, std::ar",4,9.7,2.42
+G,1,LogitsProcessor,LogitsProcessor,"void at_cuda_detail::cub::detail::scan::DeviceScanKernel<at_cuda_detail::cub::detail::scan::policy_hub<long, long, long, unsigned int, std::plus<long> >::Policy1000, long const*, long*, at_cuda_detail",4,8.9,2.22
+G,1,LogitsProcessor,LogitsProcessor,"void at::native::vectorized_elementwise_kernel<2, at::native::CUDAFunctorOnSelf_add<long>, std::array<char*, 2ul> >(int, at::native::CUDAFunctorOnSelf_add<long>, std::array<char*, 2ul>)",4,7.6,1.91
+G,1,LogitsProcessor,LogitsProcessor,"void at::native::vectorized_gather_kernel<16, long>(char*, char*, long*, int, long, long, long, long, bool)",3,6.8,1.69
+G,1,LogitsProcessor,LogitsProcessor,"void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<lon",1,6.4,1.61
+G,1,LogitsProcessor,LogitsProcessor,"void at_cuda_detail::cub::detail::scan::DeviceScanInitKernel<at_cuda_detail::cub::ScanTileState<long, true> >(at_cuda_detail::cub::ScanTileState<long, true>, int)",4,5.6,1.41
+G,1,RMSNorm,RMSNorm,"kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64614461441_tensorptrbf16gmemalign128oi64614461441_tensorptrbf16gme_0",4,531.9,132.97
+G,1,Sampler,Sampler,"void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, 4, 4> >(at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, lon",4,37.4,9.34
+G,1,Sampler,Sampler,"Memset (Device)",4,5.8,1.45
+G,1,VocabParallelEmbedding,VocabParallelEmbedding,"_vocab_parallel_embedding_kernel",4,275.7,68.93

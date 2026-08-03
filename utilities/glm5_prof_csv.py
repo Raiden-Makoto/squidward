@@ -64,14 +64,12 @@ def main():
             s, eend, cls, idx = intervals[k]
             if s <= ts < eend:
                 anc.append((cls, idx))
-            if ts - s > 5e6:
-                break
         anc.reverse()
         return anc
 
     launch_ts = {}
     for e in ev:
-        if e.get("cat") == "cuda_runtime":
+        if e.get("cat") in ("cuda_runtime", "cuda_driver"):
             c = e.get("args", {}).get("correlation")
             if c is not None and c not in launch_ts:
                 launch_ts[c] = e.get("ts", 0.0)
