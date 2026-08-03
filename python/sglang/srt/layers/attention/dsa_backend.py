@@ -72,6 +72,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.runtime_context import get_buffer
 from sglang.srt.utils import (
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_sm100_supported,
     print_warning_once,
@@ -122,6 +123,7 @@ def materialize_full_kv_cp(
 
 
 _is_hip = is_hip()
+_IS_GFX95 = is_gfx95_supported()
 
 if _is_hip:
     from sglang.kernels.ops.attention.dsa.triton_kernel import get_valid_kv_indices
