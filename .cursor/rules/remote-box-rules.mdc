@@ -40,8 +40,8 @@ docker run -d \
  --ipc=host \
  --shm-size=64g \
  --network=host \
- -v /shareddata/macui/hf_home:/root/hf_home \
- -e HF_HOME=/root/hf_home \
+ -v /data:/data \
+ -e HF_HOME=/data/macui/hf_home \
  <<new image specified by the user>> \
  sleep infinity
 ```

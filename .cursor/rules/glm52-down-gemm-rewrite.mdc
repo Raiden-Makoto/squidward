@@ -34,7 +34,7 @@ sections + the status/levers table). Read it before touching a kernel.
 
 ## Non-negotiable gotchas (each burned real cycles)
 
-1. After ANY FlyDSL kernel edit: `rm -rf /sgl-workspace/aiter_dev/aiter/jit/flydsl_cache/*` before
+1. After ANY FlyDSL kernel edit: `rm -rf /sgl-workspace/aiter-gemm1/aiter/jit/flydsl_cache/*` before
    testing — the FlyDSL disk cache silently serves the OLD kernel otherwise. (CK edits: rebuild the
    affected module; confirm recompile with a `sys.stderr.write` in the compile/gen path.)
 2. `logits_diff` varies run-to-run (random fp4 inputs) — NOT a valid before/after delta. Judge perf
@@ -44,9 +44,13 @@ sections + the status/levers table). Read it before touching a kernel.
 
 ## Dev flow
 
-Box `smci355-ccs-aus-m12-17.cs-aus.dcgpu`, container `glm5` (now on image
-`glm52-fork-aiter0720-ckb675945`, aiter `632367677`). NOTE: the box aiter (0720) has `gufusion_v3`;
-local `/home/macui/aiter` (`889a79fce`, 07-16) does not — work against the box aiter, synced to
-scratch `/sgl-workspace/aiter_dev` (leave `/sgl-workspace/aiter` untouched), `PYTHONPATH=/sgl-workspace/aiter_dev`.
-Microbench (gemm1 sweep, single GPU): `python3 op_tests/test_moe_2stage.py --kernel -q <M> -dim 6144,512 -e 257 -k 9 -t 512`.
-GPUs 4-7 run production; GPUs 0-3 are currently in a bad state (TP4 load hangs on rank 3) — verify a GPU before microbenching.
+Box `smci355-ccs-aus-m12-17.cs-aus.dcgpu`, container `macui-glm5`. Build and benchmark in
+`/sgl-workspace/aiter-gemm1` (`PYTHONPATH=/sgl-workspace/aiter-gemm1`); leave `/sgl-workspace/aiter`
+(stock, pip-editable) untouched. Local counterpart is `/home/macui/aiter-gemm1`, a worktree of
+`/home/macui/aiter` on `RM/glm52-mxfp4-moe-ck-gemm1` with CK on `RM/glm52-a4w4-k256-swizzle-fix`.
+Microbench (single GPU): `python3 op_tests/test_moe_2stage.py --kernel --no-legacy --csv-filter
+moe_ck2stages` with `AITER_CONFIG_FMOE` pinning the arm; `-t <M>` selects the token count.
+Adding a codegen instance requires deleting `aiter/jit/module_moe_ck2stages_*.so` **and** its
+`aiter/jit/build/<same name>/` directory — `AITER_REBUILD=1` alone reuses the stale instance blob
+and the run silently falls back with `ck kernel not found`.
+Check `rocm-smi` for an idle GPU before microbenching; the box is shared.
