@@ -6,10 +6,11 @@ alwaysApply: true
 
 ## Absolute prohibitions — never do these without explicit user permission:
 
-1. **Never SSH onto the remote box** (`smci350-rck-g03-d09-31.rck.dcgpu`) without the user explicitly saying to do so.
+1. **Never SSH onto the remote box** (`smci355-ccs-aus-m12-17.cs-aus.dcgpu`, container `macui-glm5`) without the user explicitly saying to do so.
 2. **Never run `pip install -e .`** (or any `pip install`) on the remote box. The container uses an editable install and Python file changes are live without reinstalling.
-3. **Never modify any files directly on the remote box** — all code changes happen locally in `/home/macui/squidward` and are pushed to GitHub, then pulled on the box by the user or with explicit permission.
+3. **Never modify any files directly on the remote box** — all code changes happen locally in `/home/macui/squidward-glm51` and are pushed to GitHub, then pulled on the box by the user or with explicit permission.
 4. **Never modify git state on the remote box** (checkout, reset, fetch, pull, etc.) unless the user explicitly instructs it.
+5. **Never `pkill -9` / `kill -9` (SIGKILL) a running ROCm GPU server process.** SIGKILL mid-GPU-op triggers a ROCm GPU core dump (`gpucore.<pid>.gpu`, 100-200 GB **each**) written to the server's cwd (`/sgl-workspace/squidward`), which fills the shared disk and takes the whole box down. Always stop servers gracefully with `SIGTERM` (`pkill -TERM -f "bin/sglan[g]"` then wait, or `docker stop`), and launch benchmark servers with `ulimit -c 0` + `HSA_ENABLE_COREDUMP=0`. If cores appear, delete them (`docker stop` first so the overlay unmounts, then remove).
 
 ## Correct workflow:
 - Make code changes locally → commit → push to `origin` (GitHub)
@@ -26,10 +27,10 @@ alwaysApply: true
 - `local behind box` = FORBIDDEN. The box must never contain commits that local does not have.
 - Practical consequence: always commit/push from local first, then pull/reset the box to that commit. Never create commits or advance git state on the box beyond local's HEAD.
 
-## Container creation command (use exactly this when recreating `dsv4`):
+## Container creation command (use exactly this when recreating the container):
 ```bash
 docker run -d \
- --name dsv4 \
+ --name <<old container name>> \
  --device=/dev/kfd \
  --device=/dev/dri \
  --security-opt seccomp=unconfined \
@@ -41,6 +42,6 @@ docker run -d \
  --network=host \
  -v /shareddata/macui/hf_home:/root/hf_home \
  -e HF_HOME=/root/hf_home \
- rocm/sgl-dev:v0.5.12.post1-rocm720-mi35x-20260529 \
+ <<new image specified by the user>> \
  sleep infinity
 ```

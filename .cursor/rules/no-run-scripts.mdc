@@ -1,0 +1,30 @@
+---
+description:
+alwaysApply: true
+---
+# Run Scripts — Use ONLY the Repo `utilities/` Scripts
+
+The ONLY run/launcher/benchmark scripts that may ever be used are the
+version-controlled ones in the repo `utilities/` folder, e.g.:
+
+- `utilities/run_glm52.sh` — canonical GLM-5.2-MXFP4 server launcher
+- `utilities/e2e_glm5.sh` — end-to-end throughput/latency sweep
+
+A/B is sequential on ONE server: launch `run_glm52.sh` with the feature flag off
+(baseline), run `e2e_glm5.sh`, then relaunch with `FEATURE_FLAG=1`
+(feature) and run `e2e_glm5.sh` again. There is no dual-server launcher.
+
+## Hard rules
+
+1. NEVER create, generate, copy, `sed`, or write any run/launcher/benchmark
+   script — not locally and not on any remote box.
+2. NEVER use or even look at ad-hoc scripts under `/root` (e.g. `/root/run_*.sh`)
+   or anywhere outside the repo `utilities/` folder. They are off-limits. The
+   repo `utilities/` scripts are the single source of truth.
+3. To vary a run, use ONLY the knobs the `utilities/` scripts expose: their
+   command-line args (e.g. `--profile`, `--spec`) and the env vars they read
+   (`PORT`, `OUT_DIR`, `CONCURRENCY`, and feature flags like
+   `SGLANG_DSA_FUSE_INDEXER_QK=1` prefixed on the launch). Do NOT inline a
+   hand-rolled `sglang serve` command as a substitute.
+4. If no `utilities/` script covers the case, STOP and ask — do not create one
+   and do not reach for a `/root` script.

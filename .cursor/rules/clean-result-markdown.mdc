@@ -10,3 +10,25 @@ When writing or editing any results, benchmark, or comparison markdown file:
 - NO prose verdicts, NO "Notes/caveats" sections, NO interpretation paragraphs, NO emojis, NO motivational filler.
 - Put deltas in the table itself if useful, not in sentences.
 - If the user wants analysis, they will ask. Default to numbers only.
+
+## EXAMPLE
+
+A. Baseline (flag off):
+
+| concurrency | TTFT (ms) | ITL (ms) | E2EL (ms) | output tok/s |
+| ----------- | --------- | -------- | --------- | ------------ |
+| 4           | 199.0     | 11.81    | 12293     | 333.1        |
+| 8           | 257.1     | 13.70    | 14312     | 572.0        |
+| 16          | 525.0     | 16.40    | 17338     | 942.1        |
+| 32          | 755.4     | 20.35    | 21900     | 1498.0       |
+| 64          | 1176.8    | 27.08    | 29723     | 2205.8       |
+
+B. Feature on (Δ vs baseline):
+
+| concurrency | TTFT (ms) | Δ     | ITL (ms) | Δ     | E2EL (ms) | Δ     | output tok/s | Δ     |
+| ----------- | --------- | ----- | -------- | ----- | --------- | ----- | ------------ | ----- |
+| 4           | 197.2     | −0.9% | 11.81    | −0.0% | 12283     | −0.1% | 332.9        | −0.1% |
+| 8           | 255.4     | −0.6% | 13.69    | −0.0% | 14310     | −0.0% | 572.2        | +0.0% |
+| 16          | 498.8     | −5.0% | 16.39    | −0.0% | 17291     | −0.3% | 946.9        | +0.5% |
+| 32          | 716.0     | −5.2% | 20.25    | −0.5% | 21781     | −0.5% | 1505.6       | +0.5% |
+| 64          | 1110.5    | −5.6% | 27.05    | −0.1% | 29630     | −0.3% | 2210.5       | +0.2% |
