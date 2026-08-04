@@ -159,6 +159,9 @@ if _use_aiter:
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
 if _use_aiter_gfx95:
+    from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
+        _get_config as _get_mxfp4_bmm_config,
+    )
     from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
     from aiter.ops.triton.fused_fp8_quant import (
         fused_flatten_fp8_group_quant,
@@ -173,12 +176,35 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
 
 
+def _get_single_split_mxfp4_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    config, _ = _get_mxfp4_bmm_config(x.shape[1], weight.shape[1], x.shape[2])
+    config = config.copy()
+    # AITER's split-K batched A16WFP4 path can reduce uninitialized extra splits
+    # for small decode M (ROCm/aiter#3766). Keep the opt-in GLM path on K-split 1.
+    config["NUM_KSPLIT"] = 1
+    return config
+
+
 def _run_mxfp4_k_bmm(
     x: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     output: torch.Tensor,
 ) -> None:
+    if envs.SGLANG_USE_MXFP4_MLA_BMM.get():
+        batched_gemm_a16wfp4(
+            x,
+            weight,
+            weight_scale,
+            y=output,
+            config=_get_single_split_mxfp4_bmm_config(x, weight),
+            transpose_bm=False,
+            prequant=True,
+            y_scale=None,
+            dtype=torch.bfloat16,
+        )
+        return
+
     batched_gemm_afp4wfp4_pre_quant(
         x,
         weight,
@@ -200,6 +226,7 @@ def _run_mxfp4_v_bmm(
             weight,
             weight_scale,
             y=output,
+            config=_get_single_split_mxfp4_bmm_config(x, weight),
             transpose_bm=True,
             prequant=True,
             y_scale=None,
