@@ -16,9 +16,9 @@ ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e
 | MoE routing / sort  | `mxfp4_moe_sort` + `p0/p1/p23` + grouped top-k    | 7.3       | routing + shared-expert MLP + add            | 34.4    | 4.71x       |
 | **MoE**             |                                                    | **144.5** |                                              | **164.8** | **1.14x** |
 | Dense GEMM          | o_proj                                             | 39.6      | `nvjet_sm100`                                | 42.4    | 1.07x       |
-| Dense GEMM          | q_b absorbed BMM                                   | 73.3      | `nvjet_sm100`                                | 12.5    | 0.17x       |
+| Dense GEMM          | q_b_proj                                           | 15.1      | `nvjet_sm100`                                | 14.3    | 0.95x       |
 | Dense GEMM          | q_a + kv_a                                         | 37.5      | `nvjet_sm100`                                | 35.9    | 0.96x       |
-| Dense GEMM          | kv_b                                               | 15.1      | `nvjet_sm100`                                | 14.3    | 0.95x       |
+| Dense GEMM          | kv_b absorbed BMM                                  | 73.3      | `nvjet_sm100`                                | 12.5    | 0.17x       |
 | Dense GEMM          | router GEMMs                                       | 6.2       | `nvjet_sm100`                                | 4.0     | 0.64x       |
 | Dense GEMM          | DenseMLP L0–2                                      | 3.5       | `nvjet_sm100`                                | 3.8     | 1.09x       |
 | **Dense GEMM**      |                                                    | **175.2** |                                              | **113.0** | **0.64x** |
