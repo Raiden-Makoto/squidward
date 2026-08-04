@@ -136,7 +136,7 @@ class TestMxfp4KDispatch(CustomTestCase):
         prequant_bmm.assert_called_once_with(x, weight, scale, torch.bfloat16, output)
         self.assertIsNone(result)
 
-    def test_feature_uses_a16wfp4_without_split_k(self):
+    def test_feature_uses_safe_k_block_without_split_k(self):
         x = torch.randn(2, 3, 8, dtype=torch.bfloat16)
         weight = torch.zeros(2, 4, 4, dtype=torch.uint8)
         scale = torch.zeros(2, 4, 1, dtype=torch.uint8)
@@ -166,7 +166,9 @@ class TestMxfp4KDispatch(CustomTestCase):
         self.assertIs(args[2], scale)
         self.assertIs(kwargs["y"], output)
         self.assertEqual(kwargs["config"]["NUM_KSPLIT"], 1)
+        self.assertEqual(kwargs["config"]["BLOCK_SIZE_K"], 64)
         self.assertEqual(tuned_config["NUM_KSPLIT"], 4)
+        self.assertEqual(tuned_config["BLOCK_SIZE_K"], 256)
         self.assertFalse(kwargs["transpose_bm"])
         prequant_bmm.assert_not_called()
         self.assertIsNone(result)
@@ -271,7 +273,9 @@ class TestMxfp4VDispatch(CustomTestCase):
         self.assertIsNone(kwargs["y_scale"])
         self.assertIs(kwargs["dtype"], torch.bfloat16)
         self.assertEqual(kwargs["config"]["NUM_KSPLIT"], 1)
+        self.assertEqual(kwargs["config"]["BLOCK_SIZE_K"], 256)
         self.assertEqual(tuned_config["NUM_KSPLIT"], 4)
+        self.assertEqual(tuned_config["BLOCK_SIZE_K"], 256)
         prequant_bmm.assert_not_called()
         self.assertIs(result, output)
         self.assertTrue(result.is_contiguous())

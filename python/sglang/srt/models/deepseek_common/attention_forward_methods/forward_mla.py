@@ -185,6 +185,17 @@ def _get_single_split_mxfp4_bmm_config(x: torch.Tensor, weight: torch.Tensor) ->
     return config
 
 
+def _get_glm_mxfp4_k_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    config = _get_single_split_mxfp4_bmm_config(x, weight)
+    # GLM's K-up has K=192. Larger blocks over-read its six E8M0 scale groups.
+    config["BLOCK_SIZE_K"] = 64
+    return config
+
+
+def _get_glm_mxfp4_v_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    return _get_single_split_mxfp4_bmm_config(x, weight)
+
+
 def _run_mxfp4_k_bmm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -197,7 +208,7 @@ def _run_mxfp4_k_bmm(
             weight,
             weight_scale,
             y=output,
-            config=_get_single_split_mxfp4_bmm_config(x, weight),
+            config=_get_glm_mxfp4_k_bmm_config(x, weight),
             transpose_bm=False,
             prequant=True,
             y_scale=None,
@@ -226,7 +237,7 @@ def _run_mxfp4_v_bmm(
             weight,
             weight_scale,
             y=output,
-            config=_get_single_split_mxfp4_bmm_config(x, weight),
+            config=_get_glm_mxfp4_v_bmm_config(x, weight),
             transpose_bm=True,
             prequant=True,
             y_scale=None,
