@@ -1877,6 +1877,13 @@ class DeepseekV2AttentionMLA(
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
         )
+        # Marker only for GLM-5.2. The unquantized linear method additionally
+        # requires the opt-in env flag, Aiter, and gfx950 before repacking.
+        if config.model_type == "glm_moe_dsa":
+            for fp8_proj_name in ("q_b_proj", "o_proj"):
+                fp8_proj = getattr(self, fp8_proj_name, None)
+                if fp8_proj is not None:
+                    fp8_proj._fp8_proj_gemm = True
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         if not skip_rope:
