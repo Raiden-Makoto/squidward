@@ -159,6 +159,7 @@ if _use_aiter:
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
 if _use_aiter_gfx95:
+    from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
     from aiter.ops.triton.fused_fp8_quant import (
         fused_flatten_fp8_group_quant,
         fused_rms_fp8_group_quant,
@@ -170,6 +171,49 @@ if _use_aiter_gfx95:
         fused_rms_mxfp4_quant,
     )
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
+
+
+def _run_mxfp4_k_bmm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    batched_gemm_afp4wfp4_pre_quant(
+        x,
+        weight,
+        weight_scale,
+        torch.bfloat16,
+        output,
+    )
+
+
+def _run_mxfp4_v_bmm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    if envs.SGLANG_USE_MXFP4_MLA_BMM.get():
+        return batched_gemm_a16wfp4(
+            x,
+            weight,
+            weight_scale,
+            y=output,
+            transpose_bm=True,
+            prequant=True,
+            y_scale=None,
+            dtype=torch.bfloat16,
+        )
+
+    batched_gemm_afp4wfp4_pre_quant(
+        x,
+        weight,
+        weight_scale,
+        torch.bfloat16,
+        output.transpose(0, 1),
+    )
+    return output
 
 
 def _should_defer_dsa_cp_kv_gather(
@@ -656,11 +700,10 @@ class DeepseekMLAForwardMixin:
                         device=x.device,
                         dtype=torch.bfloat16,
                     )
-                    batched_gemm_afp4wfp4_pre_quant(
+                    _run_mxfp4_k_bmm(
                         x,
                         self.w_kc.transpose(-2, -1),
                         self.w_scale_k.transpose(-2, -1),
-                        torch.bfloat16,
                         q_nope_out,
                     )
                 else:
@@ -1092,25 +1135,20 @@ class DeepseekMLAForwardMixin:
             # TODO(haishaw): add bmm_fp8 to ROCm
             if _use_aiter_gfx95 and self.w_vc.dtype == torch.uint8:
                 x = attn_output.transpose(0, 1)
-                B_heads, M_batch = x.shape[0], x.shape[1]
-                N_vdim = self.w_vc.shape[2]
-                # Allocate in (batch, heads, dim) so the post-GEMM
-                # transpose+flatten is a free view instead of a copy.
                 _bmm_buf = torch.empty(
-                    M_batch,
-                    B_heads,
-                    N_vdim,
+                    x.shape[1],
+                    x.shape[0],
+                    self.w_vc.shape[2],
                     device=x.device,
                     dtype=torch.bfloat16,
                 )
-                attn_bmm_output = _bmm_buf.transpose(0, 1)
-                batched_gemm_afp4wfp4_pre_quant(
+                _bmm_buf = _run_mxfp4_v_bmm(
                     x,
                     self.w_vc.transpose(-2, -1),
                     self.w_scale_v.transpose(-2, -1),
-                    torch.bfloat16,
-                    attn_bmm_output,
+                    _bmm_buf,
                 )
+                attn_bmm_output = _bmm_buf
             else:
                 _bmm_buf = None
                 if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
