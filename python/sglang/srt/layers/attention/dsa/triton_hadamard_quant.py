@@ -14,13 +14,13 @@ in fp32) then scaled by 1/sqrt(N) -- numerically equivalent to
 """
 
 from functools import lru_cache
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 _IS_FNUZ = is_fp8_fnuz()
 _FP8_DTYPE = torch.float8_e4m3fnuz if _IS_FNUZ else torch.float8_e4m3fn
@@ -32,9 +32,7 @@ def _hadamard_pm1(n: int, device: str, dtype: torch.dtype) -> torch.Tensor:
     """+/-1 Sylvester (natural-order) Hadamard matrix [n, n]."""
     h = torch.ones(1, 1, dtype=torch.float32)
     while h.shape[0] < n:
-        h = torch.cat(
-            [torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0
-        )
+        h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
     assert h.shape[0] == n, "n must be a power of 2"
     return h.to(device=device, dtype=dtype)
 
@@ -64,7 +62,9 @@ def _hadamard_quant_kernel(
 
     x = tl.load(
         x_ptr + rows[:, None] * N + n[None, :], mask=rmask[:, None], other=0.0
-    ).to(h_ptr.dtype.element_ty)  # [BLOCK_M, N]
+    ).to(
+        h_ptr.dtype.element_ty
+    )  # [BLOCK_M, N]
     h = tl.load(h_ptr + n[:, None] * N + n[None, :])  # [N, N] +/-1
 
     # hadamard: (x @ H_pm1) accumulated in fp32, then * 1/sqrt(N)
@@ -152,3 +152,42 @@ def fused_hadamard_act_quant(
     if fuse_weights:
         return y, s, w_out.view(*weights.shape, 1)
     return y, s
+
+
+# Standalone correctness check vs act_quant(rotate_activation(x)).
+# Run on the box: PYTHONPATH=python python3 -m sglang.srt.layers.attention.dsa.triton_hadamard_quant
+if __name__ == "__main__":
+    from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
+    from sglang.srt.layers.attention.dsa.tilelang_kernel import act_quant
+
+    torch.manual_seed(0)
+    softmax_scale = 0.1337
+    for shape in [(8, 32, 128), (4096, 32, 128), (1, 8, 128)]:
+        x = (
+            torch.randn(*shape, device="cuda", dtype=torch.bfloat16) * 0.3
+        ).contiguous()
+        y_ref, s_ref = act_quant(rotate_activation(x.clone()), 128, None)
+        y_f, s_f = fused_hadamard_act_quant(x.clone(), 128, None)
+        # compare fp8 bytes and scales
+        same_fp8 = (
+            (y_ref.view(torch.uint8) == y_f.view(torch.uint8)).float().mean().item()
+        )
+        s_maxrel = ((s_ref - s_f).abs() / (s_ref.abs() + 1e-9)).max().item()
+        # dequantized cosine
+        dq_ref = y_ref.float() * s_ref.float()
+        dq_f = y_f.float() * s_f.float()
+        cos = torch.nn.functional.cosine_similarity(
+            dq_ref.flatten(), dq_f.flatten(), dim=0
+        ).item()
+        # weights fold vs _apply_q_scale_and_softmax_scale
+        w = (torch.randn(*shape[:-1], device="cuda", dtype=torch.bfloat16)).contiguous()
+        w_ref = w.unsqueeze(-1) * s_f * softmax_scale
+        _, _, w_fused = fused_hadamard_act_quant(
+            x.clone(), 128, None, weights=w, softmax_scale=softmax_scale
+        )
+        w_maxabs = (w_ref.float() - w_fused.float()).abs().max().item()
+        print(
+            f"shape={shape}: fp8_exact_frac={same_fp8:.5f} "
+            f"scale_maxrel={s_maxrel:.3e} dequant_cos={cos:.6f} "
+            f"weights_fold_maxabs={w_maxabs:.3e}"
+        )

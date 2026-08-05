@@ -261,19 +261,14 @@ def mamba_extra_buffer_of(cfg: Any) -> bool:
 
 def declare_load_time_override(source: str, declared: Dict[str, Any]) -> None:
     """Declare a load-time resolved field (model-file config overrides,
-    weight-resolved dtypes) on the published ``server_args``: resolution has
-    already materialized, so the declaration writes through, joining the
-    declaration stash for provenance and republish consistency."""
+    weight-resolved dtypes): validated against the resolvable whitelist, then
+    written to the config bags via ``get_context().override``; ``server_args``
+    stays the pristine startup record."""
     from sglang.srt.runtime_context import get_context
 
-    server_args = get_context().server_args
-    validate_declarations(server_args, [(source, dict(declared))])
-    override = getattr(server_args, "override", None)
-    if override is not None:
-        override(source, **declared)
-    else:
-        # Config-shaped fixtures without the mutation entry point.
-        _apply_fields(server_args, declared)
+    context = get_context()
+    validate_declarations(context.server_args, [(source, dict(declared))])
+    context.override(source, **declared)
 
 
 def collect_model_override_declarations(
@@ -517,13 +512,26 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["disable_custom_all_reduce"] = True
     elif is_sm100_supported():
         if server_args.is_attention_backend_not_set():
-            overrides["attention_backend"] = "fa4"
+            if (
+                server_args.kv_cache_dtype == "fp8_e4m3"
+                and not envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.get()
+            ):
+                # fp8 attention GEMMs activate whenever possible
+                # (m3_fp8_attn_gemm_enabled); only trtllm_mha serves the dense
+                # fp8-q path, so prefer it over fa4 for fp8 KV. The
+                # SGLANG_DISABLE_M3_FP8_ATTN_GEMM kill switch keeps the fa4
+                # default (pre-fp8 behavior).
+                overrides["attention_backend"] = "trtllm_mha"
+            else:
+                overrides["attention_backend"] = "fa4"
+        backend_resolved = overrides.get(
+            "attention_backend", server_args.attention_backend
+        )
         page_resolved = server_args.page_size
-        if (
-            page_resolved is None
-            and overrides.get("attention_backend", server_args.attention_backend)
-            == "fa4"
-        ):
+        # fa4 (fmha_sm100) and trtllm_mha both allow the page_size == 128
+        # sparse block MSA needs (trtllm_mha via trtllm-gen's dynamic
+        # tokens-per-page kernels).
+        if page_resolved is None and backend_resolved in ("fa4", "trtllm_mha"):
             overrides["page_size"] = 128
             page_resolved = 128
         if server_args.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
@@ -554,6 +562,41 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
             f"{overrides.get('attention_backend', server_args.attention_backend)}, page_size={page_resolved} "
             "(MSA is SM100-only; sparse attention runs on the Triton path)."
         )
+
+    # fp8 attention GEMMs have no opt-in flag: m3_fp8_attn_gemm_enabled
+    # (server_args.py) derives the mode from kv_cache_dtype (fp8_e4m3) +
+    # attention_backend (trtllm_mha) + SM100 at runtime. Surface the
+    # resolution here: warn on fp8_e5m2 (fmha_sm100's variant lookup would
+    # silently dispatch the e4m3 kernel, so e5m2 stays on the widening Triton
+    # path), log when the fp8 GEMM mode is active, and log when the
+    # SGLANG_DISABLE_M3_FP8_ATTN_GEMM kill switch suppresses it.
+    if server_args.kv_cache_dtype == "fp8_e5m2":
+        logger.warning(
+            "MiniMax-M3 with kv_cache_dtype fp8_e5m2: fp8 attention GEMMs stay "
+            "DISABLED (fmha_sm100's variant lookup would silently dispatch the "
+            "e4m3 kernel for e5m2); sparse attention runs on the widening "
+            "Triton path. Use --kv-cache-dtype fp8_e4m3 for fp8 attention GEMMs."
+        )
+    elif (
+        server_args.kv_cache_dtype == "fp8_e4m3"
+        and overrides.get("attention_backend", server_args.attention_backend)
+        == "trtllm_mha"
+        and is_sm100_supported()
+    ):
+        if envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.get():
+            logger.info(
+                "MiniMax-M3 fp8 attention GEMMs DISABLED by "
+                "SGLANG_DISABLE_M3_FP8_ATTN_GEMM: bf16 indexer + widening "
+                "Triton sparse path, bf16 q; dense layers keep trtllm_mha's "
+                "fp8 KV cache."
+            )
+        else:
+            logger.info(
+                "MiniMax-M3 fp8 attention GEMMs active (kv_cache_dtype fp8_e4m3 + "
+                "trtllm_mha on SM100): fp8 main/index KV, fp8-cast q, fp8 "
+                "sparse/MSA kernels. Set SGLANG_DISABLE_M3_FP8_ATTN_GEMM=1 to "
+                "force the pre-fp8 numerics."
+            )
 
     moe_runner_resolved = overrides.get(
         "moe_runner_backend", server_args.moe_runner_backend
@@ -1270,26 +1313,38 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     return {}
 
 
-def _check_tilelang_dsa_fp8_kv(
+def _check_dsa_backend_constraints(
     kv_cache_dtype: str,
     prefill_backend: Optional[str],
     decode_backend: Optional[str],
     *,
     hip: bool,
 ) -> None:
-    """tilelang's fp8 KV path is ROCm-only; the CUDA kernel hardcodes bfloat16.
-    Reject here instead of crashing at decode CUDA-graph capture."""
-    if (
-        not hip
-        and kv_cache_dtype == "fp8_e4m3"
-        and "tilelang" in {prefill_backend, decode_backend}
-    ):
+    """Validate DSA backend / platform / kv-cache-dtype constraints."""
+    chosen = {prefill_backend, decode_backend}
+
+    rocm_only = {"triton"} & chosen
+    if not hip and rocm_only:
         raise ValueError(
-            "The tilelang DSA prefill/decode kernels only support an fp8_e4m3 KV "
-            "cache on ROCm/HIP; on CUDA they require a bfloat16 KV cache. Use "
-            "--kv-cache-dtype bfloat16 with the tilelang backend, or keep "
+            f"The {'/'.join(sorted(rocm_only))} DSA backend is only supported on "
+            "ROCm/HIP. Pick an alternative DSA backend for CUDA "
+            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+        )
+
+    fp8_rocm_only = {"tilelang", "triton"} & chosen
+    if not hip and kv_cache_dtype == "fp8_e4m3" and fp8_rocm_only:
+        raise ValueError(
+            f"The {'/'.join(sorted(fp8_rocm_only))} DSA prefill/decode kernels "
+            "only support an fp8_e4m3 KV cache on ROCm/HIP; on CUDA they require "
+            "a bfloat16 KV cache. Use --kv-cache-dtype bfloat16, or keep "
             "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
+        )
+
+    if hip and kv_cache_dtype != "fp8_e4m3" and fp8_rocm_only:
+        raise ValueError(
+            f"The {'/'.join(sorted(fp8_rocm_only))} DSA kernels on ROCm require "
+            "fp8_e4m3 KV cache. Use --kv-cache-dtype fp8_e4m3."
         )
 
 
@@ -1352,8 +1407,8 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         return declared
 
     if not user_set_prefill and not user_set_decode and is_hip():
-        declared["dsa_prefill_backend"] = "tilelang"
-        declared["dsa_decode_backend"] = "tilelang"
+        declared["dsa_prefill_backend"] = "triton"
+        declared["dsa_decode_backend"] = "triton"
     elif kv_cache_dtype == "fp8_e4m3":
         # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
         default = "trtllm" if major >= 10 else "flashmla_kv"
@@ -1370,16 +1425,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
-
-    if "triton" in (prefill, decode):
-        assert kv_cache_dtype == "fp8_e4m3", (
-            "Triton DSA kernels only support fp8_e4m3 KV cache, "
-            f"but got kv_cache_dtype={kv_cache_dtype}. "
-            "Use --kv-cache-dtype fp8_e4m3 with --dsa-prefill-backend triton / --dsa-decode-backend triton."
-        )
-
-    _check_tilelang_dsa_fp8_kv(kv_cache_dtype, prefill, decode, hip=is_hip())
-
+    _check_dsa_backend_constraints(kv_cache_dtype, prefill, decode, hip=is_hip())
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
         f"prefill={prefill}, decode={decode}."
@@ -1807,10 +1853,14 @@ def _mla_backend_page_constraints(view: Any) -> dict:
         view.attention_backend == "trtllm_mha"
         or view.decode_attention_backend == "trtllm_mha"
         or view.prefill_attention_backend == "trtllm_mha"
+        or view.speculative_draft_attention_backend == "trtllm_mha"
     ):
-        if page_size not in [16, 32, 64]:
+        # 128 runs on trtllm-gen's dynamic tokens-per-page kernels (flashinfer
+        # >= 0.6.12), which require GQA and equal QK/V head dims — validated at
+        # TRTLLMHAAttnBackend init where the model config is known.
+        if page_size not in [16, 32, 64, 128]:
             logger.warning(
-                f"TensorRT-LLM MHA only supports page_size of 16, 32 or 64, changing page_size from {page_size} to 64."
+                f"TensorRT-LLM MHA only supports page_size of 16, 32, 64 or 128, changing page_size from {page_size} to 64."
             )
             page_size = 64
     if (
@@ -2197,6 +2247,12 @@ def _a2a_backend_overrides(view: Any) -> dict:
 @register_post_process
 def _a2a_ep_size(view: Any) -> dict:
     if view.moe_a2a_backend in _A2A_EP_SPANNING_BACKENDS:
+        if view.ep_size != view.tp_size:
+            logger.info(
+                f"{view.moe_a2a_backend} MoE is enabled. The expert parallel size "
+                f"is adjusted from {view.ep_size} to the tensor parallel size "
+                f"[{view.tp_size}]."
+            )
         return {"ep_size": view.tp_size}
     return {}
 

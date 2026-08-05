@@ -76,7 +76,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args, get_spec
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -113,10 +113,16 @@ def _is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
         server_args.decode_attention_backend or server_args.attention_backend
     )
     return (
-        server_args.speculative_algorithm == "DSPARK"
-        and server_args.speculative_attention_mode == "decode"
+        get_spec().speculative_algorithm == "DSPARK"
+        and get_spec().speculative_attention_mode == "decode"
         and decode_backend in ("tokenspeed_mla", "cutedsl_mla")
     )
+
+
+def _is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
+    # FlashMLA exposes natural-log softmax LSE. FlashInfer MLA and the other
+    # currently supported MLA DCP decode backends expose base-2 LSE.
+    return attention_backend == "flashmla"
 
 
 if _is_cuda:
@@ -161,6 +167,11 @@ if _use_aiter:
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
 if _use_aiter_gfx95:
+    from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
+        _get_config as _get_mxfp4_bmm_config,
+    )
+    from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
+
     # Triton flatten+quant is still needed for the non-`_bmm_buf` fallback, whose
     # input is a strided transpose the HIP quant cannot take (it asserts
     # contiguity). Everything else routes through deepseek_common.utils, which
@@ -229,6 +240,84 @@ if _use_aiter_gfx95:
         return result
 
 
+def _get_single_split_mxfp4_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    config, _ = _get_mxfp4_bmm_config(x.shape[1], weight.shape[1], x.shape[2])
+    config = config.copy()
+    # AITER's split-K batched A16WFP4 path can reduce uninitialized extra splits
+    # for small decode M (ROCm/aiter#3766). Keep the opt-in GLM path on K-split 1.
+    config["NUM_KSPLIT"] = 1
+    return config
+
+
+def _get_glm_mxfp4_k_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    config = _get_single_split_mxfp4_bmm_config(x, weight)
+    # GLM's K-up has K=192. Larger blocks over-read its six E8M0 scale groups.
+    config["BLOCK_SIZE_K"] = 64
+    return config
+
+
+def _get_glm_mxfp4_v_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    return _get_single_split_mxfp4_bmm_config(x, weight)
+
+
+def _run_mxfp4_k_bmm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    if envs.SGLANG_USE_MXFP4_MLA_BMM.get():
+        batched_gemm_a16wfp4(
+            x,
+            weight,
+            weight_scale,
+            y=output,
+            config=_get_glm_mxfp4_k_bmm_config(x, weight),
+            transpose_bm=False,
+            prequant=True,
+            y_scale=None,
+            dtype=torch.bfloat16,
+        )
+        return
+
+    batched_gemm_afp4wfp4_pre_quant(
+        x,
+        weight,
+        weight_scale,
+        torch.bfloat16,
+        output,
+    )
+
+
+def _run_mxfp4_v_bmm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    if envs.SGLANG_USE_MXFP4_MLA_BMM.get():
+        return batched_gemm_a16wfp4(
+            x,
+            weight,
+            weight_scale,
+            y=output,
+            config=_get_glm_mxfp4_v_bmm_config(x, weight),
+            transpose_bm=True,
+            prequant=True,
+            y_scale=None,
+            dtype=torch.bfloat16,
+        )
+
+    batched_gemm_afp4wfp4_pre_quant(
+        x,
+        weight,
+        weight_scale,
+        torch.bfloat16,
+        output.transpose(0, 1),
+    )
+    return output
+
+
 def _should_defer_dsa_cp_kv_gather(
     *,
     dsa_prefill_cp: bool,
@@ -240,7 +329,7 @@ def _should_defer_dsa_cp_kv_gather(
 class DeepseekMLAForwardMixin:
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
-            get_server_args().flashinfer_mla_disable_ragged
+            get_exec().kernel.flashinfer_mla_disable_ragged
         )
 
     def should_run_indexer(
@@ -422,7 +511,7 @@ class DeepseekMLAForwardMixin:
         # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
         # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
         q_replicate_active = (
-            get_server_args().dcp_replicate_q_proj
+            get_parallel().dcp_replicate_q_proj
             and _is_dcp_mla_decode_phase(forward_batch)
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
@@ -703,11 +792,10 @@ class DeepseekMLAForwardMixin:
                         device=x.device,
                         dtype=torch.bfloat16,
                     )
-                    batched_gemm_afp4wfp4_pre_quant(
+                    _run_mxfp4_k_bmm(
                         x,
                         self.w_kc.transpose(-2, -1),
                         self.w_scale_k.transpose(-2, -1),
-                        torch.bfloat16,
                         q_nope_out,
                     )
                 else:
@@ -923,20 +1011,18 @@ class DeepseekMLAForwardMixin:
                     q_out_dtype=kv_cache_dtype,
                 )
                 save_kv_cache = False
-                # On decode, pass q_cat directly to attn_mqa with q_rope=None so
-                # dsa_backend.forward_decode reuses q_cat as a zero-copy view
-                # (`q.contiguous().view(...)` fast-path) instead of running the
-                # redundant `concat_mla_absorb_q_general(q_nope_fused, q_pe_fused)`
-                # that would otherwise rebuild a tensor byte-identical to q_cat.
-                # On ROCm tilelang decode, this eliminates the
-                # `CatArrayBatchedCopy<OpaqueType<1u>, ...>` kernel that used to
-                # fire once per layer per decode step (~2.6 us / layer saved).
-                # Prefill keeps the split form because dsa_backend.forward_extend
-                # asserts `q_rope is not None`.
-                if forward_batch.forward_mode.is_decode_or_idle():
+                reuse_q_cat = forward_batch.forward_mode.is_decode_or_idle() or (
+                    forward_batch.forward_mode.is_extend()
+                    and not forward_batch.forward_mode.is_target_verify()
+                    and get_attn_backend().dsa_prefill_impl == "tilelang"
+                )
+                if reuse_q_cat:
+                    # Pass q_cat directly with q_rope=None so the DSA backend
+                    # reuses it through the zero-copy
+                    # `q.contiguous().view(...)` fast path. This avoids rebuilding
+                    # a byte-identical tensor via concat_mla_absorb_q_general.
                     if llama_4_scaling is not None:
-                        # llama_4_scaling applies only to the q_nope portion;
-                        # mutate in place via the slice view of q_cat.
+                        # llama_4_scaling applies only to the q_nope portion.
                         q_cat[..., : self.kv_lora_rank] *= llama_4_scaling
                     attn_output = self.attn_mqa(
                         q_cat,
@@ -1082,20 +1168,23 @@ class DeepseekMLAForwardMixin:
                 self.num_local_heads * get_parallel().attn_dcp_size,
                 self.kv_lora_rank,
             )
-            dcp_comm_backend = get_server_args().dcp_comm_backend
+            dcp_comm_backend = get_parallel().dcp_comm_backend
+            is_lse_base_on_e = _is_mla_dcp_lse_base_on_e(self.current_attention_backend)
             if dcp_comm_backend in ("a2a", "fi_a2a"):
                 # A2A exchange of head partials + LSE, then local Triton combine.
-                # MLA decode LSE is base-2 (FlashInfer-MLA/FlashMLA) -> base_on_e=False.
                 attn_output = dcp_a2a_lse_reduce(
                     attn_output.contiguous(),
                     lse.contiguous(),
                     get_parallel().dcp_group,
-                    is_lse_base_on_e=False,
+                    is_lse_base_on_e=is_lse_base_on_e,
                     comm_backend=dcp_comm_backend,
                 )
             else:
                 attn_output = cp_lse_ag_out_rs_mla(
-                    attn_output, lse, get_parallel().dcp_group
+                    attn_output,
+                    lse,
+                    get_parallel().dcp_group,
+                    is_lse_base_on_e=is_lse_base_on_e,
                 )
                 attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
@@ -1141,25 +1230,20 @@ class DeepseekMLAForwardMixin:
             # TODO(haishaw): add bmm_fp8 to ROCm
             if _use_aiter_gfx95 and self.w_vc.dtype == torch.uint8:
                 x = attn_output.transpose(0, 1)
-                B_heads, M_batch = x.shape[0], x.shape[1]
-                N_vdim = self.w_vc.shape[2]
-                # Allocate in (batch, heads, dim) so the post-GEMM
-                # transpose+flatten is a free view instead of a copy.
                 _bmm_buf = torch.empty(
-                    M_batch,
-                    B_heads,
-                    N_vdim,
+                    x.shape[1],
+                    x.shape[0],
+                    self.w_vc.shape[2],
                     device=x.device,
                     dtype=torch.bfloat16,
                 )
-                attn_bmm_output = _bmm_buf.transpose(0, 1)
-                batched_gemm_afp4wfp4_pre_quant(
+                _bmm_buf = _run_mxfp4_v_bmm(
                     x,
                     self.w_vc.transpose(-2, -1),
                     self.w_scale_v.transpose(-2, -1),
-                    torch.bfloat16,
-                    attn_bmm_output,
+                    _bmm_buf,
                 )
+                attn_bmm_output = _bmm_buf
             else:
                 _bmm_buf = None
                 if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
@@ -1365,8 +1449,8 @@ class DeepseekMLAForwardMixin:
         """
         if self.current_attention_backend in ("dsa", "nsa"):
             return (
-                get_server_args().dsa_decode_backend == "trtllm"
-                or get_server_args().dsa_prefill_backend == "trtllm"
+                get_exec().kernel.dsa_decode_backend == "trtllm"
+                or get_exec().kernel.dsa_prefill_backend == "trtllm"
             ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
 
         return (
@@ -1384,13 +1468,12 @@ class DeepseekMLAForwardMixin:
         """
         Check if we should skip rope and use fused rope+cache path for TileLang DSA on gfx95.
         """
-        server_args = get_server_args()
         return (
             _use_aiter_gfx95
             and self.current_attention_backend in ("dsa", "nsa")
             and (
-                server_args.dsa_decode_backend in ("tilelang", "triton")
-                or server_args.dsa_prefill_backend in ("tilelang", "triton")
+                get_exec().kernel.dsa_decode_backend in ("tilelang", "triton")
+                or get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton")
             )
         )
 

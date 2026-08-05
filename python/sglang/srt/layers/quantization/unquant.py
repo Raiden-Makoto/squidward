@@ -70,28 +70,6 @@ _is_gfx95_supported = is_gfx95_supported()
 # q_b remains FP8 at every M. Mixed-mode o_proj can select BF16 below an
 # M threshold; its producer returns a tuple only for FP8 and a tensor for BF16,
 # so the BF16 arm never performs activation quantization. Default off.
-_DSA_FP8_PROJ_GEMM = get_bool_env_var("SGLANG_DSA_FP8_PROJ_GEMM")
-
-
-def _fp8_proj_gemm_enabled(layer: torch.nn.Module) -> bool:
-    return (
-        _DSA_FP8_PROJ_GEMM
-        and _is_gfx95_supported
-        and getattr(layer, "_fp8_proj_gemm", False)
-    )
-
-
-def fp8_proj_gemm_active(layer: torch.nn.Module) -> bool:
-    """Whether this projection runs the FP8 GEMM, and hence wants an FP8 activation.
-
-    The gate for callers that can fold the activation quant into the kernel feeding
-    this projection. Deliberately NOT `weight.dtype == float8_e4m3fn`: these layers
-    keep a bf16 `layer.weight` alongside a private FP8 copy, so the dtype test that
-    guards the natively-FP8 fused paths can never fire for them. `apply()` below
-    keys off the same flag, so a caller that pre-quantizes is always matched by an
-    FP8 GEMM that consumes it.
-    """
-    return getattr(layer, "_fp8_proj_ready", False)
 
 
 def fp8_proj_uses_ptpc(layer: torch.nn.Module) -> bool:
@@ -144,6 +122,20 @@ def fp8_proj_use_o_proj_at_m(layer: torch.nn.Module, m: int) -> bool:
     if not fp8_proj_uses_mixed(layer):
         return True
     return m >= envs.SGLANG_DSA_FP8_PROJ_O_PROJ_M_MIN.get()
+
+
+def _fp8_proj_gemm_enabled(layer: torch.nn.Module) -> bool:
+    return (
+        envs.SGLANG_DSA_FP8_PROJ_GEMM.get()
+        and _use_aiter
+        and getattr(layer, "_fp8_proj_gemm", False)
+        and is_gfx95_supported()
+    )
+
+
+def fp8_proj_gemm_active(layer: torch.nn.Module) -> bool:
+    """Whether a marked BF16 projection was repacked for an FP8 path."""
+    return getattr(layer, "_fp8_proj_ready", False)
 
 
 if _use_aiter:

@@ -34,7 +34,11 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.utils import BumpAllocator, get_bool_env_var, next_power_of_2
 
 _use_fp8_prefill_attn = (
@@ -184,9 +188,7 @@ def _forward_dsa_indexer_for_mha(
 
 class DeepseekMHAForwardMixin:
     def init_mha_forward(self: DeepseekV2AttentionMLA):
-        self.disable_chunked_prefix_cache = (
-            get_server_args().disable_chunked_prefix_cache
-        )
+        self.disable_chunked_prefix_cache = get_schedule().disable_chunked_prefix_cache
 
         # TODO: Design a finer way to determine the threshold
         self.chunked_prefix_cache_threshold = (
@@ -285,7 +287,41 @@ class DeepseekMHAForwardMixin:
                     None,
                 )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-            elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
+            elif _use_aiter_gfx95 and fp8_proj_gemm_active(self.q_b_proj):
+                use_ptpc = fp8_proj_uses_ptpc_at_batch(
+                    self.q_b_proj, fp8_proj_num_sequences(forward_batch)
+                )
+                quant_fn = (
+                    fused_rms_fp8_per_token_quant
+                    if use_ptpc
+                    else fused_rms_fp8_group_quant
+                )
+                quant_kwargs = (
+                    {}
+                    if use_ptpc
+                    else {
+                        "group_size": 128,
+                        "transpose_scale": _use_aiter_bpreshuffle_gfx95,
+                    }
+                )
+                q, _, _, _ = quant_fn(
+                    q,
+                    self.q_a_layernorm.weight,
+                    self.q_a_layernorm.variance_epsilon,
+                    None,
+                    None,
+                    None,
+                    dtype_quant=torch.float8_e4m3fn,
+                    res1=None,
+                    output_unquantized_inp1=False,
+                    **quant_kwargs,
+                )
+                if getattr(self.q_b_proj, "_fp8_proj_mode", None) == "hybrid":
+                    q = tag_fp8_proj_input(q, use_ptpc=use_ptpc)
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            elif _use_aiter_gfx95 and (
+                self.q_b_proj.weight.dtype == torch.float8_e4m3fn
+            ):
                 q, _, _, _ = fused_rms_fp8_group_quant(
                     q,
                     self.q_a_layernorm.weight,
@@ -365,8 +401,8 @@ class DeepseekMHAForwardMixin:
                 self.use_dsa
                 and self.kv_cache_dtype == "fp8_e4m3"
                 and (
-                    not get_server_args().dsa_decode_backend == "trtllm"
-                    or not get_server_args().dsa_prefill_backend == "trtllm"
+                    not get_exec().kernel.dsa_decode_backend == "trtllm"
+                    or not get_exec().kernel.dsa_prefill_backend == "trtllm"
                 )
             ):
                 # FP8 path: dequantize DSA-specific FP8 format to BF16

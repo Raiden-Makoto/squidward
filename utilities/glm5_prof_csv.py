@@ -10,6 +10,7 @@ annotations). Per-layer microseconds = total / (layers-in-block * forwards).
 Usage:
   python3 glm5_prof_csv.py <trace.json[.gz]> [out.csv]
 """
+
 import bisect
 import collections
 import gzip
@@ -59,19 +60,17 @@ def main():
 
     def stack_at(ts):
         hi = bisect.bisect_right(starts, ts)
-        anc = []
+        ancestors = []
         for k in range(hi - 1, -1, -1):
             s, eend, cls, idx = intervals[k]
             if s <= ts < eend:
-                anc.append((cls, idx))
-            if ts - s > 5e6:
-                break
-        anc.reverse()
-        return anc
+                ancestors.append((cls, idx))
+        ancestors.reverse()
+        return ancestors
 
     launch_ts = {}
     for e in ev:
-        if e.get("cat") == "cuda_runtime":
+        if e.get("cat") in ("cuda_runtime", "cuda_driver"):
             c = e.get("args", {}).get("correlation")
             if c is not None and c not in launch_ts:
                 launch_ts[c] = e.get("ts", 0.0)
@@ -93,15 +92,15 @@ def main():
             unattributed[0] += dur
             unattributed[1] += 1
             continue
-        anc = stack_at(ts)
-        if not anc:
+        ancestors = stack_at(ts)
+        if not ancestors:
             unattributed[0] += dur
             unattributed[1] += 1
             continue
-        leaf = anc[-1][0]
-        anc_cls = {c for c, _ in anc}
+        leaf = ancestors[-1][0]
+        anc_cls = {c for c, _ in ancestors}
         layer_idx = None
-        for cls, idx in anc:
+        for cls, idx in ancestors:
             if cls == "DeepseekV2DecoderLayer":
                 layer_idx = idx
         if anc_cls & {"DeepseekV2MoE", "FusedMoE", "MoEGate", "TopK"}:
@@ -119,21 +118,36 @@ def main():
         else:
             block, sub = "G", leaf
         kl = kern.lower()
-        if "cross_device_reduce" in kl or "all_reduce" in kl or "allreduce" in kl \
-                or "rccl" in kl or "nccl" in kl:
+        if (
+            "cross_device_reduce" in kl
+            or "all_reduce" in kl
+            or "allreduce" in kl
+            or "rccl" in kl
+            or "nccl" in kl
+        ):
             sub = "AllReduce(TP)"
         agg[(block, sub, leaf, kern)][0] += dur
         agg[(block, sub, leaf, kern)][1] += 1
 
     n_dense = len(seen_dense_layers) or 3
     n_moe = len(seen_moe_layers) or 75
-    rows = [(block, sub, leaf, kern, us, cnt)
-            for (block, sub, leaf, kern), (us, cnt) in agg.items()]
+    rows = [
+        (block, sub, leaf, kern, us, cnt)
+        for (block, sub, leaf, kern), (us, cnt) in agg.items()
+    ]
     nlayers = {"A": n_dense, "B": n_moe, "L": n_dense + n_moe, "G": 1}
     n_fwd = inst_count.get("DeepseekV2Model", 1) or 1
 
-    header = ["Block", "BlockLayers", "DecoderSubmodule", "LeafModule",
-              "KernelName", "Calls", "Total_us", "PerLayer_us"]
+    header = [
+        "Block",
+        "BlockLayers",
+        "DecoderSubmodule",
+        "LeafModule",
+        "KernelName",
+        "Calls",
+        "Total_us",
+        "PerLayer_us",
+    ]
     block_order = {"A": 0, "L": 1, "B": 2, "G": 3}
     rows.sort(key=lambda r: (block_order.get(r[0], 9), r[1], r[2], -r[4]))
     lines = [",".join(header)]
@@ -141,8 +155,9 @@ def main():
         nlyr = nlayers.get(block, 1)
         per = us / (nlyr * n_fwd) if nlyr else us
         kn = '"' + kern.replace('"', "'")[:200] + '"'
-        lines.append("%s,%d,%s,%s,%s,%d,%.1f,%.2f" %
-                      (block, nlyr, sub, leaf, kn, cnt, us, per))
+        lines.append(
+            "%s,%d,%s,%s,%s,%d,%.1f,%.2f" % (block, nlyr, sub, leaf, kn, cnt, us, per)
+        )
     csv = "\n".join(lines) + "\n"
     if out:
         with open(out, "w") as f:
@@ -150,20 +165,39 @@ def main():
 
     print("trace:", path)
     print("module thread tid:", mod_tid, " module intervals:", len(intervals))
-    print("dense layers:", n_dense, " moe layers:", n_moe, " forward passes:", n_fwd,
-          " unattributed kernel us=%.1f (n=%d)" % (unattributed[0], unattributed[1]))
+    print(
+        "dense layers:",
+        n_dense,
+        " moe layers:",
+        n_moe,
+        " forward passes:",
+        n_fwd,
+        " unattributed kernel us=%.1f (n=%d)" % (unattributed[0], unattributed[1]),
+    )
     sub_us = collections.defaultdict(float)
     sub_cnt = collections.defaultdict(int)
     for block, sub, leaf, kern, us, cnt in rows:
         sub_us[(block, sub)] += us
         sub_cnt[(block, sub)] += cnt
-    print("\n%-6s %-7s %-16s %12s %10s %12s" %
-          ("Block", "#Lyr", "Submodule", "Total_us", "Calls", "PerLayer_us"))
-    for (block, sub) in sorted(sub_us, key=lambda k: (block_order.get(k[0], 9), -sub_us[k])):
+    print(
+        "\n%-6s %-7s %-16s %12s %10s %12s"
+        % ("Block", "#Lyr", "Submodule", "Total_us", "Calls", "PerLayer_us")
+    )
+    for block, sub in sorted(
+        sub_us, key=lambda k: (block_order.get(k[0], 9), -sub_us[k])
+    ):
         nl = nlayers.get(block, 1) * n_fwd
-        print("%-6s %-7d %-16s %12.1f %10d %12.2f" %
-              (block, nlayers.get(block, 1), sub, sub_us[(block, sub)],
-               sub_cnt[(block, sub)], sub_us[(block, sub)] / nl if nl else 0))
+        print(
+            "%-6s %-7d %-16s %12.1f %10d %12.2f"
+            % (
+                block,
+                nlayers.get(block, 1),
+                sub,
+                sub_us[(block, sub)],
+                sub_cnt[(block, sub)],
+                sub_us[(block, sub)] / nl if nl else 0,
+            )
+        )
     tot = sum(sub_us.values())
     print("\nTOTAL attributed GPU kernel us = %.1f" % tot)
     if out:
