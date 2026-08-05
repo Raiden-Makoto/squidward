@@ -24,6 +24,7 @@ export AITER_USE_FLYDSL_MOE_SORTING=1  # match ATOM + the FlyDSL gemm1 kernels s
 PROFILE_ARGS=""
 SPEC_ARGS=""
 EXTRA_ARGS=""
+BACKEND_ARGS="--dsa-prefill-backend tilelang --dsa-decode-backend tilelang"
 # aiter TP allreduce+RMSNorm fusion, on by default (self-disables under deterministic
 # inference). Set ALLREDUCE_FUSION="" to drop it.
 ALLREDUCE_FUSION=${ALLREDUCE_FUSION-"--enable-aiter-allreduce-fusion"}
@@ -41,6 +42,9 @@ for arg in "$@"; do
       # Kept for backwards compat so old launch commands still parse.
       export SGLANG_USE_AITER=1
       ALLREDUCE_FUSION="--enable-aiter-allreduce-fusion"
+      ;;
+    --use-triton|--triton)
+      BACKEND_ARGS="--dsa-prefill-backend triton --dsa-decode-backend triton"
       ;;
     *)
       # forward any other flag straight to `sglang serve`
@@ -62,8 +66,7 @@ exec sglang serve \
   --trust-remote-code \
   --tool-call-parser glm47 \
   --reasoning-parser glm45 \
-  --dsa-prefill-backend tilelang \
-  --dsa-decode-backend tilelang \
+  ${BACKEND_ARGS} \
   --watchdog-timeout 1200 \
   --mem-fraction-static 0.85 \
   --disable-radix-cache \
