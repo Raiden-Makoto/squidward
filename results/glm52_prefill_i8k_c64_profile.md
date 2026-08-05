@@ -20,7 +20,9 @@ ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e
 | Attention           | TileLang `main_kernel` sparse MLA               | 303.0     | `fmhaSm100f` sparse FMHA             | 228.6     | 0.75x       |
 | Attention           | `_fused_qk_rope_cat_and_cache_mla`              | 6.3       | `RopeQuantize` + `set_mla_kv_buffer` | 10.8      | 1.70x       |
 | Attention           | q/k norm + rope                                 | 3.4       | `RMSNorm`                            | 3.0       | 0.88x       |
-| Attention           | DSA indexer                                     | 26.7      | fused indexer + DeepGEMM logits      | 23.2      | 0.87x       |
+| DSA indexer         | top-k transform                                 | 12.3      | `topk_transform_prefill`             | 12.2      | 0.99x       |
+| DSA indexer         | FP8 paged MQA logits                            | 10.1      | `deep_gemm::sm100_mqa_logits`        | 6.1       | 0.60x       |
+| DSA indexer         | norm/rope/quant/cache + misc                    | 4.3       | fused indexer prep/store + misc      | 4.9       | 1.14x       |
 | **Attention**       |                                                 | **339.4** |                                      | **265.7** | **0.78x**   |
 | MoE gate-up (gemm1) | `mfma_moe1`                                     | 40.9      | `bmm_E2m1`                           | 70.2      | 1.72x       |
 | MoE down (gemm2)    | `mfma_moe2`                                     | 51.3      | `bmm_Bfloat16_E2m1`                  | 33.4      | 0.65x       |
