@@ -10,6 +10,9 @@ export SGLANG_USE_AITER=${SGLANG_USE_AITER:-1}
 export SGLANG_ROCM_FUSED_DECODE_MLA=0
 export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4  # ATOM only
+# PTPC FP8 q_b/o projections and packed-MXFP4 MLA absorbed K/V BMMs.
+export SGLANG_DSA_FP8_PROJ_GEMM=${SGLANG_DSA_FP8_PROJ_GEMM:-1}
+export SGLANG_USE_MXFP4_MLA_BMM=${SGLANG_USE_MXFP4_MLA_BMM:-1}
 # Tuned MoE (fmoe) config: left unset so aiter merges its own configs/tuned_fmoe.csv
 # with configs/model_configs/*tuned_fmoe*.csv, i.e. the stock glm5_fp4 rows.
 
