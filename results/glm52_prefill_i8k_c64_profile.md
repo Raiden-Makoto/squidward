@@ -15,13 +15,20 @@ ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e
 | Query Hadamard + FP8 quant | 4.2250    | 1.7455   | −2.4795 | −58.69% |
 | Full indexer               | 28.8151   | 26.6938  | −2.1213 | −7.36%  |
 
+| AITER BLOCK_Q MQA logits | Stock | BLOCK_Q | Δ |
+| ------------------------- | ----- | ------- | ------- |
+| Kernel ms / forward       | 10.0629 | 7.5260 | −25.21% |
+| E2E TTFT                  | — | — | −0.19% to −0.79% |
+| E2E ITL                   | — | — | −0.06% to −0.25% |
+| E2E output tok/s          | — | — | +0.07% to +0.79% |
+
 | Section             | MI355X kernel                                   | MI355X ms | B200 kernel                          | B200 ms   | B200/MI355X |
 | ------------------- | ----------------------------------------------- | --------- | ------------------------------------ | --------- | ----------- |
 | Attention           | TileLang `main_kernel` sparse MLA               | 303.0     | `fmhaSm100f` sparse FMHA             | 228.6     | 0.75x       |
 | Attention           | `_fused_qk_rope_cat_and_cache_mla`              | 6.3       | `RopeQuantize` + `set_mla_kv_buffer` | 10.8      | 1.70x       |
 | Attention           | q/k norm + rope                                 | 3.4       | `RMSNorm`                            | 3.0       | 0.88x       |
 | DSA indexer         | top-k transform                                 | 12.3      | `topk_transform_prefill`             | 12.2      | 0.99x       |
-| DSA indexer         | FP8 paged MQA logits                            | 10.1      | `deep_gemm::sm100_mqa_logits`        | 6.1       | 0.60x       |
+| DSA indexer         | FP8 ragged MQA logits                           | 10.1      | `deep_gemm::sm100_mqa_logits`        | 6.1       | 0.60x       |
 | DSA indexer         | norm/rope/quant/cache + misc                    | 4.3       | fused indexer prep/store + misc      | 4.9       | 1.14x       |
 | **Attention**       |                                                 | **339.4** |                                      | **265.7** | **0.78x**   |
 | MoE gate-up (gemm1) | `mfma_moe1`                                     | 40.9      | `bmm_E2m1`                           | 70.2      | 1.72x       |
@@ -49,5 +56,5 @@ ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e
 | ---- | --------------- | --------- | ------- | --------- | ------------- | --------------------------------------- |
 | 1    | Sparse MLA core | 303.0     | 228.6   | 74.4      | 10.4%         | Attention kernel work in progress       |
 | 2    | MoE gemm2       | 51.3      | 33.4    | 17.9      | 2.5%          | Optional; config exhausted, kernel work |
-| 3    | DSA MQA logits  | 10.1      | 6.1     | 4.0       | 0.6%          | Kernel / hardware                       |
+| 3    | DSA MQA logits  | 10.1      | 6.1     | 4.0       | 0.6%          | AITER #4180: −25.21% kernel             |
 | 4    | MoE combine     | 26.0      | 22.7    | 3.3       | 0.5%          | HBM-bound; prior fusion lost            |
