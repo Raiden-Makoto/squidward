@@ -13,6 +13,8 @@ export AITER_QUICK_REDUCE_QUANTIZATION=INT4  # ATOM only
 # PTPC FP8 q_b/o projections and packed-MXFP4 MLA absorbed K/V BMMs.
 export SGLANG_DSA_FP8_PROJ_GEMM=${SGLANG_DSA_FP8_PROJ_GEMM:-1}
 export SGLANG_USE_MXFP4_MLA_BMM=${SGLANG_USE_MXFP4_MLA_BMM:-1}
+# Fuse the DSA indexer query Hadamard transform with FP8 activation quantization.
+export SGLANG_DSA_FUSE_HADAMARD_QUANT=${SGLANG_DSA_FUSE_HADAMARD_QUANT:-1}
 # Tuned MoE (fmoe) config: left unset so aiter merges its own configs/tuned_fmoe.csv
 # with configs/model_configs/*tuned_fmoe*.csv, i.e. the stock glm5_fp4 rows.
 
