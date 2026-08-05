@@ -990,20 +990,18 @@ class DeepseekMLAForwardMixin:
                     q_out_dtype=kv_cache_dtype,
                 )
                 save_kv_cache = False
-                # On decode, pass q_cat directly to attn_mqa with q_rope=None so
-                # dsa_backend.forward_decode reuses q_cat as a zero-copy view
-                # (`q.contiguous().view(...)` fast-path) instead of running the
-                # redundant `concat_mla_absorb_q_general(q_nope_fused, q_pe_fused)`
-                # that would otherwise rebuild a tensor byte-identical to q_cat.
-                # On ROCm tilelang decode, this eliminates the
-                # `CatArrayBatchedCopy<OpaqueType<1u>, ...>` kernel that used to
-                # fire once per layer per decode step (~2.6 us / layer saved).
-                # Prefill keeps the split form because dsa_backend.forward_extend
-                # asserts `q_rope is not None`.
-                if forward_batch.forward_mode.is_decode_or_idle():
+                reuse_q_cat = forward_batch.forward_mode.is_decode_or_idle() or (
+                    forward_batch.forward_mode.is_extend()
+                    and not forward_batch.forward_mode.is_target_verify()
+                    and get_attn_backend().dsa_prefill_impl == "tilelang"
+                )
+                if reuse_q_cat:
+                    # Pass q_cat directly with q_rope=None so the DSA backend
+                    # reuses it through the zero-copy
+                    # `q.contiguous().view(...)` fast path. This avoids rebuilding
+                    # a byte-identical tensor via concat_mla_absorb_q_general.
                     if llama_4_scaling is not None:
-                        # llama_4_scaling applies only to the q_nope portion;
-                        # mutate in place via the slice view of q_cat.
+                        # llama_4_scaling applies only to the q_nope portion.
                         q_cat[..., : self.kv_lora_rank] *= llama_4_scaling
                     attn_output = self.attn_mqa(
                         q_cat,

@@ -1941,8 +1941,9 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
             )
 
-        # Do absorbed multi-latent attention (MLA path)
-        assert q_rope is not None
+        # Do absorbed multi-latent attention (MLA path). The fused ROCm TileLang
+        # caller may pass an already-concatenated q with q_rope=None.
+        assert q_rope is not None or dsa_impl == "tilelang"
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         if q_rope is not None:
