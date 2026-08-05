@@ -1943,7 +1943,8 @@ class DeepseekSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path). The fused ROCm TileLang
         # caller may pass an already-concatenated q with q_rope=None.
-        assert q_rope is not None or dsa_impl == "tilelang"
+        q_is_concatenated = q_rope is None
+        assert not q_is_concatenated or dsa_impl == "tilelang"
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         if q_rope is not None:
@@ -2004,7 +2005,7 @@ class DeepseekSparseAttnBackend(
             ).to(torch.int32)
 
         if dsa_impl == "tilelang":
-            if q_rope is not None:
+            if not q_is_concatenated:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
