@@ -19,6 +19,9 @@ from sglang.test.test_utils import CustomTestCase
 
 
 class TestUnquantFp8ProjPtpc(CustomTestCase):
+    FUSED_QKV_A_N = 2624
+    FUSED_QKV_A_K = 6144
+
     def test_gate_truth_table(self):
         layer = SimpleNamespace()
         for enabled in (False, True):
@@ -161,6 +164,93 @@ class TestUnquantFp8ProjPtpc(CustomTestCase):
         self.assertIs(args.args[1], layer._fp8_proj_weight)
         self.assertIs(args.args[2], layer._fp8_proj_weight_scale)
         self.assertIs(args.kwargs["bias"], bias)
+
+    def test_fused_qkv_a_exact_shape_repack_dispatch_and_bf16_rollback(self):
+        method = unquant.UnquantizedLinearMethod()
+        weight = torch.empty(
+            self.FUSED_QKV_A_N,
+            self.FUSED_QKV_A_K,
+            dtype=torch.bfloat16,
+            device="meta",
+        )
+        parameter = torch.nn.Parameter(weight, requires_grad=False)
+        layer = SimpleNamespace(weight=parameter, _fp8_proj_gemm=True)
+        fp8_weight = torch.empty(
+            self.FUSED_QKV_A_N,
+            self.FUSED_QKV_A_K,
+            dtype=torch.uint8,
+            device="meta",
+        )
+        weight_scale = torch.empty(
+            self.FUSED_QKV_A_N, 1, dtype=torch.float32, device="meta"
+        )
+        shuffled = torch.empty_like(fp8_weight)
+
+        aiter = types.ModuleType("aiter")
+        aiter.dtypes = SimpleNamespace(fp8=object())
+        aiter.pertoken_quant = MagicMock(return_value=(fp8_weight, weight_scale))
+        aiter_ops = types.ModuleType("aiter.ops")
+        aiter_shuffle = types.ModuleType("aiter.ops.shuffle")
+        aiter_shuffle.shuffle_weight = MagicMock(return_value=shuffled)
+
+        with patch.dict(
+            sys.modules,
+            {
+                "aiter": aiter,
+                "aiter.ops": aiter_ops,
+                "aiter.ops.shuffle": aiter_shuffle,
+            },
+        ):
+            method._repack_bf16_to_fp8_ptpc(layer)
+
+        self.assertIs(layer.weight, parameter)
+        self.assertEqual(
+            tuple(layer.weight.shape),
+            (self.FUSED_QKV_A_N, self.FUSED_QKV_A_K),
+        )
+        self.assertEqual(layer.weight.dtype, torch.bfloat16)
+        self.assertEqual(
+            tuple(layer._fp8_proj_weight.shape),
+            (self.FUSED_QKV_A_N, self.FUSED_QKV_A_K),
+        )
+        self.assertEqual(
+            tuple(layer._fp8_proj_weight_scale.shape),
+            (self.FUSED_QKV_A_N, 1),
+        )
+        self.assertTrue(layer._fp8_proj_ready)
+
+        x = torch.empty(2, self.FUSED_QKV_A_K, dtype=torch.bfloat16, device="meta")
+        expected_ptpc = torch.empty(
+            2, self.FUSED_QKV_A_N, dtype=torch.bfloat16, device="meta"
+        )
+        with patch.object(
+            fp8_utils, "apply_fp8_ptpc_linear", return_value=expected_ptpc
+        ) as apply_ptpc:
+            actual_ptpc = method.apply(layer, x)
+
+        self.assertIs(actual_ptpc, expected_ptpc)
+        self.assertEqual(
+            tuple(actual_ptpc.shape),
+            (2, self.FUSED_QKV_A_N),
+        )
+        apply_ptpc.assert_called_once_with(
+            x,
+            layer._fp8_proj_weight,
+            layer._fp8_proj_weight_scale,
+            bias=None,
+        )
+
+        layer._fp8_proj_ready = False
+        expected_bf16 = torch.empty_like(expected_ptpc)
+        with patch.object(
+            unquant, "use_intel_amx_backend", return_value=False
+        ), patch.object(unquant, "_use_aiter", False), patch.object(
+            unquant.F, "linear", return_value=expected_bf16
+        ) as bf16_linear:
+            actual_bf16 = method.apply(layer, x)
+
+        self.assertIs(actual_bf16, expected_bf16)
+        bf16_linear.assert_called_once_with(x, parameter, None)
 
 
 if __name__ == "__main__":

@@ -1880,7 +1880,11 @@ class DeepseekV2AttentionMLA(
         # Marker only for GLM-5.2. The unquantized linear method additionally
         # requires the opt-in env flag, Aiter, and gfx950 before repacking.
         if config.model_type == "glm_moe_dsa":
-            for fp8_proj_name in ("q_b_proj", "o_proj"):
+            for fp8_proj_name in (
+                "fused_qkv_a_proj_with_mqa",
+                "q_b_proj",
+                "o_proj",
+            ):
                 fp8_proj = getattr(self, fp8_proj_name, None)
                 if fp8_proj is not None:
                     fp8_proj._fp8_proj_gemm = True
