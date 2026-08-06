@@ -165,6 +165,40 @@ class TestUnquantFp8ProjPtpc(CustomTestCase):
         self.assertIs(args.args[2], layer._fp8_proj_weight_scale)
         self.assertIs(args.kwargs["bias"], bias)
 
+    def test_fused_qkv_a_uses_bf16_through_m512(self):
+        method = unquant.UnquantizedLinearMethod()
+        layer = SimpleNamespace(
+            weight=torch.nn.Parameter(
+                torch.empty(4, 8, dtype=torch.bfloat16, device="meta"),
+                requires_grad=False,
+            ),
+            _fp8_proj_weight=torch.empty(4, 8, device="meta"),
+            _fp8_proj_weight_scale=torch.empty(4, 1, device="meta"),
+            _fp8_proj_ready=True,
+            _fp8_proj_gemm_bf16_max_m=512,
+        )
+        bf16_output = torch.empty(512, 4, dtype=torch.bfloat16, device="meta")
+        ptpc_output = torch.empty(513, 4, dtype=torch.bfloat16, device="meta")
+
+        with patch.object(
+            unquant.F, "linear", return_value=bf16_output
+        ) as bf16_linear, patch.object(
+            fp8_utils, "apply_fp8_ptpc_linear", return_value=ptpc_output
+        ) as apply_ptpc:
+            x_bf16 = torch.empty(512, 8, dtype=torch.bfloat16, device="meta")
+            self.assertIs(method.apply(layer, x_bf16), bf16_output)
+            bf16_linear.assert_called_once_with(x_bf16, layer.weight, None)
+            apply_ptpc.assert_not_called()
+
+            x_ptpc = torch.empty(513, 8, dtype=torch.bfloat16, device="meta")
+            self.assertIs(method.apply(layer, x_ptpc), ptpc_output)
+            apply_ptpc.assert_called_once_with(
+                x_ptpc,
+                layer._fp8_proj_weight,
+                layer._fp8_proj_weight_scale,
+                bias=None,
+            )
+
     def test_fused_qkv_a_exact_shape_repack_dispatch_and_bf16_rollback(self):
         method = unquant.UnquantizedLinearMethod()
         weight = torch.empty(

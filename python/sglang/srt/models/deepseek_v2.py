@@ -1888,6 +1888,8 @@ class DeepseekV2AttentionMLA(
                 fp8_proj = getattr(self, fp8_proj_name, None)
                 if fp8_proj is not None:
                     fp8_proj._fp8_proj_gemm = True
+                    if fp8_proj_name == "fused_qkv_a_proj_with_mqa":
+                        fp8_proj._fp8_proj_gemm_bf16_max_m = 512
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         if not skip_rope:
