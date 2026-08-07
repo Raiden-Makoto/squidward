@@ -245,16 +245,23 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if fp8_proj_gemm_active(layer):
-            from sglang.srt.layers.quantization.fp8_utils import (
-                apply_fp8_ptpc_linear,
+            bf16_max_m = getattr(layer, "_fp8_proj_gemm_bf16_max_m", 0)
+            use_bf16 = (
+                bf16_max_m > 0
+                and isinstance(x, torch.Tensor)
+                and x.numel() // x.shape[-1] <= bf16_max_m
             )
+            if not use_bf16:
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    apply_fp8_ptpc_linear,
+                )
 
-            return apply_fp8_ptpc_linear(
-                x,
-                layer._fp8_proj_weight,
-                layer._fp8_proj_weight_scale,
-                bias=bias,
-            )
+                return apply_fp8_ptpc_linear(
+                    x,
+                    layer._fp8_proj_weight,
+                    layer._fp8_proj_weight_scale,
+                    bias=bias,
+                )
 
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
