@@ -4,52 +4,69 @@ ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e
 
 ## Attention
 
-| Component              | MI355X kernel                              | MI355X ms | GB300 kernel                         | GB300 ms  | GB300/MI355X |
-| ---------------------- | ------------------------------------------ | --------- | ------------------------------------ | --------- | ------------ |
-| Sparse MLA             | Triton sparse MLA                          | 183.7     | `fmhaSm100f` sparse FMHA             | 204.0     | 1.11x        |
-| MLA cache              | `_fused_qk_rope_cat_and_cache_mla`         | 8.3       | `RopeQuantize` + `set_mla_kv_buffer` | 9.8       | 1.18x        |
-| q/k norm + rope        | q/k norm + rope                            | 0.9       | `RMSNorm`                            | 2.6       | 2.89x        |
-| DSA top-k              | top-k transform                            | 15.8      | `topk_transform_prefill`             | 11.0      | 0.70x        |
-| DSA MQA logits         | Gluon FP8 ragged MQA logits                | 13.1      | `deep_gemm::sm100_mqa_logits`        | 5.2       | 0.40x        |
-| DSA prep/store + misc  | norm/rope/quant/cache + misc               | 5.4       | fused indexer prep/store + misc      | 4.8       | 0.89x        |
-| **Attention subtotal** |                                            | **227.3** |                                      | **237.5** | **1.04x**    |
+
+| Component              | MI355X kernel                      | MI355X ms | GB300 kernel                         | GB300 ms  | GB300/MI355X |
+| ---------------------- | ---------------------------------- | --------- | ------------------------------------ | --------- | ------------ |
+| Sparse MLA             | Triton sparse MLA                  | 183.7     | `fmhaSm100f` sparse FMHA             | 204.0     | 1.11x        |
+| MLA cache              | `_fused_qk_rope_cat_and_cache_mla` | 8.3       | `RopeQuantize` + `set_mla_kv_buffer` | 9.8       | 1.18x        |
+| q/k norm + rope        | q/k norm + rope                    | 0.9       | `RMSNorm`                            | 2.6       | 2.89x        |
+| DSA top-k              | top-k transform                    | 15.8      | `topk_transform_prefill`             | 11.0      | 0.70x        |
+| DSA MQA logits         | Gluon FP8 ragged MQA logits        | 13.1      | `deep_gemm::sm100_mqa_logits`        | 5.2       | 0.40x        |
+| DSA prep/store + misc  | norm/rope/quant/cache + misc       | 5.4       | fused indexer prep/store + misc      | 4.8       | 0.89x        |
+| **Attention subtotal** |                                    | **227.3** |                                      | **237.5** | **1.04x**    |
+
+
+
 
 ## MoE
 
-| Component        | MI355X kernel                                      | MI355X ms | GB300 kernel                      | GB300 ms  | GB300/MI355X |
-| ---------------- | -------------------------------------------------- | --------- | --------------------------------- | --------- | ------------ |
-| Gate-up (gemm1)  | `mfma_moe1`                                        | 48.8      | `bmm_E2m1`                        | 64.2      | 1.32x        |
-| Down (gemm2)     | `mfma_moe2`                                        | 62.2      | `bmm_Bfloat16_E2m1`               | 30.9      | 0.50x        |
-| Combine          | `moe_reduction_kernel`                             | 33.3      | `finalizeKernelVecLoad`           | 22.3      | 0.67x        |
-| Activation quant | `dynamic_per_group_scaled_quant`                   | 6.1       | `NVFP4Quantize`                   | 3.9       | 0.64x        |
-| Routing / sort   | `mxfp4_moe_sort` + `p0/p1/p23` + grouped top-k    | 7.9       | routing + shared-expert MLP + add | 31.3      | 3.97x        |
-| **MoE subtotal** |                                                    | **158.2** |                                   | **152.7** | **0.97x**    |
+
+| Component        | MI355X kernel                                  | MI355X ms | GB300 kernel                      | GB300 ms  | GB300/MI355X |
+| ---------------- | ---------------------------------------------- | --------- | --------------------------------- | --------- | ------------ |
+| Gate-up (gemm1)  | `mfma_moe1`                                    | 48.8      | `bmm_E2m1`                        | 64.2      | 1.32x        |
+| Down (gemm2)     | `mfma_moe2`                                    | 62.2      | `bmm_Bfloat16_E2m1`               | 30.9      | 0.50x        |
+| Combine          | `moe_reduction_kernel`                         | 33.3      | `finalizeKernelVecLoad`           | 22.3      | 0.67x        |
+| Activation quant | `dynamic_per_group_scaled_quant`               | 6.1       | `NVFP4Quantize`                   | 3.9       | 0.64x        |
+| Routing / sort   | `mxfp4_moe_sort` + `p0/p1/p23` + grouped top-k | 7.9       | routing + shared-expert MLP + add | 31.3      | 3.97x        |
+| **MoE subtotal** |                                                | **158.2** |                                   | **152.7** | **0.97x**    |
+
+
+
 
 ## Dense GEMM
 
-| Component          | MI355X kernel                                   | MI355X ms | GB300 kernel           | GB300 ms  | GB300/MI355X |
-| ------------------ | ----------------------------------------------- | --------- | ---------------------- | --------- | ------------ |
-| o_proj GEMM                  | PTPC FP8                                | 36.2      | `nvjet_sm103`          | 35.5      | 0.98x        |
-| o_proj input quant           | `dynamic_per_token_scaled_quant`       | 2.9       | fused / not standalone | —         |              |
-| q_b_proj GEMM                | PTPC FP8                                | 15.0      | `nvjet_sm103`          | 12.1      | 0.81x        |
-| q_b input norm + quant       | fused RMSNorm + per-token quant        | 3.1       | fused / not standalone | —         |              |
-| q_a + kv_a GEMM              | PTPC FP8                                | 33.4      | `nvjet_sm103`          | 30.6      | 0.92x        |
-| q_a + kv_a input quant       | `dynamic_per_token_scaled_quant`       | 5.3       | fused / not standalone | —         |              |
-| Absorbed K/V BMM             | A16WFP4                                 | 51.2      | `nvjet_sm103`          | 11.0      | 0.21x        |
-| Router GEMMs                 | AITER BF16                              | 7.3       | `nvjet_sm103`          | 3.8       | 0.52x        |
-| DenseMLP L0–2                | DenseMLP L0–2                           | 4.0       | `nvjet_sm103`          | 3.1       | 0.77x        |
-| **Dense subtotal**           |                                         | **158.5** |                        | **96.0**  | **0.61x**    |
+
+| Component              | MI355X kernel                    | MI355X ms | GB300 kernel           | GB300 ms | GB300/MI355X |
+| ---------------------- | -------------------------------- | --------- | ---------------------- | -------- | ------------ |
+| o_proj GEMM            | PTPC FP8                         | 36.2      | `nvjet_sm103`          | 35.5     | 0.98x        |
+| o_proj input quant     | `dynamic_per_token_scaled_quant` | 2.9       | fused / not standalone | —        |              |
+| q_b_proj GEMM          | PTPC FP8                         | 15.0      | `nvjet_sm103`          | 12.1     | 0.81x        |
+| q_b input norm + quant | fused RMSNorm + per-token quant  | 3.1       | fused / not standalone | —        |              |
+| q_a + kv_a GEMM        | PTPC FP8                         | 33.4      | `nvjet_sm103`          | 30.6     | 0.92x        |
+| q_a + kv_a input quant | `dynamic_per_token_scaled_quant` | 5.3       | fused / not standalone | —        |              |
+| Absorbed K/V BMM       | A16WFP4                          | 51.2      | `nvjet_sm103`          | 11.0     | 0.21x        |
+| Router GEMMs           | AITER BF16                       | 7.3       | `nvjet_sm103`          | 3.8      | 0.52x        |
+| DenseMLP L0–2          | DenseMLP L0–2                    | 4.0       | `nvjet_sm103`          | 3.1      | 0.77x        |
+| **Dense subtotal**     |                                  | **158.5** |                        | **96.0** | **0.61x**    |
+
+
+
 
 ## Communication and normalization
 
-| Component           | MI355X kernel                                   | MI355X ms | GB300 kernel | GB300 ms  | GB300/MI355X |
-| ------------------- | ----------------------------------------------- | --------- | ------------ | --------- | ------------ |
-| All-reduce          | QuickReduce INT4                                | 138.3     | NCCL RING_LL | 126.9     | 0.92x        |
-| RMSNorm             | `aiter::add_rmsnorm_quant`                      | 20.4      | `fused_add_rmsnorm` | 20.3 | 0.99x        |
-| Other               | activation + output head + embedding + sampling | 0.4       | same         | 0.5       | 1.19x        |
-| **TOTAL**           |                                                 | **703.1** |              | **633.8** | **0.90x**    |
+
+| Component  | MI355X kernel                                   | MI355X ms | GB300 kernel        | GB300 ms  | GB300/MI355X |
+| ---------- | ----------------------------------------------- | --------- | ------------------- | --------- | ------------ |
+| All-reduce | QuickReduce INT4                                | 138.3     | NCCL RING_LL        | 126.9     | 0.92x        |
+| RMSNorm    | `aiter::add_rmsnorm_quant`                      | 20.4      | `fused_add_rmsnorm` | 20.3      | 0.99x        |
+| Other      | activation + output head + embedding + sampling | 0.4       | same                | 0.5       | 1.19x        |
+| **TOTAL**  |                                                 | **703.1** |                     | **633.8** | **0.90x**    |
+
+
+
 
 ## Lever ranking — excluding all-reduce and parity/faster rows
+
 
 | Rank | Lever                | MI355X ms | GB300 ms | Excess ms | % of MI total | Work class                              |
 | ---- | -------------------- | --------- | -------- | --------- | ------------- | --------------------------------------- |
@@ -65,3 +82,5 @@ ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e
 | 10   | MoE act quant        | 6.1       | 3.9      | 2.2       | 0.3%          | HBM-bound; prior fusion lost            |
 | 11   | DenseMLP L0–2        | 4.0       | 3.1      | 0.9       | 0.1%          | Near parity                             |
 | 12   | DSA prep / store     | 5.4       | 4.8      | 0.6       | 0.1%          | Near parity                             |
+
+
