@@ -249,6 +249,84 @@ def _run_mxfp4_v_bmm(
     return output
 
 
+def _get_single_split_mxfp4_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    config, _ = _get_mxfp4_bmm_config(x.shape[1], weight.shape[1], x.shape[2])
+    config = config.copy()
+    # AITER's split-K batched A16WFP4 path can reduce uninitialized extra splits
+    # for small decode M (ROCm/aiter#3766). Keep the opt-in GLM path on K-split 1.
+    config["NUM_KSPLIT"] = 1
+    return config
+
+
+def _get_glm_mxfp4_k_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    config = _get_single_split_mxfp4_bmm_config(x, weight)
+    # GLM's K-up has K=192. Larger blocks over-read its six E8M0 scale groups.
+    config["BLOCK_SIZE_K"] = 64
+    return config
+
+
+def _get_glm_mxfp4_v_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    return _get_single_split_mxfp4_bmm_config(x, weight)
+
+
+def _run_mxfp4_k_bmm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    if envs.SGLANG_USE_MXFP4_MLA_BMM.get():
+        batched_gemm_a16wfp4(
+            x,
+            weight,
+            weight_scale,
+            y=output,
+            config=_get_glm_mxfp4_k_bmm_config(x, weight),
+            transpose_bm=False,
+            prequant=True,
+            y_scale=None,
+            dtype=torch.bfloat16,
+        )
+        return
+
+    batched_gemm_afp4wfp4_pre_quant(
+        x,
+        weight,
+        weight_scale,
+        torch.bfloat16,
+        output,
+    )
+
+
+def _run_mxfp4_v_bmm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    if envs.SGLANG_USE_MXFP4_MLA_BMM.get():
+        return batched_gemm_a16wfp4(
+            x,
+            weight,
+            weight_scale,
+            y=output,
+            config=_get_glm_mxfp4_v_bmm_config(x, weight),
+            transpose_bm=True,
+            prequant=True,
+            y_scale=None,
+            dtype=torch.bfloat16,
+        )
+
+    batched_gemm_afp4wfp4_pre_quant(
+        x,
+        weight,
+        weight_scale,
+        torch.bfloat16,
+        output.transpose(0, 1),
+    )
+    return output
+
+
 def _should_defer_dsa_cp_kv_gather(
     *,
     dsa_prefill_cp: bool,
