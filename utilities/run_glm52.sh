@@ -15,6 +15,10 @@ export SGLANG_DSA_FP8_PROJ_GEMM=${SGLANG_DSA_FP8_PROJ_GEMM:-1}
 export SGLANG_USE_MXFP4_MLA_BMM=${SGLANG_USE_MXFP4_MLA_BMM:-1}
 # Fuse the DSA indexer query Hadamard transform with FP8 activation quantization.
 export SGLANG_DSA_FUSE_HADAMARD_QUANT=${SGLANG_DSA_FUSE_HADAMARD_QUANT:-1}
+# Dense-MHA prefill below index_topk; sparse Triton MLA above it.
+export SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD=${SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD:-2048}
+# Shared-expert append (#31323) and dense-regime decode indexer skip (#31324)
+# auto-enable for this non-EP GLM DSA configuration.
 # Tuned MoE (fmoe) config: left unset so aiter merges its own configs/tuned_fmoe.csv
 # with configs/model_configs/*tuned_fmoe*.csv, i.e. the stock glm5_fp4 rows.
 
@@ -24,7 +28,7 @@ export AITER_USE_FLYDSL_MOE_SORTING=1  # match ATOM + the FlyDSL gemm1 kernels s
 PROFILE_ARGS=""
 SPEC_ARGS=""
 EXTRA_ARGS=""
-BACKEND_ARGS="--dsa-prefill-backend tilelang --dsa-decode-backend tilelang"
+BACKEND_ARGS="--dsa-prefill-backend triton --dsa-decode-backend triton"
 # aiter TP allreduce+RMSNorm fusion, on by default (self-disables under deterministic
 # inference). Set ALLREDUCE_FUSION="" to drop it.
 ALLREDUCE_FUSION=${ALLREDUCE_FUSION-"--enable-aiter-allreduce-fusion"}
@@ -45,6 +49,9 @@ for arg in "$@"; do
       ;;
     --use-triton|--triton)
       BACKEND_ARGS="--dsa-prefill-backend triton --dsa-decode-backend triton"
+      ;;
+    --use-tilelang|--tilelang)
+      BACKEND_ARGS="--dsa-prefill-backend tilelang --dsa-decode-backend tilelang"
       ;;
     *)
       # forward any other flag straight to `sglang serve`
