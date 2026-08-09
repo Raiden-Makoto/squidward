@@ -43,6 +43,15 @@ def _make_loader():
 class TestGlmMxfp4AbsorbedWeightSelection(CustomTestCase):
     def test_toggle_defaults_off(self):
         self.assertFalse(envs.SGLANG_USE_MXFP4_MLA_BMM.default)
+        self.assertEqual(
+            envs.SGLANG_EXPERIMENTAL_MXFP4_MLA_BMM_IMPL.default, "a16"
+        )
+        self.assertEqual(
+            envs.SGLANG_EXPERIMENTAL_MXFP4_MLA_K_BMM_CONFIG.default, ()
+        )
+        self.assertEqual(
+            envs.SGLANG_EXPERIMENTAL_MXFP4_MLA_V_BMM_CONFIG.default, ()
+        )
 
     def test_flag_off_preserves_fp8_rollback(self):
         loader, self_attn = _make_loader()
@@ -313,6 +322,252 @@ class TestMxfp4VDispatch(CustomTestCase):
 
         self.assertIs(result, output)
         torch.testing.assert_close(result, expected)
+
+
+class TestMxfp4ExperimentalControls(CustomTestCase):
+    def _config_inputs(self, *, k=192, n=512):
+        return (
+            torch.empty(16, 3, k, dtype=torch.bfloat16),
+            torch.empty(16, n, k // 2, dtype=torch.uint8),
+        )
+
+    def test_default_a16_k_control_is_exact(self):
+        x, weight = self._config_inputs()
+        tuned_config = {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 256,
+            "NUM_KSPLIT": 4,
+        }
+        with (
+            envs.SGLANG_EXPERIMENTAL_MXFP4_MLA_K_BMM_CONFIG.override(""),
+            mock.patch.object(
+                forward_mla,
+                "_get_mxfp4_bmm_config",
+                create=True,
+                return_value=(tuned_config, None),
+            ),
+        ):
+            config = forward_mla._get_glm_mxfp4_k_bmm_config(x, weight)
+
+        self.assertEqual(config["BLOCK_SIZE_M"], 128)
+        self.assertEqual(config["BLOCK_SIZE_N"], 256)
+        self.assertEqual(config["BLOCK_SIZE_K"], 64)
+        self.assertEqual(config["NUM_KSPLIT"], 1)
+        self.assertEqual(tuned_config["BLOCK_SIZE_K"], 256)
+        self.assertEqual(tuned_config["NUM_KSPLIT"], 4)
+
+    def test_default_a16_v_control_preserves_tuned_tiles(self):
+        x, weight = self._config_inputs(k=512, n=256)
+        tuned_config = {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 512,
+            "NUM_KSPLIT": 8,
+        }
+        with (
+            envs.SGLANG_EXPERIMENTAL_MXFP4_MLA_V_BMM_CONFIG.override(""),
+            mock.patch.object(
+                forward_mla,
+                "_get_mxfp4_bmm_config",
+                create=True,
+                return_value=(tuned_config, None),
+            ),
+        ):
+            config = forward_mla._get_glm_mxfp4_v_bmm_config(x, weight)
+
+        self.assertEqual(config["BLOCK_SIZE_M"], 64)
+        self.assertEqual(config["BLOCK_SIZE_N"], 128)
+        self.assertEqual(config["BLOCK_SIZE_K"], 512)
+        self.assertEqual(config["NUM_KSPLIT"], 1)
+        self.assertEqual(tuned_config["NUM_KSPLIT"], 8)
+
+    def test_separate_k_v_overrides_are_legal_and_single_split(self):
+        k_x, k_weight = self._config_inputs()
+        v_x, v_weight = self._config_inputs(k=512, n=256)
+        with (
+            envs.SGLANG_EXPERIMENTAL_MXFP4_MLA_K_BMM_CONFIG.override("256,128,32"),
+            envs.SGLANG_EXPERIMENTAL_MXFP4_MLA_V_BMM_CONFIG.override("64,256,512"),
+            mock.patch.object(
+                forward_mla,
+                "_get_mxfp4_bmm_config",
+                create=True,
+                return_value=(
+                    {
+                        "BLOCK_SIZE_M": 1,
+                        "BLOCK_SIZE_N": 1,
+                        "BLOCK_SIZE_K": 1,
+                        "NUM_KSPLIT": 16,
+                    },
+                    None,
+                ),
+            ),
+        ):
+            k_config = forward_mla._get_glm_mxfp4_k_bmm_config(k_x, k_weight)
+            v_config = forward_mla._get_glm_mxfp4_v_bmm_config(v_x, v_weight)
+
+        self.assertEqual(
+            (
+                k_config["BLOCK_SIZE_M"],
+                k_config["BLOCK_SIZE_N"],
+                k_config["BLOCK_SIZE_K"],
+                k_config["NUM_KSPLIT"],
+            ),
+            (256, 128, 32, 1),
+        )
+        self.assertEqual(
+            (
+                v_config["BLOCK_SIZE_M"],
+                v_config["BLOCK_SIZE_N"],
+                v_config["BLOCK_SIZE_K"],
+                v_config["NUM_KSPLIT"],
+            ),
+            (64, 256, 512, 1),
+        )
+
+    def test_rejects_unsafe_k_block_and_unknown_impl(self):
+        x, weight = self._config_inputs()
+        with (
+            envs.SGLANG_EXPERIMENTAL_MXFP4_MLA_K_BMM_CONFIG.override("64,64,128"),
+            mock.patch.object(
+                forward_mla,
+                "_get_mxfp4_bmm_config",
+                create=True,
+                return_value=({"NUM_KSPLIT": 1}, None),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "illegal K MXFP4 BMM config"):
+                forward_mla._get_glm_mxfp4_k_bmm_config(x, weight)
+
+        with envs.SGLANG_EXPERIMENTAL_MXFP4_MLA_BMM_IMPL.override("unknown"):
+            with self.assertRaisesRegex(ValueError, "must be 'a16' or 'a4w4'"):
+                forward_mla._get_glm_mxfp4_bmm_impl()
+
+
+class TestMxfp4PrepackedA4W4Dispatch(CustomTestCase):
+    @staticmethod
+    def _fake_quantized_layout(x):
+        batch, tokens, k = x.shape
+        packed = torch.empty(batch, tokens * k // 2, dtype=torch.uint8)
+        scales = torch.empty(tokens * k // 32, batch, dtype=torch.uint8).T
+        return packed, scales
+
+    def _run_and_check(self, *, operand):
+        torch.manual_seed(7)
+        batch, tokens = 2, 5
+        k, n = (192, 32) if operand == "K" else (512, 64)
+        x = torch.randn(batch, tokens, k, dtype=torch.bfloat16)
+        reference_weight = torch.randn(batch, n, k, dtype=torch.bfloat16)
+        packed_weight = torch.empty(batch, n, k // 2, dtype=torch.uint8)
+        weight_scale = torch.empty(batch, n, k // 32, dtype=torch.uint8)
+        expected_batched = torch.bmm(x, reference_weight.transpose(-2, -1))
+        output = torch.empty(
+            (batch, tokens, n) if operand == "K" else (tokens, batch, n),
+            dtype=torch.bfloat16,
+        )
+        expected = (
+            expected_batched
+            if operand == "K"
+            else expected_batched.transpose(0, 1).contiguous()
+        )
+        observed = {}
+
+        def reference_a4w4(
+            x_packed,
+            weight,
+            x_scale,
+            w_scale,
+            *,
+            dtype,
+            y,
+            config,
+        ):
+            self.assertEqual(x_packed.shape, (batch, tokens, k // 2))
+            self.assertEqual(x_scale.shape, (batch, tokens, k // 32))
+            self.assertEqual(x_scale.stride(), (1, batch * k // 32, batch))
+            self.assertIs(weight, packed_weight)
+            self.assertIs(w_scale, weight_scale)
+            self.assertIs(dtype, torch.bfloat16)
+            self.assertEqual(config["NUM_KSPLIT"], 1)
+            self.assertEqual(config["SPLITK_BLOCK_SIZE"], k)
+            if operand == "K":
+                self.assertLessEqual(config["BLOCK_SIZE_K"], 64)
+            self.assertEqual(y.data_ptr(), output.data_ptr())
+            y.copy_(expected_batched)
+            observed["y"] = y
+
+        with (
+            envs.SGLANG_USE_MXFP4_MLA_BMM.override(True),
+            envs.SGLANG_EXPERIMENTAL_MXFP4_MLA_BMM_IMPL.override("a4w4"),
+            envs.SGLANG_EXPERIMENTAL_MXFP4_MLA_K_BMM_CONFIG.override(""),
+            envs.SGLANG_EXPERIMENTAL_MXFP4_MLA_V_BMM_CONFIG.override(""),
+            mock.patch.object(
+                forward_mla,
+                "_get_mxfp4_bmm_config",
+                create=True,
+                return_value=(
+                    {
+                        "BLOCK_SIZE_M": 128,
+                        "BLOCK_SIZE_N": 128,
+                        "BLOCK_SIZE_K": 128,
+                        "NUM_KSPLIT": 4,
+                    },
+                    None,
+                ),
+            ),
+            mock.patch.object(
+                forward_mla,
+                "fused_flatten_mxfp4_quant",
+                create=True,
+                side_effect=self._fake_quantized_layout,
+            ) as quantize,
+            mock.patch.object(
+                forward_mla,
+                "batched_gemm_afp4wfp4",
+                create=True,
+                side_effect=reference_a4w4,
+            ) as a4w4_bmm,
+            mock.patch.object(
+                forward_mla, "batched_gemm_a16wfp4", create=True
+            ) as a16_bmm,
+        ):
+            if operand == "K":
+                result = forward_mla._run_mxfp4_k_bmm(
+                    x, packed_weight, weight_scale, output
+                )
+                self.assertIsNone(result)
+            else:
+                result = forward_mla._run_mxfp4_v_bmm(
+                    x, packed_weight, weight_scale, output
+                )
+                self.assertIs(result, output)
+
+        quantize.assert_called_once_with(x)
+        a4w4_bmm.assert_called_once()
+        a16_bmm.assert_not_called()
+        self.assertIsNotNone(observed["y"])
+        self.assertTrue(torch.isfinite(output).all())
+        torch.testing.assert_close(output, expected)
+        cosine = torch.nn.functional.cosine_similarity(
+            output.float().flatten(), expected.float().flatten(), dim=0
+        )
+        self.assertGreaterEqual(float(cosine), 0.9999985)
+        self.assertTrue(output.is_contiguous())
+
+    def test_k_prepacked_layout_capture_buffer_and_accuracy(self):
+        self._run_and_check(operand="K")
+
+    def test_v_prepacked_layout_capture_buffer_and_accuracy(self):
+        self._run_and_check(operand="V")
+
+    def test_quantizer_rejects_invalid_capture_shape_before_allocation(self):
+        x = torch.empty(2, 3, 48, dtype=torch.bfloat16)
+        with mock.patch.object(
+            forward_mla, "fused_flatten_mxfp4_quant", create=True
+        ) as quantize:
+            with self.assertRaisesRegex(ValueError, "K divisible by 32"):
+                forward_mla._quantize_mxfp4_bmm_activation(x)
+        quantize.assert_not_called()
 
 
 if __name__ == "__main__":
