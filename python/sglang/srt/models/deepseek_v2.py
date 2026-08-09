@@ -2210,6 +2210,13 @@ class DeepseekV2AttentionMLA(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         assert self.q_lora_rank is not None
+        proj_input = hidden_states
+        if (
+            getattr(self.fused_qkv_a_proj_with_mqa, "_fp8_proj_ready", False)
+            and isinstance(hidden_states, tuple)
+            and len(hidden_states) == 3
+        ):
+            proj_input = hidden_states[:2]
         if self._use_min_latency_fused_a_gemm is None:
             self._use_min_latency_fused_a_gemm = (
                 self.has_fused_proj
@@ -2220,10 +2227,10 @@ class DeepseekV2AttentionMLA(
         if self._use_min_latency_fused_a_gemm:
             return linear_with_fused_a_gemm(
                 self.fused_qkv_a_proj_with_mqa,
-                hidden_states,
+                proj_input,
                 backend=self.fused_a_gemm_backend,
             )
-        return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+        return self.fused_qkv_a_proj_with_mqa(proj_input)[0]
 
     def q_b_proj_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
         if self._use_min_latency_q_b_gemm is None:
@@ -2398,12 +2405,26 @@ class DeepseekV2DecoderLayer(nn.Module):
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
             )
 
+        if self._gfx95_quant_format == "fp8_ptpc":
+            fused_proj = self.self_attn.fused_qkv_a_proj_with_mqa
+            self.layer_communicator.enable_fused_ar_quant = True
+            self.layer_communicator.fused_ar_quant_keep_bf16 = True
+            self.layer_communicator.fused_ar_quant_group_size = 0
+            self.layer_communicator.fused_ar_quant_bf16_max_m = getattr(
+                fused_proj, "_fp8_proj_gemm_bf16_max_m", 0
+            )
+
     def _detect_gfx95_quant_format(self) -> str:
         if not _is_gfx95_supported:
             return ""
-        weight = getattr(
-            getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None), "weight", None
-        )
+        fused_proj = getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None)
+        if (
+            _use_aiter_gfx95
+            and envs.SGLANG_DSA_FP8_PROJ_GEMM.get()
+            and getattr(fused_proj, "_fp8_proj_gemm", False)
+        ):
+            return "fp8_ptpc"
+        weight = getattr(fused_proj, "weight", None)
         if weight is None:
             return ""
         if weight.dtype == torch.uint8:

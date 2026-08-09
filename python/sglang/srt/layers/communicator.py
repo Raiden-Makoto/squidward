@@ -102,6 +102,9 @@ if _use_aiter:
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
 
     if _is_gfx95_supported:
+        from aiter.ops.fused_qk_rmsnorm_group_quant import (
+            fused_qk_rmsnorm_per_token_quant as _aiter_fused_rmsnorm_per_token_quant,
+        )
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
         from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
@@ -155,6 +158,32 @@ def _fused_rmsnorm_fp8_per_token_quant(
             0,  # group_size=0 → per-token
         )
         return (out_fp8, scale.unsqueeze(1))
+
+
+def _fused_rmsnorm_fp8_per_token_quant_keep_bf16(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    residual: Optional[torch.Tensor] = None,
+):
+    """Fused RMSNorm + per-token FP8 quant with a BF16 side output."""
+    m, n = hidden_states.shape
+    out_fp8 = torch.empty((m, n), dtype=_aiter_fp8_dtype, device=hidden_states.device)
+    scale = torch.empty((m, 1), dtype=torch.float32, device=hidden_states.device)
+    out_bf16 = torch.empty_like(hidden_states)
+    residual_out = torch.empty_like(hidden_states) if residual is not None else None
+    _aiter_fused_rmsnorm_per_token_quant(
+        out_fp8,
+        scale,
+        hidden_states,
+        weight,
+        epsilon,
+        q_out_unquantized=out_bf16,
+        q_res_out=residual_out,
+        q_residual=residual,
+    )
+    output = (out_bf16, out_fp8, scale)
+    return (output, residual_out) if residual is not None else output
 
 
 # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
@@ -468,6 +497,8 @@ class LayerCommunicator:
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
         self.enable_fused_ar_quant = enable_fused_ar_quant
         self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
+        self.fused_ar_quant_group_size = 128
+        self.fused_ar_quant_bf16_max_m = 0
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -587,6 +618,10 @@ class LayerCommunicator:
                     quant_result = None
                     if (
                         self.enable_fused_ar_quant
+                        and (
+                            self.fused_ar_quant_bf16_max_m <= 0
+                            or hidden_states.shape[0] > self.fused_ar_quant_bf16_max_m
+                        )
                         and _use_aiter
                         and hasattr(
                             self.input_layernorm,
@@ -599,6 +634,7 @@ class LayerCommunicator:
                         quant_result = self.input_layernorm.forward_with_allreduce_fusion_quant_per_group(
                             hidden_states,
                             residual,
+                            group_size=self.fused_ar_quant_group_size,
                             use_attn_tp_group=False,
                             keep_bf16=self.fused_ar_quant_keep_bf16,
                         )
@@ -628,6 +664,20 @@ class LayerCommunicator:
                             None,
                             None,
                             None,
+                        )
+                    elif (
+                        _use_aiter
+                        and _is_gfx95_supported
+                        and quant_format == "fp8_ptpc"
+                        and (
+                            self.fused_ar_quant_bf16_max_m <= 0
+                            or hidden_states.shape[0] > self.fused_ar_quant_bf16_max_m
+                        )
+                    ):
+                        hidden_states = _fused_rmsnorm_fp8_per_token_quant_keep_bf16(
+                            hidden_states,
+                            self.input_layernorm.weight,
+                            self.input_layernorm.variance_epsilon,
                         )
                     elif _use_aiter and _is_gfx95_supported and (quant_format == "fp8"):
                         # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant.
@@ -679,6 +729,25 @@ class LayerCommunicator:
                             None,
                             residual,
                         )
+                    elif (
+                        _use_aiter
+                        and _is_gfx95_supported
+                        and quant_format == "fp8_ptpc"
+                        and (
+                            self.fused_ar_quant_bf16_max_m <= 0
+                            or hidden_states.shape[0] > self.fused_ar_quant_bf16_max_m
+                        )
+                    ):
+                        if post_residual_addition is not None:
+                            residual = residual + post_residual_addition
+                        hidden_states, residual = (
+                            _fused_rmsnorm_fp8_per_token_quant_keep_bf16(
+                                hidden_states,
+                                self.input_layernorm.weight,
+                                self.input_layernorm.variance_epsilon,
+                                residual=residual,
+                            )
+                        )
                     elif _use_aiter and _is_gfx95_supported and (quant_format == "fp8"):
                         # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant
                         # with residual addition. When DSA is active, pack
@@ -724,6 +793,14 @@ class LayerCommunicator:
                             residual,
                             post_residual_addition,
                         )
+
+        if (
+            quant_format == "fp8_ptpc"
+            and isinstance(hidden_states, tuple)
+            and len(hidden_states) == 3
+        ):
+            bf16_hidden_states, fp8_hidden_states, fp8_scale = hidden_states
+            hidden_states = (fp8_hidden_states, fp8_scale, bf16_hidden_states)
 
         hidden_states = self._communicate_simple_fn(
             hidden_states=hidden_states,

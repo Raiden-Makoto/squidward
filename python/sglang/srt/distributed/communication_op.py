@@ -48,7 +48,10 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
     group_size: int = 128,
     emit_bf16: bool = False,
 ) -> Optional[Tuple[torch.Tensor, ...]]:
-    """Fused TP all-reduce + RMSNorm + per-group FP8 quant (ROCm/aiter).
+    """Fused TP all-reduce + RMSNorm + FP8 quant (ROCm/aiter).
+
+    ``group_size=0`` selects per-token scaling; positive values select
+    per-group scaling.
 
     Returns ``(fp8_output, residual_out, per_group_scale)`` by default, or
     ``(fp8_output, residual_out, per_group_scale, bf16_output)`` when

@@ -13,8 +13,11 @@ from unittest.mock import MagicMock, patch
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.distributed import parallel_state
 from sglang.srt.environ import envs
+from sglang.srt.layers import communicator
 from sglang.srt.layers.quantization import fp8_utils, unquant
+from sglang.srt.models import deepseek_v2
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -164,6 +167,125 @@ class TestUnquantFp8ProjPtpc(CustomTestCase):
         self.assertIs(args.args[1], layer._fp8_proj_weight)
         self.assertIs(args.args[2], layer._fp8_proj_weight_scale)
         self.assertIs(args.kwargs["bias"], bias)
+
+    def test_fused_rmsnorm_quant_keeps_bf16_for_dsa(self):
+        x = torch.empty(3, 8, dtype=torch.bfloat16)
+        weight = torch.empty(8, dtype=torch.bfloat16)
+        residual = torch.empty_like(x)
+
+        with patch.object(
+            communicator, "_aiter_fp8_dtype", torch.float8_e4m3fn
+        ), patch.object(
+            communicator,
+            "_aiter_fused_rmsnorm_per_token_quant",
+            create=True,
+        ) as fused_norm_quant:
+            without_residual = (
+                communicator._fused_rmsnorm_fp8_per_token_quant_keep_bf16(
+                    x, weight, 1e-6
+                )
+            )
+            with_residual, residual_out = (
+                communicator._fused_rmsnorm_fp8_per_token_quant_keep_bf16(
+                    x, weight, 1e-6, residual=residual
+                )
+            )
+
+        for output in (without_residual, with_residual):
+            bf16_output, fp8_output, scale = output
+            self.assertEqual(bf16_output.dtype, torch.bfloat16)
+            self.assertEqual(fp8_output.dtype, torch.float8_e4m3fn)
+            self.assertEqual(scale.dtype, torch.float32)
+            self.assertEqual(tuple(bf16_output.shape), (3, 8))
+            self.assertEqual(tuple(fp8_output.shape), (3, 8))
+            self.assertEqual(tuple(scale.shape), (3, 1))
+        self.assertEqual(tuple(residual_out.shape), (3, 8))
+        self.assertEqual(fused_norm_quant.call_count, 2)
+
+    def test_fused_allreduce_dispatches_per_token_quant(self):
+        expected = (
+            torch.empty(3, 8, dtype=torch.float8_e4m3fn),
+            torch.empty(3, 8, dtype=torch.bfloat16),
+            torch.empty(3, 1, dtype=torch.float32),
+            torch.empty(3, 8, dtype=torch.bfloat16),
+        )
+        fused_per_token = MagicMock(return_value=expected)
+        coordinator = SimpleNamespace(
+            ca_comm=SimpleNamespace(
+                disabled=False,
+                custom_fused_ar_rms_quant=fused_per_token,
+            ),
+            world_size=4,
+        )
+        x = torch.empty(3, 8, dtype=torch.bfloat16)
+        residual = torch.empty_like(x)
+        weight = torch.empty(8, dtype=torch.bfloat16)
+
+        with patch.object(parallel_state, "is_hip", return_value=True), patch.object(
+            parallel_state, "is_gfx95_supported", return_value=True
+        ):
+            actual = (
+                parallel_state.GroupCoordinator.fused_allreduce_rmsnorm_quant_per_group(
+                    coordinator,
+                    x,
+                    residual,
+                    weight,
+                    1e-6,
+                    group_size=0,
+                    emit_bf16=True,
+                )
+            )
+
+        self.assertIs(actual, expected)
+        fused_per_token.assert_called_once()
+        args = fused_per_token.call_args
+        self.assertIs(args.args[0], x)
+        self.assertIs(args.args[1], residual)
+        self.assertIs(args.args[2], weight)
+        self.assertEqual(args.args[3], 1e-6)
+        self.assertTrue(args.kwargs["emit_bf16"])
+
+    def test_qkv_a_consumes_prequantized_norm_output(self):
+        fp8_input = torch.empty(3, 8, dtype=torch.float8_e4m3fn)
+        input_scale = torch.empty(3, 1, dtype=torch.float32)
+        bf16_input = torch.empty(3, 8, dtype=torch.bfloat16)
+        expected = torch.empty(3, 4, dtype=torch.bfloat16)
+        fused_proj = MagicMock(return_value=(expected, None))
+        fused_proj._fp8_proj_ready = True
+        attention = SimpleNamespace(
+            q_lora_rank=1,
+            fused_qkv_a_proj_with_mqa=fused_proj,
+            _use_min_latency_fused_a_gemm=False,
+        )
+
+        actual = deepseek_v2.DeepseekV2AttentionMLA.prepare_qkv_latent(
+            attention,
+            (fp8_input, input_scale, bf16_input),
+            forward_batch=None,
+        )
+
+        self.assertIs(actual, expected)
+        fused_proj.assert_called_once_with((fp8_input, input_scale))
+
+    def test_ptpc_projection_selects_fused_per_token_norm_quant(self):
+        fused_proj = SimpleNamespace(
+            weight=torch.empty(4, 8, dtype=torch.bfloat16),
+            _fp8_proj_gemm=True,
+        )
+        decoder_layer = SimpleNamespace(
+            self_attn=SimpleNamespace(fused_qkv_a_proj_with_mqa=fused_proj)
+        )
+
+        with envs.SGLANG_DSA_FP8_PROJ_GEMM.override(True), patch.object(
+            deepseek_v2, "_is_gfx95_supported", True
+        ), patch.object(deepseek_v2, "_use_aiter_gfx95", True):
+            quant_format = (
+                deepseek_v2.DeepseekV2DecoderLayer._detect_gfx95_quant_format(
+                    decoder_layer
+                )
+            )
+
+        self.assertEqual(quant_format, "fp8_ptpc")
 
     def test_fused_qkv_a_uses_bf16_through_m512(self):
         method = unquant.UnquantizedLinearMethod()

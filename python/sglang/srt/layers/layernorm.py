@@ -239,7 +239,7 @@ def _forward_with_allreduce_fusion_quant_per_group(
     use_attn_tp_group: bool = True,
     keep_bf16: bool = False,
 ):
-    """Fused AR + RMSNorm + per-group FP8 quant with graceful staged fallback.
+    """Fused AR + RMSNorm + FP8 quant with graceful staged fallback.
 
     The single-kernel quantized backend dispatch is ROCm + aiter + gfx95-only.
     Other HIP/aiter runs can still use the 2-kernel fallback below to preserve
@@ -253,8 +253,8 @@ def _forward_with_allreduce_fusion_quant_per_group(
 
     Fallback chain (best → worst):
 
-    1. Fully-fused AR+RMSNorm+per-group-quant  (aiter single kernel).
-    2. Fused AR+RMSNorm followed by a separate per-1x128 quant
+    1. Fully-fused AR+RMSNorm+quant  (aiter single kernel).
+    2. Fused AR+RMSNorm followed by a separate quant
        (two kernels, still saves the 3-kernel unfused baseline path).
     3. ``None`` so the caller can run the generic unfused path.
 
@@ -308,14 +308,19 @@ def _forward_with_allreduce_fusion_quant_per_group(
         if fused_result is None:
             return None
         bf16_out, residual_out = fused_result
-        per_1x128_quant, fp8_dtype = _get_aiter_per_group_quant()
-        fp8_out, scale_out = per_1x128_quant(
-            bf16_out,
-            quant_dtype=fp8_dtype,
-            transpose_scale=False,
-        )
-        if use_bpreshuffle:
-            scale_out = materialize_bpreshuffle_fp8_scale(scale_out)
+        if group_size == 0:
+            fp8_out, scale_out = _aiter.per_token_quant_hip(
+                bf16_out, quant_dtype=_aiter.dtypes.fp8
+            )
+        else:
+            per_1x128_quant, fp8_dtype = _get_aiter_per_group_quant()
+            fp8_out, scale_out = per_1x128_quant(
+                bf16_out,
+                quant_dtype=fp8_dtype,
+                transpose_scale=False,
+            )
+            if use_bpreshuffle:
+                scale_out = materialize_bpreshuffle_fp8_scale(scale_out)
         return (fp8_out, scale_out), residual_out
 
     # keep_bf16=True: GDN path — need both an unquantized bf16 normed output
@@ -343,14 +348,19 @@ def _forward_with_allreduce_fusion_quant_per_group(
     if fused_result is None:
         return None
     bf16_out, residual_out = fused_result
-    per_1x128_quant, fp8_dtype = _get_aiter_per_group_quant()
-    fp8_out, scale_out = per_1x128_quant(
-        bf16_out,
-        quant_dtype=fp8_dtype,
-        transpose_scale=False,
-    )
-    if use_bpreshuffle:
-        scale_out = materialize_bpreshuffle_fp8_scale(scale_out)
+    if group_size == 0:
+        fp8_out, scale_out = _aiter.per_token_quant_hip(
+            bf16_out, quant_dtype=_aiter.dtypes.fp8
+        )
+    else:
+        per_1x128_quant, fp8_dtype = _get_aiter_per_group_quant()
+        fp8_out, scale_out = per_1x128_quant(
+            bf16_out,
+            quant_dtype=fp8_dtype,
+            transpose_scale=False,
+        )
+        if use_bpreshuffle:
+            scale_out = materialize_bpreshuffle_fp8_scale(scale_out)
     return (bf16_out, fp8_out, scale_out), residual_out
 
 
@@ -758,9 +768,10 @@ class RMSNorm(MultiPlatformOp):
         use_attn_tp_group: bool = True,
         keep_bf16: bool = False,
     ):
-        """Fused AR + RMSNorm + per-group FP8 quant (ROCm/aiter path).
+        """Fused AR + RMSNorm + FP8 quant (ROCm/aiter path).
 
-        Returns ``((fp8, scale), residual)`` when ``keep_bf16=False``;
+        ``group_size=0`` selects per-token scaling. Returns
+        ``((fp8, scale), residual)`` when ``keep_bf16=False``;
         ``((bf16, fp8, scale), residual)`` when ``keep_bf16=True``;
         or ``None`` when no fused path is available (caller must fall back to
         the standard fused AR+RMSNorm + separate quant path).

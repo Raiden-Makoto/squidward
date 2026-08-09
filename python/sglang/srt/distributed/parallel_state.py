@@ -803,7 +803,10 @@ class GroupCoordinator:
         group_size: int = 128,
         emit_bf16: bool = False,
     ) -> Optional[Tuple[torch.Tensor, ...]]:
-        """Attempt fused all-reduce + RMSNorm + per-group FP8 quant.
+        """Attempt fused all-reduce + RMSNorm + FP8 quant.
+
+        ``group_size=0`` dispatches Aiter's per-token kernel; positive values
+        dispatch the per-group kernel.
 
         ROCm/aiter/gfx95-only entry point. Returns ``None`` on any other
         platform or when the aiter custom-all-reduce communicator cannot
@@ -822,13 +825,19 @@ class GroupCoordinator:
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
-        if not hasattr(ca_comm, "custom_fused_ar_rms_per_group_quant"):
+        per_token = group_size == 0
+        fused_method = (
+            "custom_fused_ar_rms_quant"
+            if per_token
+            else "custom_fused_ar_rms_per_group_quant"
+        )
+        if not hasattr(ca_comm, fused_method):
             return None
 
         # Shape / size eligibility mirrors aiter's internal gate so we fail
         # fast without entering the HIP kernel dispatch.
         K = input_.shape[-1]
-        if K % group_size != 0 or K > 16384:
+        if (not per_token and K % group_size != 0) or K > 16384:
             return None
         total_bytes = input_.numel() * input_.element_size()
         if total_bytes == 0 or total_bytes > 8 * 1024 * 8192:
@@ -853,6 +862,15 @@ class GroupCoordinator:
                 use_1stage_ar = False
 
         try:
+            if per_token:
+                return ca_comm.custom_fused_ar_rms_quant(
+                    input_,
+                    residual_inp_,
+                    weight_,
+                    eps,
+                    use_1stage_ar,
+                    emit_bf16=emit_bf16,
+                )
             return ca_comm.custom_fused_ar_rms_per_group_quant(
                 input_,
                 residual_inp_,
