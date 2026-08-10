@@ -1955,6 +1955,13 @@ class DeepseekV2AttentionMLA(
         # The uint8 dtype gate at the call sites still decides whether this path
         # actually runs; this marker only selects GLM's shape-tuned tile configs.
         self.use_mxfp4_mla_bmm = config.model_type == "glm_moe_dsa"
+        if layer_id == 0:
+            logger.warning(
+                "GLM MXFP4 dispatch source=%s model_type=%s tuned=%s",
+                __file__,
+                config.model_type,
+                self.use_mxfp4_mla_bmm,
+            )
 
         self.current_attention_backend = (
             None  # Attention backend used by current forward batch
