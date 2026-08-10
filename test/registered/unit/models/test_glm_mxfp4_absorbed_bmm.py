@@ -207,45 +207,106 @@ class TestMxfp4KDispatch(CustomTestCase):
 
 
 class TestTunedMxfp4Bmm(CustomTestCase):
-    def test_serializes_config_for_raw_aiter_kernel(self):
-        x = torch.randn(2, 3, 8, dtype=torch.bfloat16)
-        weight = torch.zeros(2, 4, 4, dtype=torch.uint8)
-        scale = torch.zeros(2, 4, 1, dtype=torch.uint8)
-        output = torch.empty(3, 2, 4, dtype=torch.bfloat16)
-        config = {"BLOCK_SIZE_K": 64, "NUM_KSPLIT": 1}
-        serialized_config = '{"BLOCK_SIZE_K":64,"NUM_KSPLIT":1}'
-
-        with (
-            mock.patch.object(
-                forward_mla,
-                "serialize_dict",
-                create=True,
-                return_value=serialized_config,
-            ) as serialize_dict,
-            mock.patch.object(
-                forward_mla,
-                "batched_gemm_a16wfp4_",
-                create=True,
-                return_value=output,
-            ) as raw_bmm,
-        ):
-            result = forward_mla._run_tuned_mxfp4_bmm(
-                x, weight, scale, output, config, transpose_bm=True
-            )
-
-        serialize_dict.assert_called_once_with(config)
-        raw_bmm.assert_called_once_with(
-            x,
-            weight,
-            scale,
-            dtype=torch.bfloat16,
-            y=output,
-            config=serialized_config,
-            transpose_bm=True,
-            prequant=True,
-            y_scale=None,
+    def test_launches_aiter_triton_kernel_with_single_split_metadata(self):
+        cases = (
+            {
+                "name": "k",
+                "packed_k": 96,
+                "config": {
+                    "BLOCK_SIZE_M": 32,
+                    "BLOCK_SIZE_N": 64,
+                    "BLOCK_SIZE_K": 64,
+                    "NUM_KSPLIT": 1,
+                },
+                "transpose_bm": False,
+            },
+            {
+                "name": "v",
+                "packed_k": 256,
+                "config": {
+                    "BLOCK_SIZE_M": 128,
+                    "BLOCK_SIZE_N": 256,
+                    "BLOCK_SIZE_K": 128,
+                    "NUM_KSPLIT": 1,
+                },
+                "transpose_bm": True,
+            },
         )
-        self.assertIs(result, output)
+
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                batch, m, n = 2, 3, 4
+                packed_k = case["packed_k"]
+                x = torch.empty(batch, m, 2 * packed_k, dtype=torch.bfloat16)
+                weight = torch.empty(batch, n, packed_k, dtype=torch.uint8)
+                scale = torch.empty(batch, n, packed_k // 32, dtype=torch.uint8)
+                output_shape = (m, batch, n) if case["transpose_bm"] else (batch, m, n)
+                output = torch.empty(output_shape, dtype=torch.bfloat16)
+                config = case["config"]
+                original_config = config.copy()
+                launch = mock.Mock()
+                kernel = mock.MagicMock()
+                kernel.__getitem__.return_value = launch
+
+                with mock.patch.object(
+                    forward_mla, "_batched_gemm_a16wfp4_kernel", kernel
+                ):
+                    result = forward_mla._run_tuned_mxfp4_bmm(
+                        x,
+                        weight,
+                        scale,
+                        output,
+                        config,
+                        transpose_bm=case["transpose_bm"],
+                    )
+
+                self.assertEqual(config, original_config)
+                kernel.__getitem__.assert_called_once()
+                grid = kernel.__getitem__.call_args.args[0]
+                args, metadata = launch.call_args
+                self.assertEqual(
+                    grid(metadata),
+                    (
+                        batch,
+                        forward_mla.triton.cdiv(m, config["BLOCK_SIZE_M"])
+                        * forward_mla.triton.cdiv(n, config["BLOCK_SIZE_N"]),
+                    ),
+                )
+                self.assertIs(args[0], x)
+                self.assertIs(args[1], weight)
+                self.assertIs(args[2], output)
+                self.assertIs(args[3], scale)
+                self.assertIsNone(args[4])
+                self.assertEqual(args[5:8], (m, n, packed_k))
+                self.assertEqual(args[8:11], x.stride())
+                self.assertEqual(args[11:14], weight.stride())
+                expected_stride_cb = (
+                    output.stride(1) if case["transpose_bm"] else output.stride(0)
+                )
+                expected_stride_cm = (
+                    output.stride(0) if case["transpose_bm"] else output.stride(1)
+                )
+                self.assertEqual(
+                    args[14:18],
+                    (
+                        expected_stride_cb,
+                        0,
+                        expected_stride_cm,
+                        output.stride(2),
+                    ),
+                )
+                self.assertEqual(args[18:21], scale.stride())
+                self.assertTrue(metadata["PRE_QUANT"])
+                self.assertFalse(metadata["HAVE_Y_SCALE"])
+                self.assertEqual(metadata["NUM_KSPLIT"], 1)
+                self.assertEqual(metadata["SPLITK_BLOCK_SIZE"], 2 * packed_k)
+                for block_size in (
+                    "BLOCK_SIZE_M",
+                    "BLOCK_SIZE_N",
+                    "BLOCK_SIZE_K",
+                ):
+                    self.assertEqual(metadata[block_size], config[block_size])
+                self.assertIs(result, output)
 
 
 class TestMxfp4VDispatch(CustomTestCase):
