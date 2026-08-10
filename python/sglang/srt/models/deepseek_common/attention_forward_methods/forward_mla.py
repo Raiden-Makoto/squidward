@@ -102,7 +102,16 @@ def _select_local_dcp_heads_for_autotune(
     return attn_output.narrow(1, rank * num_local_heads, num_local_heads)
 
 
-def _is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
+def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
+    if not get_parallel().dcp_enabled:
+        return False
+    return (
+        forward_batch.forward_mode.is_decode()
+        or forward_batch.forward_mode.is_target_verify()
+    )
+
+
+def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
     # FlashMLA exposes natural-log softmax LSE. FlashInfer MLA and the other
     # currently supported MLA DCP decode backends expose base-2 LSE.
     return attention_backend == "flashmla"
@@ -249,85 +258,7 @@ def _run_mxfp4_v_bmm(
     return output
 
 
-def _get_single_split_mxfp4_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
-    config, _ = _get_mxfp4_bmm_config(x.shape[1], weight.shape[1], x.shape[2])
-    config = config.copy()
-    # AITER's split-K batched A16WFP4 path can reduce uninitialized extra splits
-    # for small decode M (ROCm/aiter#3766). Keep the opt-in GLM path on K-split 1.
-    config["NUM_KSPLIT"] = 1
-    return config
-
-
-def _get_glm_mxfp4_k_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
-    config = _get_single_split_mxfp4_bmm_config(x, weight)
-    # GLM's K-up has K=192. Larger blocks over-read its six E8M0 scale groups.
-    config["BLOCK_SIZE_K"] = 64
-    return config
-
-
-def _get_glm_mxfp4_v_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
-    return _get_single_split_mxfp4_bmm_config(x, weight)
-
-
-def _run_mxfp4_k_bmm(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    output: torch.Tensor,
-) -> None:
-    if envs.SGLANG_USE_MXFP4_MLA_BMM.get():
-        batched_gemm_a16wfp4(
-            x,
-            weight,
-            weight_scale,
-            y=output,
-            config=_get_glm_mxfp4_k_bmm_config(x, weight),
-            transpose_bm=False,
-            prequant=True,
-            y_scale=None,
-            dtype=torch.bfloat16,
-        )
-        return
-
-    batched_gemm_afp4wfp4_pre_quant(
-        x,
-        weight,
-        weight_scale,
-        torch.bfloat16,
-        output,
-    )
-
-
-def _run_mxfp4_v_bmm(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    output: torch.Tensor,
-) -> torch.Tensor:
-    if envs.SGLANG_USE_MXFP4_MLA_BMM.get():
-        return batched_gemm_a16wfp4(
-            x,
-            weight,
-            weight_scale,
-            y=output,
-            config=_get_glm_mxfp4_v_bmm_config(x, weight),
-            transpose_bm=True,
-            prequant=True,
-            y_scale=None,
-            dtype=torch.bfloat16,
-        )
-
-    batched_gemm_afp4wfp4_pre_quant(
-        x,
-        weight,
-        weight_scale,
-        torch.bfloat16,
-        output.transpose(0, 1),
-    )
-    return output
-
-
-def _should_defer_dsa_cp_kv_gather(
+def should_defer_dsa_cp_kv_gather(
     *,
     dsa_prefill_cp: bool,
     fuse_rope_for_trtllm_mla: bool,
@@ -521,11 +452,7 @@ class DeepseekMLAForwardMixin:
         # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
         q_replicate_active = (
             get_parallel().dcp_replicate_q_proj
-            and get_parallel().dcp_enabled
-            and (
-                forward_batch.forward_mode.is_decode()
-                or forward_batch.forward_mode.is_target_verify()
-            )
+            and is_dcp_mla_decode_phase(forward_batch)
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
             and self.q_b_proj_qrep_weight is not None
@@ -916,9 +843,9 @@ class DeepseekMLAForwardMixin:
         skip_rope_for_aiter_fused_mla = self._skip_rope_for_aiter_fused_mla()
         if (
             self.rotary_emb is not None
-            and (not fuse_rope_for_trtllm_mla)
-            and (not skip_rope_for_dsa_tilelang_fused)
-            and (not skip_rope_for_aiter_fused_mla)
+            and not fuse_rope_for_trtllm_mla
+            and not skip_rope_for_dsa_tilelang_fused
+            and not skip_rope_for_aiter_fused_mla
             and (
                 not _use_aiter
                 or not _is_gfx95_supported
@@ -962,7 +889,7 @@ class DeepseekMLAForwardMixin:
 
         dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
         mla_prefill_cp = mla_use_prefill_cp(forward_batch)
-        defer_kv_gather_until_after_rope = _should_defer_dsa_cp_kv_gather(
+        defer_kv_gather_until_after_rope = should_defer_dsa_cp_kv_gather(
             dsa_prefill_cp=dsa_prefill_cp,
             fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
         )
@@ -988,10 +915,7 @@ class DeepseekMLAForwardMixin:
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if get_parallel().dcp_enabled:
-            if (
-                forward_batch.forward_mode.is_decode()
-                or forward_batch.forward_mode.is_target_verify()
-            ):
+            if is_dcp_mla_decode_phase(forward_batch):
                 if not q_replicate_active:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
@@ -1142,10 +1066,7 @@ class DeepseekMLAForwardMixin:
                         topk_indices=topk_indices,
                     )
                     attn_output = fusion_plan.attn_output_buf
-                elif (
-                    forward_batch.forward_mode.is_decode()
-                    or forward_batch.forward_mode.is_target_verify()
-                ) and get_parallel().dcp_enabled:
+                elif is_dcp_mla_decode_phase(forward_batch):
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
@@ -1180,11 +1101,9 @@ class DeepseekMLAForwardMixin:
             if _use_aiter_gfx95 and self.current_attention_backend == "aiter":
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
-
                 kv_cache_dtype = (
                     fp8_dtype if self.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
                 )
-
                 q, _, _, k = fused_qk_rope_cat_and_cache_mla(
                     q_nope_out,
                     q_pe,
@@ -1199,7 +1118,6 @@ class DeepseekMLAForwardMixin:
                     self.rotary_emb.is_neox_style,
                     q_out_dtype=kv_cache_dtype,
                 )
-
                 save_kv_cache = False
             else:
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
@@ -1219,10 +1137,7 @@ class DeepseekMLAForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if (
-            forward_batch.forward_mode.is_decode()
-            or forward_batch.forward_mode.is_target_verify()
-        ) and get_parallel().dcp_enabled:
+        if is_dcp_mla_decode_phase(forward_batch):
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,
@@ -1237,7 +1152,7 @@ class DeepseekMLAForwardMixin:
                 )
             else:
                 dcp_comm_backend = get_parallel().dcp_comm_backend
-                is_lse_base_on_e = _is_mla_dcp_lse_base_on_e(
+                is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
                     self.current_attention_backend
                 )
                 if dcp_comm_backend in ("a2a", "fi_a2a"):
