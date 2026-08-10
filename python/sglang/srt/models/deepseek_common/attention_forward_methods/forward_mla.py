@@ -197,7 +197,12 @@ def _get_glm_mxfp4_k_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
 
 
 def _get_glm_mxfp4_v_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
-    return _get_single_split_mxfp4_bmm_config(x, weight)
+    config = _get_single_split_mxfp4_bmm_config(x, weight)
+    # Keep AITER's small-M decode buckets; use the profiled prefill tiles.
+    if x.shape[1] > 256:
+        config["BLOCK_SIZE_M"] = 128
+        config["BLOCK_SIZE_K"] = 128
+    return config
 
 
 def _run_mxfp4_k_bmm(
@@ -801,7 +806,6 @@ class DeepseekMLAForwardMixin:
                             q_nope.to(torch.bfloat16).transpose(0, 1),
                             self.w_kc.to(torch.bfloat16) * self.w_scale,
                         )
-
             elif self.w_kc.dtype == torch.float8_e4m3fn:
                 if _is_cpu:
                     q_nope_out = torch.bmm(
@@ -1302,7 +1306,6 @@ class DeepseekMLAForwardMixin:
                     )
             else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
-
         elif self.w_vc.dtype == torch.float8_e4m3fn:
             if _is_cpu:
                 attn_bmm_output = torch.bmm(

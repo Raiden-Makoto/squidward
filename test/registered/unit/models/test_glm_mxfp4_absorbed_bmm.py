@@ -315,5 +315,42 @@ class TestMxfp4VDispatch(CustomTestCase):
         torch.testing.assert_close(result, expected)
 
 
+class TestMxfp4VConfig(CustomTestCase):
+    def _config(self, tokens):
+        x = torch.empty(16, tokens, 512, dtype=torch.bfloat16)
+        weight = torch.empty(16, 256, 256, dtype=torch.uint8)
+        tuned_config = {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 256,
+            "NUM_KSPLIT": 4,
+        }
+        with mock.patch.object(
+            forward_mla,
+            "_get_mxfp4_bmm_config",
+            create=True,
+            return_value=(tuned_config, None),
+        ):
+            config = forward_mla._get_glm_mxfp4_v_bmm_config(x, weight)
+        return config, tuned_config
+
+    def test_large_prefill_uses_m128_k128_single_split(self):
+        config, tuned_config = self._config(8192)
+        self.assertEqual(config["BLOCK_SIZE_M"], 128)
+        self.assertEqual(config["BLOCK_SIZE_N"], 256)
+        self.assertEqual(config["BLOCK_SIZE_K"], 128)
+        self.assertEqual(config["NUM_KSPLIT"], 1)
+        self.assertEqual(tuned_config["BLOCK_SIZE_M"], 256)
+        self.assertEqual(tuned_config["BLOCK_SIZE_K"], 256)
+        self.assertEqual(tuned_config["NUM_KSPLIT"], 4)
+
+    def test_short_shapes_preserve_aiter_bucket(self):
+        for tokens in (1, 16, 64, 128, 256):
+            with self.subTest(tokens=tokens):
+                config, _ = self._config(tokens)
+                self.assertEqual(config["BLOCK_SIZE_M"], 256)
+                self.assertEqual(config["NUM_KSPLIT"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
