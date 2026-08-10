@@ -224,6 +224,15 @@ def _run_tuned_mxfp4_bmm(
 
     batch, m, _ = x.shape
     _, n, packed_k = weight.shape
+    if not getattr(_run_tuned_mxfp4_bmm, "_logged_config", False):
+        logger.warning(
+            "GLM tuned MXFP4 BMM source=%s shape=%s weight=%s config=%s",
+            __file__,
+            tuple(x.shape),
+            tuple(weight.shape),
+            config,
+        )
+        _run_tuned_mxfp4_bmm._logged_config = True
     config["SPLITK_BLOCK_SIZE"] = 2 * packed_k
     if config["BLOCK_SIZE_K"] >= 2 * packed_k:
         config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * packed_k)
