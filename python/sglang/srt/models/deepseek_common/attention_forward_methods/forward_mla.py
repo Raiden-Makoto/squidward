@@ -162,11 +162,12 @@ if _use_aiter_gfx95:
     from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
         _get_config as _get_mxfp4_bmm_config,
     )
-    from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
+    from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4_
     from aiter.ops.triton.fused_fp8_quant import (
         fused_flatten_fp8_group_quant,
         fused_rms_fp8_group_quant,
     )
+    from aiter.ops.triton.utils.common_utils import serialize_dict
 
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
         batched_gemm_afp4wfp4_pre_quant,
@@ -205,6 +206,31 @@ def _get_glm_mxfp4_v_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
     return config
 
 
+def _run_tuned_mxfp4_bmm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+    config: dict,
+    *,
+    transpose_bm: bool,
+) -> torch.Tensor:
+    # Serialize before entering AITER's custom op. Calling the public dict wrapper
+    # from a compiled forward can graph-break in json.dumps and resume the custom
+    # op with config=None, silently restoring AITER's generic 256x256x256 tiles.
+    return batched_gemm_a16wfp4_(
+        x,
+        weight,
+        weight_scale,
+        dtype=torch.bfloat16,
+        y=output,
+        config=serialize_dict(config),
+        transpose_bm=transpose_bm,
+        prequant=True,
+        y_scale=None,
+    )
+
+
 def _run_mxfp4_k_bmm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -212,16 +238,13 @@ def _run_mxfp4_k_bmm(
     output: torch.Tensor,
 ) -> None:
     if envs.SGLANG_USE_MXFP4_MLA_BMM.get():
-        batched_gemm_a16wfp4(
+        _run_tuned_mxfp4_bmm(
             x,
             weight,
             weight_scale,
-            y=output,
-            config=_get_glm_mxfp4_k_bmm_config(x, weight),
+            output,
+            _get_glm_mxfp4_k_bmm_config(x, weight),
             transpose_bm=False,
-            prequant=True,
-            y_scale=None,
-            dtype=torch.bfloat16,
         )
         return
 
@@ -241,16 +264,13 @@ def _run_mxfp4_v_bmm(
     output: torch.Tensor,
 ) -> torch.Tensor:
     if envs.SGLANG_USE_MXFP4_MLA_BMM.get():
-        return batched_gemm_a16wfp4(
+        return _run_tuned_mxfp4_bmm(
             x,
             weight,
             weight_scale,
-            y=output,
-            config=_get_glm_mxfp4_v_bmm_config(x, weight),
+            output,
+            _get_glm_mxfp4_v_bmm_config(x, weight),
             transpose_bm=True,
-            prequant=True,
-            y_scale=None,
-            dtype=torch.bfloat16,
         )
 
     batched_gemm_afp4wfp4_pre_quant(
