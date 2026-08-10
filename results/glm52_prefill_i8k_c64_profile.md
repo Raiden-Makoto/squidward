@@ -1,6 +1,6 @@
 # GLM-5.2 prefill — i8k/o16 conc64, TP4 — MI355X (MXFP4) vs GB300 (NVFP4)
 
-ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e_glm5.sh 8192 16 1`, conc64 num256, `--profile-num-steps 4 --profile-by-stage`, `RM/glm51` `1d023bcaba`; stock AITER `6c48c5fa0e`, `SGLANG_DSA_FP8_PROJ_GEMM=1`. MI355X image `raidenmakoto916/raidenmakoto:glm52-fork-aiter0724-ckaf7118-ckgemm1`; GB300 ARM64 image `lmsysorg/sglang:dev-cu13-glm52-nvfp4` with `sglang-kernel 0.4.5` and `flashinfer 0.6.15.post1`.
+ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e_glm5.sh 8192 16 1`, conc64 num256, `--profile-num-steps 4 --profile-by-stage`, `RM/glm51` `1d023bcaba`; absorbed BMM reprofile `RM/glm52-mxfp4-bmm-tuning` `39edf1b647`; stock AITER `6c48c5fa0e`, `SGLANG_DSA_FP8_PROJ_GEMM=1`. MI355X image `raidenmakoto916/raidenmakoto:glm52-fork-aiter0724-ckaf7118-ckgemm1`; GB300 ARM64 image `lmsysorg/sglang:dev-cu13-glm52-nvfp4` with `sglang-kernel 0.4.5` and `flashinfer 0.6.15.post1`.
 
 ## Attention
 
@@ -35,10 +35,10 @@ ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e
 | q_b input norm + quant | fused RMSNorm + per-token quant  | 3.1       | fused / not standalone | —        |              |
 | q_a + kv_a GEMM        | PTPC FP8                         | 33.4      | `nvjet_sm103`          | 30.6     | 0.92x        |
 | q_a + kv_a input quant | `dynamic_per_token_scaled_quant` | 5.3       | fused / not standalone | —        |              |
-| Absorbed K/V BMM       | A16WFP4                          | 51.2      | `nvjet_sm103`          | 11.0     | 0.21x        |
+| Absorbed K/V BMM       | A16WFP4                          | 35.0      | `nvjet_sm103`          | 11.0     | 0.31x        |
 | Router GEMMs           | AITER BF16                       | 7.3       | `nvjet_sm103`          | 3.8      | 0.52x        |
 | DenseMLP L0–2          | DenseMLP L0–2                    | 4.0       | `nvjet_sm103`          | 3.1      | 0.77x        |
-| **Dense subtotal**     |                                  | **158.5** |                        | **96.0** | **0.61x**    |
+| **Dense subtotal**     |                                  | **142.3** |                        | **96.0** | **0.67x**    |
 
 ## Communication and normalization
 
@@ -47,17 +47,17 @@ ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e
 | All-reduce | QuickReduce INT4                                | 138.3     | NCCL RING_LL        | 126.9     | 0.92x        |
 | RMSNorm    | `aiter::add_rmsnorm_quant`                      | 20.4      | `fused_add_rmsnorm` | 20.3      | 0.99x        |
 | Other      | activation + output head + embedding + sampling | 0.4       | same                | 0.5       | 1.19x        |
-| **TOTAL**  |                                                 | **703.1** |                     | **633.8** | **0.90x**    |
+| **TOTAL**  |                                                 | **686.8** |                     | **633.8** | **0.92x**    |
 
 ## Lever ranking — excluding all-reduce and parity/faster rows
 
 | Rank | Lever                | MI355X ms | GB300 ms | Excess ms | % of MI total | Work class                              |
 | ---- | -------------------- | --------- | -------- | --------- | ------------- | --------------------------------------- |
-| 1    | A16WFP4 absorbed BMM | 51.2      | 11.0     | 40.2      | 5.7%          | Kernel work                             |
-| 2    | MoE gemm2            | 62.2      | 30.9     | 31.3      | 4.4%          | Optional; config exhausted, kernel work |
+| 1    | MoE gemm2            | 62.2      | 30.9     | 31.3      | 4.6%          | Optional; config exhausted, kernel work |
+| 2    | A16WFP4 absorbed BMM | 35.0      | 11.0     | 24.0      | 3.5%          | Kernel work                             |
 | 3    | MoE combine          | 33.3      | 22.3     | 11.0      | 1.6%          | HBM-bound; prior fusion lost            |
 | 4    | q_a + kv_a PTPC path | 38.7      | 30.6     | 8.1       | 1.2%          | GEMM 33.4 ms + quant 5.3 ms             |
-| 5    | DSA MQA logits       | 13.1      | 5.2      | 7.9       | 1.1%          | Gluon fallback; BLOCK_Q disabled        |
+| 5    | DSA MQA logits       | 13.1      | 5.2      | 7.9       | 1.2%          | Gluon fallback; BLOCK_Q disabled        |
 | 6    | q_b_proj PTPC path   | 18.1      | 12.1     | 6.0       | 0.9%          | GEMM 15.0 ms + fused norm/quant 3.1 ms  |
 | 7    | DSA top-k            | 15.8      | 11.0     | 4.8       | 0.7%          | Near parity                             |
 | 8    | o_proj PTPC path     | 39.1      | 35.5     | 3.6       | 0.5%          | GEMM 36.2 ms + quant 2.9 ms             |
