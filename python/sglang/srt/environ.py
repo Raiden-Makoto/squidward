@@ -811,12 +811,6 @@ class Envs:
     # Opt-in GLM MLA absorbed-BMM backend that keeps w_kc/w_vc in packed
     # MXFP4 and dispatches the matching AITER FP4 kernels.
     SGLANG_USE_MXFP4_MLA_BMM = EnvBool(False)
-    # Temporary GLM MXFP4 absorbed-BMM investigation controls. The default
-    # preserves the current fused A16WFP4 implementation. Config tuples are
-    # BLOCK_SIZE_M,BLOCK_SIZE_N,BLOCK_SIZE_K and are validated per K/V path.
-    SGLANG_EXPERIMENTAL_MXFP4_MLA_BMM_IMPL = EnvStr("a16")
-    SGLANG_EXPERIMENTAL_MXFP4_MLA_K_BMM_CONFIG = EnvTuple(tuple())
-    SGLANG_EXPERIMENTAL_MXFP4_MLA_V_BMM_CONFIG = EnvTuple(tuple())
     # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
     # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
     # directly in fp8 ("born fp8") and the standalone concat-cast kernel

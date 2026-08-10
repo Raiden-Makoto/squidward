@@ -160,7 +160,6 @@ if _use_aiter_gfx95:
     )
 
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
-        batched_gemm_afp4wfp4,
         batched_gemm_afp4wfp4_pre_quant,
         fused_flatten_mxfp4_quant,
         fused_rms_mxfp4_quant,
@@ -181,110 +180,22 @@ def _get_single_split_mxfp4_bmm_config(x: torch.Tensor, weight: torch.Tensor) ->
     return config
 
 
-def _apply_glm_mxfp4_bmm_config_override(
-    config: dict,
-    override: tuple[str, ...],
-    *,
-    operand: str,
-) -> dict:
-    if not override:
-        return config
-    if len(override) != 3:
-        raise ValueError(
-            f"{operand} MXFP4 BMM config must be BLOCK_SIZE_M,BLOCK_SIZE_N,"
-            f"BLOCK_SIZE_K; got {override!r}"
-        )
-    try:
-        block_m, block_n, block_k = (int(value) for value in override)
-    except ValueError as exc:
-        raise ValueError(
-            f"{operand} MXFP4 BMM config values must be integers; got {override!r}"
-        ) from exc
-
-    allowed_mn = {64, 128, 256}
-    allowed_k = {32, 64} if operand == "K" else {64, 128, 256, 512}
-    if block_m not in allowed_mn or block_n not in allowed_mn or block_k not in allowed_k:
-        raise ValueError(
-            f"illegal {operand} MXFP4 BMM config {(block_m, block_n, block_k)}; "
-            f"BLOCK_SIZE_M/N must be one of {sorted(allowed_mn)} and "
-            f"BLOCK_SIZE_K must be one of {sorted(allowed_k)}"
-        )
-
-    config.update(
-        BLOCK_SIZE_M=block_m,
-        BLOCK_SIZE_N=block_n,
-        BLOCK_SIZE_K=block_k,
-        NUM_KSPLIT=1,
-    )
-    return config
-
-
 def _get_glm_mxfp4_k_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
     config = _get_single_split_mxfp4_bmm_config(x, weight)
     # GLM's K-up has K=192. Larger blocks over-read its six E8M0 scale groups.
     config["BLOCK_SIZE_K"] = 64
-    return _apply_glm_mxfp4_bmm_config_override(
-        config,
-        envs.SGLANG_EXPERIMENTAL_MXFP4_MLA_K_BMM_CONFIG.get(),
-        operand="K",
-    )
+    return config
 
 
 def _get_glm_mxfp4_v_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
-    return _apply_glm_mxfp4_bmm_config_override(
-        _get_single_split_mxfp4_bmm_config(x, weight),
-        envs.SGLANG_EXPERIMENTAL_MXFP4_MLA_V_BMM_CONFIG.get(),
-        operand="V",
-    )
-
-
-def _get_glm_mxfp4_bmm_impl() -> str:
-    impl = envs.SGLANG_EXPERIMENTAL_MXFP4_MLA_BMM_IMPL.get().lower()
-    if impl not in {"a16", "a4w4"}:
-        raise ValueError(
-            "SGLANG_EXPERIMENTAL_MXFP4_MLA_BMM_IMPL must be 'a16' or 'a4w4'; "
-            f"got {impl!r}"
-        )
-    return impl
-
-
-def _quantize_mxfp4_bmm_activation(
-    x: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if x.ndim != 3 or x.shape[-1] % 32 != 0:
-        raise ValueError(
-            "MXFP4 BMM activation must have shape (B,M,K) with K divisible by 32; "
-            f"got {tuple(x.shape)}"
-        )
-    batch, tokens, k = x.shape
-    packed, scales = fused_flatten_mxfp4_quant(x)
-    return (
-        packed.view(batch, tokens, k // 2),
-        scales.view(batch, tokens, k // 32),
-    )
-
-
-def _run_prepacked_mxfp4_bmm(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    output: torch.Tensor,
-    config: dict,
-) -> None:
-    x_packed, x_scale = _quantize_mxfp4_bmm_activation(x)
-    config = config.copy()
-    # A4W4 receives packed K/2 bytes, while SPLITK_BLOCK_SIZE is expressed in
-    # logical FP4 elements. With NUM_KSPLIT=1 it must cover all of K.
-    config["SPLITK_BLOCK_SIZE"] = x.shape[-1]
-    batched_gemm_afp4wfp4(
-        x_packed,
-        weight,
-        x_scale,
-        weight_scale,
-        dtype=torch.bfloat16,
-        y=output,
-        config=config,
-    )
+    config = _get_single_split_mxfp4_bmm_config(x, weight)
+    # AITER's generic M>256 fallback uses BLOCK_SIZE_M=256. GLM's V-up shape
+    # has only N=256, and profiling shows M=128/K=128 keeps more CUs occupied.
+    # Preserve AITER's smaller-M buckets used by decode and short prefill.
+    if x.shape[1] > 256:
+        config["BLOCK_SIZE_M"] = 128
+        config["BLOCK_SIZE_K"] = 128
+    return config
 
 
 def _run_mxfp4_k_bmm(
@@ -294,21 +205,17 @@ def _run_mxfp4_k_bmm(
     output: torch.Tensor,
 ) -> None:
     if envs.SGLANG_USE_MXFP4_MLA_BMM.get():
-        config = _get_glm_mxfp4_k_bmm_config(x, weight)
-        if _get_glm_mxfp4_bmm_impl() == "a16":
-            batched_gemm_a16wfp4(
-                x,
-                weight,
-                weight_scale,
-                y=output,
-                config=config,
-                transpose_bm=False,
-                prequant=True,
-                y_scale=None,
-                dtype=torch.bfloat16,
-            )
-        else:
-            _run_prepacked_mxfp4_bmm(x, weight, weight_scale, output, config)
+        batched_gemm_a16wfp4(
+            x,
+            weight,
+            weight_scale,
+            y=output,
+            config=_get_glm_mxfp4_k_bmm_config(x, weight),
+            transpose_bm=False,
+            prequant=True,
+            y_scale=None,
+            dtype=torch.bfloat16,
+        )
         return
 
     batched_gemm_afp4wfp4_pre_quant(
@@ -327,23 +234,17 @@ def _run_mxfp4_v_bmm(
     output: torch.Tensor,
 ) -> torch.Tensor:
     if envs.SGLANG_USE_MXFP4_MLA_BMM.get():
-        config = _get_glm_mxfp4_v_bmm_config(x, weight)
-        if _get_glm_mxfp4_bmm_impl() == "a16":
-            return batched_gemm_a16wfp4(
-                x,
-                weight,
-                weight_scale,
-                y=output,
-                config=config,
-                transpose_bm=True,
-                prequant=True,
-                y_scale=None,
-                dtype=torch.bfloat16,
-            )
-        _run_prepacked_mxfp4_bmm(
-            x, weight, weight_scale, output.transpose(0, 1), config
+        return batched_gemm_a16wfp4(
+            x,
+            weight,
+            weight_scale,
+            y=output,
+            config=_get_glm_mxfp4_v_bmm_config(x, weight),
+            transpose_bm=True,
+            prequant=True,
+            y_scale=None,
+            dtype=torch.bfloat16,
         )
-        return output
 
     batched_gemm_afp4wfp4_pre_quant(
         x,
