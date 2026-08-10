@@ -73,6 +73,7 @@ class TestGlmMxfp4AbsorbedWeightSelection(CustomTestCase):
         self.assertIs(self_attn.w_scale, fp8_scale)
         self.assertEqual(self_attn.w_kc.stride(), (32, 1, 4))
         self.assertEqual(self_attn.w_vc.stride(), (16, 1, 8))
+        self.assertFalse(self_attn.use_mxfp4_mla_bmm)
 
     def test_flag_on_assigns_packed_weights_and_scales(self):
         loader, self_attn = _make_loader()
@@ -116,6 +117,55 @@ class TestGlmMxfp4AbsorbedWeightSelection(CustomTestCase):
         torch.testing.assert_close(
             self_attn.w_scale_v.transpose(-2, -1), w_scale_v.transpose(-2, -1)
         )
+        self.assertTrue(self_attn.use_mxfp4_mla_bmm)
+
+    def test_load_time_tuned_decision_survives_env_sanitization(self):
+        loader, self_attn = _make_loader()
+        packed_weights = (
+            torch.zeros(2, 2, 8, dtype=torch.uint8),
+            torch.zeros(2, 1, 8, dtype=torch.uint8),
+            torch.zeros(2, 2, 4, dtype=torch.uint8),
+            torch.zeros(2, 2, 1, dtype=torch.uint8),
+        )
+        with (
+            envs.SGLANG_USE_MXFP4_MLA_BMM.override(True),
+            mock.patch.object(weight_loader, "_use_aiter_gfx95", True),
+            mock.patch.object(
+                weight_loader,
+                "quark_post_load_weights",
+                create=True,
+                return_value=packed_weights,
+            ),
+        ):
+            loader.post_load_weights(
+                weight_names=["model.layers.0.self_attn.kv_b_proj"]
+            )
+
+        x = torch.randn(2, 3, 8, dtype=torch.bfloat16)
+        output = torch.empty(2, 3, 4, dtype=torch.bfloat16)
+        with (
+            envs.SGLANG_USE_MXFP4_MLA_BMM.override(False),
+            mock.patch.object(
+                forward_mla,
+                "_get_mxfp4_bmm_config",
+                create=True,
+                return_value=({"NUM_KSPLIT": 1}, None),
+            ),
+            mock.patch.object(forward_mla, "_run_tuned_mxfp4_bmm") as tuned_bmm,
+            mock.patch.object(
+                forward_mla, "batched_gemm_afp4wfp4_pre_quant", create=True
+            ) as prequant_bmm,
+        ):
+            forward_mla._run_mxfp4_k_bmm(
+                x,
+                self_attn.w_kc.transpose(-2, -1),
+                self_attn.w_scale_k.transpose(-2, -1),
+                output,
+                use_tuned_config=self_attn.use_mxfp4_mla_bmm,
+            )
+
+        tuned_bmm.assert_called_once()
+        prequant_bmm.assert_not_called()
 
 
 class TestMxfp4KDispatch(CustomTestCase):
@@ -125,13 +175,12 @@ class TestMxfp4KDispatch(CustomTestCase):
         scale = torch.zeros(2, 4, 1, dtype=torch.uint8)
         output = torch.empty(2, 3, 4, dtype=torch.bfloat16)
 
-        with (
-            envs.SGLANG_USE_MXFP4_MLA_BMM.override(False),
-            mock.patch.object(
-                forward_mla, "batched_gemm_afp4wfp4_pre_quant", create=True
-            ) as prequant_bmm,
-        ):
-            result = forward_mla._run_mxfp4_k_bmm(x, weight, scale, output)
+        with mock.patch.object(
+            forward_mla, "batched_gemm_afp4wfp4_pre_quant", create=True
+        ) as prequant_bmm:
+            result = forward_mla._run_mxfp4_k_bmm(
+                x, weight, scale, output, use_tuned_config=False
+            )
 
         prequant_bmm.assert_called_once_with(x, weight, scale, torch.bfloat16, output)
         self.assertIsNone(result)
@@ -144,21 +193,20 @@ class TestMxfp4KDispatch(CustomTestCase):
         tuned_config = {"BLOCK_SIZE_K": 256, "NUM_KSPLIT": 4}
 
         with (
-            envs.SGLANG_USE_MXFP4_MLA_BMM.override(True),
             mock.patch.object(
                 forward_mla,
                 "_get_mxfp4_bmm_config",
                 create=True,
                 return_value=(tuned_config, None),
             ),
-            mock.patch.object(
-                forward_mla, "_run_tuned_mxfp4_bmm"
-            ) as tuned_bmm,
+            mock.patch.object(forward_mla, "_run_tuned_mxfp4_bmm") as tuned_bmm,
             mock.patch.object(
                 forward_mla, "batched_gemm_afp4wfp4_pre_quant", create=True
             ) as prequant_bmm,
         ):
-            result = forward_mla._run_mxfp4_k_bmm(x, weight, scale, output)
+            result = forward_mla._run_mxfp4_k_bmm(
+                x, weight, scale, output, use_tuned_config=True
+            )
 
         args, kwargs = tuned_bmm.call_args
         self.assertIs(args[0], x)
@@ -180,9 +228,7 @@ class TestMxfp4KDispatch(CustomTestCase):
         output = torch.empty(2, 3, 4, dtype=torch.bfloat16)
         expected = torch.bmm(x, weight.transpose(-2, -1))
 
-        def reference_bmm(
-            x, weight, _scale, output, _config, *, transpose_bm
-        ):
+        def reference_bmm(x, weight, _scale, output, _config, *, transpose_bm):
             result = torch.bmm(x, weight.transpose(-2, -1))
             if transpose_bm:
                 result = result.transpose(0, 1)
@@ -190,7 +236,6 @@ class TestMxfp4KDispatch(CustomTestCase):
             return output
 
         with (
-            envs.SGLANG_USE_MXFP4_MLA_BMM.override(True),
             mock.patch.object(
                 forward_mla,
                 "_get_mxfp4_bmm_config",
@@ -203,7 +248,9 @@ class TestMxfp4KDispatch(CustomTestCase):
                 side_effect=reference_bmm,
             ),
         ):
-            result = forward_mla._run_mxfp4_k_bmm(x, weight, scale, output)
+            result = forward_mla._run_mxfp4_k_bmm(
+                x, weight, scale, output, use_tuned_config=True
+            )
 
         self.assertIsNone(result)
         torch.testing.assert_close(output, expected)
@@ -263,15 +310,14 @@ class TestMxfp4VDispatch(CustomTestCase):
     def test_flag_off_uses_existing_prequant_kernel(self):
         x, weight, scale, output = self._inputs()
         with (
-            envs.SGLANG_USE_MXFP4_MLA_BMM.override(False),
             mock.patch.object(
                 forward_mla, "batched_gemm_afp4wfp4_pre_quant", create=True
             ) as prequant_bmm,
-            mock.patch.object(
-                forward_mla, "_run_tuned_mxfp4_bmm"
-            ) as tuned_bmm,
+            mock.patch.object(forward_mla, "_run_tuned_mxfp4_bmm") as tuned_bmm,
         ):
-            result = forward_mla._run_mxfp4_v_bmm(x, weight, scale, output)
+            result = forward_mla._run_mxfp4_v_bmm(
+                x, weight, scale, output, use_tuned_config=False
+            )
         args, kwargs = prequant_bmm.call_args
         self.assertEqual(kwargs, {})
         self.assertIs(args[0], x)
@@ -288,7 +334,6 @@ class TestMxfp4VDispatch(CustomTestCase):
         x, weight, scale, output = self._inputs()
         tuned_config = {"BLOCK_SIZE_K": 256, "NUM_KSPLIT": 4}
         with (
-            envs.SGLANG_USE_MXFP4_MLA_BMM.override(True),
             mock.patch.object(
                 forward_mla,
                 "_get_mxfp4_bmm_config",
@@ -304,7 +349,9 @@ class TestMxfp4VDispatch(CustomTestCase):
                 forward_mla, "batched_gemm_afp4wfp4_pre_quant", create=True
             ) as prequant_bmm,
         ):
-            result = forward_mla._run_mxfp4_v_bmm(x, weight, scale, output)
+            result = forward_mla._run_mxfp4_v_bmm(
+                x, weight, scale, output, use_tuned_config=True
+            )
         args, kwargs = tuned_bmm.call_args
         self.assertIs(args[0], x)
         self.assertIs(args[1], weight)
@@ -326,9 +373,7 @@ class TestMxfp4VDispatch(CustomTestCase):
         output = torch.empty(3, 2, 4, dtype=torch.bfloat16)
         expected = torch.bmm(x, weight.transpose(-2, -1)).transpose(0, 1)
 
-        def reference_bmm(
-            x, weight, _scale, output, _config, *, transpose_bm
-        ):
+        def reference_bmm(x, weight, _scale, output, _config, *, transpose_bm):
             result = torch.bmm(x, weight.transpose(-2, -1))
             if transpose_bm:
                 result = result.transpose(0, 1)
@@ -336,7 +381,6 @@ class TestMxfp4VDispatch(CustomTestCase):
             return output
 
         with (
-            envs.SGLANG_USE_MXFP4_MLA_BMM.override(True),
             mock.patch.object(
                 forward_mla,
                 "_get_mxfp4_bmm_config",
@@ -349,7 +393,9 @@ class TestMxfp4VDispatch(CustomTestCase):
                 side_effect=reference_bmm,
             ),
         ):
-            result = forward_mla._run_mxfp4_v_bmm(x, weight, scale, output)
+            result = forward_mla._run_mxfp4_v_bmm(
+                x, weight, scale, output, use_tuned_config=True
+            )
 
         self.assertIs(result, output)
         torch.testing.assert_close(result, expected)

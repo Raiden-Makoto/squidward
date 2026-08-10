@@ -236,8 +236,10 @@ def _run_mxfp4_k_bmm(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     output: torch.Tensor,
+    *,
+    use_tuned_config: bool,
 ) -> None:
-    if envs.SGLANG_USE_MXFP4_MLA_BMM.get():
+    if use_tuned_config:
         _run_tuned_mxfp4_bmm(
             x,
             weight,
@@ -262,8 +264,10 @@ def _run_mxfp4_v_bmm(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     output: torch.Tensor,
+    *,
+    use_tuned_config: bool,
 ) -> torch.Tensor:
-    if envs.SGLANG_USE_MXFP4_MLA_BMM.get():
+    if use_tuned_config:
         return _run_tuned_mxfp4_bmm(
             x,
             weight,
@@ -800,6 +804,7 @@ class DeepseekMLAForwardMixin:
                         self.w_kc.transpose(-2, -1),
                         self.w_scale_k.transpose(-2, -1),
                         q_nope_out,
+                        use_tuned_config=self.use_mxfp4_mla_bmm,
                     )
                 else:
                     if (
@@ -1246,6 +1251,7 @@ class DeepseekMLAForwardMixin:
                     self.w_vc.transpose(-2, -1),
                     self.w_scale_v.transpose(-2, -1),
                     _bmm_buf,
+                    use_tuned_config=self.use_mxfp4_mla_bmm,
                 )
                 attn_bmm_output = _bmm_buf
             else:
