@@ -1951,7 +1951,10 @@ class DeepseekV2AttentionMLA(
         self.w_scale_k = None
         self.w_scale_v = None
         self.use_deep_gemm_bmm = False
-        self.use_mxfp4_mla_bmm = False
+        # Model identity is stable across worker startup and environment cleanup.
+        # The uint8 dtype gate at the call sites still decides whether this path
+        # actually runs; this marker only selects GLM's shape-tuned tile configs.
+        self.use_mxfp4_mla_bmm = config.model_type == "glm_moe_dsa"
 
         self.current_attention_backend = (
             None  # Attention backend used by current forward batch

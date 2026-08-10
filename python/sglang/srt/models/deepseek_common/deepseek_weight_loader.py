@@ -639,10 +639,6 @@ class DeepseekV2WeightLoaderMixin:
             use_mxfp4_mla_bmm = (
                 is_glm_bf16_absorbed_weight and envs.SGLANG_USE_MXFP4_MLA_BMM.get()
             )
-            # Worker startup may sanitize SGLANG_* variables after model loading.
-            # Preserve the resolved backend choice on the module instead of
-            # re-reading process environment from every attention forward.
-            self_attn.use_mxfp4_mla_bmm = use_mxfp4_mla_bmm
             if use_mxfp4_mla_bmm:
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
@@ -693,18 +689,6 @@ class DeepseekV2WeightLoaderMixin:
                     )
                     self_attn.w_vc = (
                         self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
-                    )
-                if (
-                    _use_aiter_gfx95
-                    and self.config.architectures
-                    and self.config.architectures[0] == "GlmMoeDsaForCausalLM"
-                ):
-                    # The bound format is authoritative. Some loader paths already
-                    # materialize packed uint8 weights before this hook, so the
-                    # earlier bf16-only conversion predicate cannot determine
-                    # whether the tuned A16WFP4 dispatch should run.
-                    self_attn.use_mxfp4_mla_bmm = (
-                        self_attn.w_kc.dtype == torch.uint8
                     )
             else:
                 num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]

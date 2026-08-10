@@ -73,7 +73,6 @@ class TestGlmMxfp4AbsorbedWeightSelection(CustomTestCase):
         self.assertIs(self_attn.w_scale, fp8_scale)
         self.assertEqual(self_attn.w_kc.stride(), (32, 1, 4))
         self.assertEqual(self_attn.w_vc.stride(), (16, 1, 8))
-        self.assertFalse(self_attn.use_mxfp4_mla_bmm)
 
     def test_flag_on_assigns_packed_weights_and_scales(self):
         loader, self_attn = _make_loader()
@@ -117,55 +116,6 @@ class TestGlmMxfp4AbsorbedWeightSelection(CustomTestCase):
         torch.testing.assert_close(
             self_attn.w_scale_v.transpose(-2, -1), w_scale_v.transpose(-2, -1)
         )
-        self.assertTrue(self_attn.use_mxfp4_mla_bmm)
-
-    def test_load_time_tuned_decision_survives_env_sanitization(self):
-        loader, self_attn = _make_loader()
-        packed_weights = (
-            torch.zeros(2, 2, 8, dtype=torch.uint8),
-            torch.zeros(2, 1, 8, dtype=torch.uint8),
-            torch.zeros(2, 2, 4, dtype=torch.uint8),
-            torch.zeros(2, 2, 1, dtype=torch.uint8),
-        )
-        with (
-            envs.SGLANG_USE_MXFP4_MLA_BMM.override(True),
-            mock.patch.object(weight_loader, "_use_aiter_gfx95", True),
-            mock.patch.object(
-                weight_loader,
-                "quark_post_load_weights",
-                create=True,
-                return_value=packed_weights,
-            ),
-        ):
-            loader.post_load_weights(
-                weight_names=["model.layers.0.self_attn.kv_b_proj"]
-            )
-
-        x = torch.randn(2, 3, 8, dtype=torch.bfloat16)
-        output = torch.empty(2, 3, 4, dtype=torch.bfloat16)
-        with (
-            envs.SGLANG_USE_MXFP4_MLA_BMM.override(False),
-            mock.patch.object(
-                forward_mla,
-                "_get_mxfp4_bmm_config",
-                create=True,
-                return_value=({"NUM_KSPLIT": 1}, None),
-            ),
-            mock.patch.object(forward_mla, "_run_tuned_mxfp4_bmm") as tuned_bmm,
-            mock.patch.object(
-                forward_mla, "batched_gemm_afp4wfp4_pre_quant", create=True
-            ) as prequant_bmm,
-        ):
-            forward_mla._run_mxfp4_k_bmm(
-                x,
-                self_attn.w_kc.transpose(-2, -1),
-                self_attn.w_scale_k.transpose(-2, -1),
-                output,
-                use_tuned_config=self_attn.use_mxfp4_mla_bmm,
-            )
-
-        tuned_bmm.assert_called_once()
-        prequant_bmm.assert_not_called()
 
 
 class TestMxfp4KDispatch(CustomTestCase):
