@@ -3,7 +3,7 @@ description:
 alwaysApply: true
 ---
 
-# Known Remote GPU Boxes
+# Known Remote GPU Box
 
 Remote GPU boxes in use. SSH form:
 `ssh -o ConnectTimeout=25 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null macui@<HOST> '<cmd>'`
@@ -14,12 +14,6 @@ Container exec: `docker exec <CONTAINER> bash -lc "..."`. Always export
 **Container name does NOT imply workstream — always verify the running container, its
 branch, and its live server before acting.** A box can host several containers on
 different branches.
-
-## gbt box — gfx950 / CDNA4 (MI350X/MI355X, mi35x)  — NOT VERIFIED
-- Host: `gbt350-odcdh2-b13-1.png-odc.dcgpu`
-- gfx950, fp8 **e4m3fn**. Not used for GLM-5.2 since the move to m12-17, and the
-  container/image details here are unverified — enumerate `docker ps` and confirm
-  the mounts before relying on this box.
 
 ## m12-17 box — gfx950 / CDNA4 (MI355X, mi35x)  ← ACTIVE GLM-5.2 BOX
 - Host: `smci355-ccs-aus-m12-17.cs-aus.dcgpu`, gfx950, fp8 **e4m3fn**, 256 CUs, 160 KB LDS/CU.
