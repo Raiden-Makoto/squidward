@@ -694,6 +694,18 @@ class DeepseekV2WeightLoaderMixin:
                     self_attn.w_vc = (
                         self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
                     )
+                if (
+                    _use_aiter_gfx95
+                    and self.config.architectures
+                    and self.config.architectures[0] == "GlmMoeDsaForCausalLM"
+                ):
+                    # The bound format is authoritative. Some loader paths already
+                    # materialize packed uint8 weights before this hook, so the
+                    # earlier bf16-only conversion predicate cannot determine
+                    # whether the tuned A16WFP4 dispatch should run.
+                    self_attn.use_mxfp4_mla_bmm = (
+                        self_attn.w_kc.dtype == torch.uint8
+                    )
             else:
                 num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
                 num_tiles_n = self_attn.v_head_dim // weight_block_size[0]
