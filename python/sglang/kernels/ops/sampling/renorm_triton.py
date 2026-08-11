@@ -132,7 +132,7 @@ def top_p_renorm_probs_triton_scale_fast(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
 ) -> torch.Tensor:
-    """Topk64 fast selection with a pre-normalized dense scale/write pass."""
+    """Topk32 fast selection with a pre-normalized dense scale/write pass."""
     probs, top_ps = _prepare_top_p(probs, top_p)
     if probs.shape[0] == 0:
         return probs.clone()
@@ -160,7 +160,7 @@ def top_p_renorm_probs_triton_scatter_fast(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
 ) -> torch.Tensor:
-    """Topk64 fast selection with zero-fill and normalized prefix scatter."""
+    """Topk32 fast selection with zero-fill and normalized prefix scatter."""
     probs, top_ps = _prepare_top_p(probs, top_p)
     if probs.shape[0] == 0:
         return probs.clone()

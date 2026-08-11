@@ -163,7 +163,7 @@ def run_capture_bench(args, aot) -> None:
     )
     print(
         f"{'bs':>5} {'rows':>6} {'nuc_p50':>8} {'nuc_max':>8} {'ovf':>5} "
-        f"{'old':>8} {'select64':>8} {'scale':>8} {'scatter':>8} "
+        f"{'old':>8} {'select32':>8} {'scale':>8} {'scatter':>8} "
         f"{'scale_all':>9} {'scatter_all':>11}"
     )
 

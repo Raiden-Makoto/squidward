@@ -264,7 +264,7 @@ class TestTritonTopPFastPath(CustomTestCase):
     def test_fast_nucleus_sizes(self):
         from sglang.kernels.ops.sampling.renorm import top_p_fast_prefix
 
-        for nucleus_size in (1, 15, 63):
+        for nucleus_size in (1, 15, 31):
             with self.subTest(nucleus_size=nucleus_size):
                 probs, top_ps = self._distribution_with_nucleus(nucleus_size)
                 *_, fast_path = top_p_fast_prefix(probs, top_ps)
@@ -274,7 +274,7 @@ class TestTritonTopPFastPath(CustomTestCase):
     def test_boundary_and_cross_prefix_ties_fall_back(self):
         from sglang.kernels.ops.sampling.renorm import top_p_fast_prefix
 
-        boundary_probs, boundary_top_ps = self._distribution_with_nucleus(64)
+        boundary_probs, boundary_top_ps = self._distribution_with_nucleus(32)
         tied_probs = torch.zeros((1, 128), dtype=torch.float32, device=self.device)
         tied_probs[:, :70] = 1.0 / 70
         tied_top_ps = torch.tensor([0.5], device=self.device)

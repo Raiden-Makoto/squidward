@@ -27,7 +27,7 @@ import torch
 # only starts paying beyond that (2.78ms at 8192). Widening the prefix to the end
 # of that plateau is close to free and keeps rows off the 13.4ms sort.
 _TOP_P_PREFIX = 4096
-_TOP_P_FAST_PREFIX = 64
+_TOP_P_FAST_PREFIX = 32
 
 
 def per_row_threshold(
