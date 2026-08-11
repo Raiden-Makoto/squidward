@@ -292,15 +292,13 @@ def make_captured_inputs(requests, batch_size: int):
             "retrive_index": torch.arange(
                 batch_size * num_draft_tokens, dtype=torch.int64, device=DEVICE
             ).view(batch_size, num_draft_tokens),
-            "retrive_next_token": torch.stack(
-                [x["next_token"] for x in selected]
-            ).to(DEVICE),
+            "retrive_next_token": torch.stack([x["next_token"] for x in selected]).to(
+                DEVICE
+            ),
             "retrive_next_sibling": torch.stack(
                 [x["next_sibling"] for x in selected]
             ).to(DEVICE),
-            "uniform_samples": torch.stack([x["coins"] for x in selected]).to(
-                DEVICE
-            ),
+            "uniform_samples": torch.stack([x["coins"] for x in selected]).to(DEVICE),
             "uniform_samples_for_final_sampling": torch.stack(
                 [x["final_coin"] for x in selected]
             ).to(DEVICE),
@@ -334,8 +332,7 @@ def run_capture_bench(args, aot) -> None:
         "rows": [],
     }
     print(
-        f"{output['device']}  capture_requests={len(requests)}  "
-        f"iters={args.iters}"
+        f"{output['device']}  capture_requests={len(requests)}  " f"iters={args.iters}"
     )
     print(
         f"{'bs':>5} {'tree_p50':>10} {'tree_p95':>10} {'accept':>8} "
@@ -461,8 +458,10 @@ def main():
 
     if args.calibrate:
         print(f"{torch.cuda.get_device_name(0)}   vocab={args.vocab}")
-        print(f"{'logit_scale':>12} {'top1_prob':>10} {'width=1':>9} {'width=2':>9} "
-              f"{'width=4':>9}   (accept_len, ndt=8, bs=128)")
+        print(
+            f"{'logit_scale':>12} {'top1_prob':>10} {'width=1':>9} {'width=2':>9} "
+            f"{'width=4':>9}   (accept_len, ndt=8, bs=128)"
+        )
         for scale in (6.0, 9.0, 12.0, 16.0, 20.0):
             row = f"{scale:>12.1f}"
             top1 = None
@@ -488,9 +487,13 @@ def main():
         return
 
     aot = load_aot_kernel()
-    print(f"{torch.cuda.get_device_name(0)}   vocab={args.vocab}   iters={args.iters}"
-          f"   agreement={args.agreement}")
-    print(f"AOT tree kernel: {'available' if aot else 'unavailable (expected on ROCm)'}")
+    print(
+        f"{torch.cuda.get_device_name(0)}   vocab={args.vocab}   iters={args.iters}"
+        f"   agreement={args.agreement}"
+    )
+    print(
+        f"AOT tree kernel: {'available' if aot else 'unavailable (expected on ROCm)'}"
+    )
 
     header = f"{'bs':>5} {'ndt':>4} {'width':>6} {'depth':>6} {'triton(ms)':>11}"
     if aot:

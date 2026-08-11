@@ -25,8 +25,8 @@ import triton
 
 from sglang.kernels.ops.sampling.renorm import (
     _TOP_P_PREFIX,
-    top_p_pivots,
     top_k_renorm_probs_torch,
+    top_p_pivots,
     top_p_renorm_probs_torch,
 )
 from sglang.kernels.ops.sampling.renorm_triton import (
@@ -158,9 +158,7 @@ def run_capture_bench(args, aot) -> None:
         row_sums = torch.empty(rows, device=DEV, dtype=torch.float32)
         out = torch.empty_like(probs)
 
-        pivot_samples = latency_samples(
-            lambda: top_p_pivots(probs, top_ps), args.iters
-        )
+        pivot_samples = latency_samples(lambda: top_p_pivots(probs, top_ps), args.iters)
         sum_samples = latency_samples(
             lambda: _masked_row_sum_kernel[grid](
                 probs,
@@ -255,7 +253,9 @@ def describe(probs: torch.Tensor, top_p: float, sample_rows: int = 64):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vocab", type=int, default=151936, help="GLM-5.2 vocabulary")
-    parser.add_argument("--rows", type=int, default=1536, help="bs 256 x 6 draft tokens")
+    parser.add_argument(
+        "--rows", type=int, default=1536, help="bs 256 x 6 draft tokens"
+    )
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=20)
@@ -281,8 +281,12 @@ def main() -> None:
         run_capture_bench(args, aot)
         return
     name = torch.cuda.get_device_name(0)
-    print(f"{name}  vocab={args.vocab}  rows={args.rows}  top_p={args.top_p}  top_k={args.top_k}")
-    print(f"AOT renorm kernel: {'available' if aot else 'unavailable (expected on ROCm)'}")
+    print(
+        f"{name}  vocab={args.vocab}  rows={args.rows}  top_p={args.top_p}  top_k={args.top_k}"
+    )
+    print(
+        f"AOT renorm kernel: {'available' if aot else 'unavailable (expected on ROCm)'}"
+    )
     print(f"prefix={_TOP_P_PREFIX} (nucleus above this falls back to a full sort)\n")
 
     header = (
@@ -316,7 +320,6 @@ def main() -> None:
             row += f" {ka:>7.3f} {pa:>7.3f}"
         print(row)
 
-        del probs
         torch.cuda.empty_cache()
 
 
