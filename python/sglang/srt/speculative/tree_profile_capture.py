@@ -10,7 +10,7 @@ import torch
 
 from sglang.srt.environ import envs
 
-_CAPTURE: Optional["TreeProfileCapture"] = None
+_CAPTURE: Optional[TreeProfileCapture] = None
 
 
 def _cpu_copy(tensor: torch.Tensor) -> torch.Tensor:
@@ -167,9 +167,7 @@ class TreeProfileCapture:
         flat_nucleus_input = nucleus_input.flatten(0, 1)
         top_ps = pending.top_ps
         if isinstance(top_ps, torch.Tensor):
-            row_top_ps = top_ps.reshape(-1).repeat_interleave(
-                pending.num_draft_tokens
-            )
+            row_top_ps = top_ps.reshape(-1).repeat_interleave(pending.num_draft_tokens)
         else:
             row_top_ps = torch.full(
                 (flat_nucleus_input.shape[0],), float(top_ps), dtype=torch.float32
@@ -194,17 +192,13 @@ class TreeProfileCapture:
             "max_token_probability": max_token_probability.tolist(),
             "nucleus_size": nucleus_sizes.tolist(),
             "prefix_overflow": (nucleus_sizes > 4096).tolist(),
-            "acceptance_length": _cpu_copy(
-                accept_token_num[request_indices]
-            ).tolist(),
+            "acceptance_length": _cpu_copy(accept_token_num[request_indices]).tolist(),
         }
         record = {
             "metadata": metadata,
             "softmax_probs": pending.softmax_probs,
             "top_p_input_probs": nucleus_input,
-            "renormalized_probs": _cpu_copy(
-                renormalized_probs[request_indices]
-            ),
+            "renormalized_probs": _cpu_copy(renormalized_probs[request_indices]),
             "candidates": pending.candidates,
             "retrieve_index": pending.retrieve_index,
             "retrieve_next_token": pending.retrieve_next_token,
