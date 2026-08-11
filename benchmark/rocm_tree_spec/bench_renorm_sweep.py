@@ -120,6 +120,35 @@ def load_capture_rows(capture_dir: Path):
     return tuple(torch.cat(x) for x in (softmax, probs, expected, top_ps, top_ks))
 
 
+def top_p_selection_variant(
+    probs: torch.Tensor,
+    top_ps: torch.Tensor,
+    *,
+    prefix: int,
+    sorted_topk: bool,
+):
+    prefix = min(prefix, probs.shape[1])
+    values, _ = torch.topk(probs, prefix, dim=-1, sorted=sorted_topk)
+    if not sorted_topk:
+        values = values.sort(dim=-1, descending=True).values
+    budget = probs.sum(dim=-1) - (1.0 - top_ps)
+    within = (values.cumsum(dim=-1) - values) <= budget.unsqueeze(1)
+    position = (within.sum(dim=-1) - 1).clamp(min=0)
+    pivots = values.gather(1, position.unsqueeze(1)).squeeze(1)
+    normalizers = torch.where(
+        values >= pivots.unsqueeze(1), values, torch.zeros_like(values)
+    ).sum(dim=-1)
+    if prefix == probs.shape[1]:
+        fast_path = normalizers > 0
+    else:
+        fast_path = (
+            ~within[:, -1]
+            & (values[:, -1] < pivots)
+            & (normalizers > 0)
+        )
+    return pivots, normalizers, fast_path
+
+
 def run_capture_bench(args, aot) -> None:
     captured_softmax, captured, captured_expected, captured_top_ps, captured_top_ks = (
         load_capture_rows(args.capture_dir)
@@ -263,6 +292,32 @@ def run_capture_bench(args, aot) -> None:
         row["scatter_fast_speedup"] = (
             row["baseline_top_p_p50_ms"] / row["scatter_fast_top_p_p50_ms"]
         )
+        row["selection_variants"] = {}
+        for prefix in (16, 32, 64):
+            for sorted_topk in (True, False):
+                name = f"topk{prefix}_{'sorted' if sorted_topk else 'unsorted_sort'}"
+                variant_samples = latency_samples(
+                    lambda prefix=prefix, sorted_topk=sorted_topk: (
+                        top_p_selection_variant(
+                            probs,
+                            top_ps,
+                            prefix=prefix,
+                            sorted_topk=sorted_topk,
+                        )
+                    ),
+                    args.iters,
+                )
+                *_, variant_fast_path = top_p_selection_variant(
+                    probs,
+                    top_ps,
+                    prefix=prefix,
+                    sorted_topk=sorted_topk,
+                )
+                row["selection_variants"][name] = {
+                    "p50_ms": statistics.median(variant_samples),
+                    "p95_ms": percentile(variant_samples, 0.95),
+                    "fast_path_rate": float(variant_fast_path.float().mean()),
+                }
         top_k_is_active = bool((top_ks < probs.shape[1]).any())
         if top_k_is_active:
             top_k_samples = latency_samples(
@@ -292,6 +347,20 @@ def run_capture_bench(args, aot) -> None:
 
     if args.output_json:
         args.output_json.write_text(json.dumps(output, indent=2))
+
+    print("\nselection variants (p50 ms / fast-path rate)")
+    print(
+        f"{'bs':>5} {'k16 sorted':>14} {'k16 unsorted':>14} "
+        f"{'k32 sorted':>14} {'k32 unsorted':>14} "
+        f"{'k64 sorted':>14} {'k64 unsorted':>14}"
+    )
+    for row in output["rows"]:
+        fields = []
+        for prefix in (16, 32, 64):
+            for suffix in ("sorted", "unsorted_sort"):
+                value = row["selection_variants"][f"topk{prefix}_{suffix}"]
+                fields.append(f"{value['p50_ms']:.3f}/{value['fast_path_rate']:.0%}")
+        print(f"{row['batch_size']:>5} " + " ".join(f"{x:>14}" for x in fields))
 
 
 def describe(probs: torch.Tensor, top_p: float, sample_rows: int = 64):
