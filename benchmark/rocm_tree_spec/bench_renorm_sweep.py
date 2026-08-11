@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import time
 from pathlib import Path
 
 import torch
@@ -99,6 +100,17 @@ def latency_samples(fn, iters: int) -> list[float]:
 def percentile(samples: list[float], fraction: float) -> float:
     ordered = sorted(samples)
     return ordered[min(int(len(ordered) * fraction), len(ordered) - 1)]
+
+
+def wall_latency_samples(fn, iters: int) -> list[float]:
+    for _ in range(3):
+        fn()
+    samples = []
+    for _ in range(iters):
+        start = time.perf_counter()
+        fn()
+        samples.append((time.perf_counter() - start) * 1000)
+    return samples
 
 
 def load_capture_rows(capture_dir: Path):
@@ -185,6 +197,29 @@ def run_capture_bench(args, aot) -> None:
             top_p_fast_prefix(probs, top_ps)
         )
         fast_path_rate = float(fast_path.float().mean())
+        row_totals = probs.sum(dim=-1)
+        topk32_values, _ = torch.topk(probs, 32, dim=-1, sorted=True)
+
+        def prefix_math():
+            budget = row_totals - (1.0 - top_ps)
+            within = (
+                topk32_values.cumsum(dim=-1) - topk32_values
+            ) <= budget.unsqueeze(1)
+            position = (within.sum(dim=-1) - 1).clamp(min=0)
+            candidate_pivots = topk32_values.gather(
+                1, position.unsqueeze(1)
+            ).squeeze(1)
+            candidate_normalizers = torch.where(
+                topk32_values >= candidate_pivots.unsqueeze(1),
+                topk32_values,
+                torch.zeros_like(topk32_values),
+            ).sum(dim=-1)
+            return (
+                ~within[:, -1]
+                & (topk32_values[:, -1] < candidate_pivots)
+                & (candidate_normalizers > 0)
+            )
+
         num_chunks = triton.cdiv(probs.shape[1], _BLOCK_SIZE)
         grid = (rows, num_chunks)
         partial = torch.empty((rows, num_chunks), device=DEV, dtype=torch.float32)
@@ -223,6 +258,17 @@ def run_capture_bench(args, aot) -> None:
         )
         fast_selection_samples = latency_samples(
             lambda: top_p_fast_prefix(probs, top_ps), args.iters
+        )
+        row_sum_samples = latency_samples(lambda: probs.sum(dim=-1), args.iters)
+        topk32_samples = latency_samples(
+            lambda: torch.topk(probs, 32, dim=-1, sorted=True), args.iters
+        )
+        prefix_math_samples = latency_samples(prefix_math, args.iters)
+        fallback_check_samples = latency_samples(
+            lambda: fast_path.all(), args.iters
+        )
+        fallback_sync_wall_samples = wall_latency_samples(
+            lambda: bool(fast_path.all()), args.iters
         )
         fast_scale_samples = latency_samples(
             lambda: _masked_scale_kernel[grid](
@@ -275,6 +321,13 @@ def run_capture_bench(args, aot) -> None:
             "baseline_top_p_p50_ms": statistics.median(full_samples),
             "baseline_top_p_p95_ms": percentile(full_samples, 0.95),
             "fast_prefix_p50_ms": statistics.median(fast_selection_samples),
+            "row_sum_p50_ms": statistics.median(row_sum_samples),
+            "topk32_p50_ms": statistics.median(topk32_samples),
+            "prefix_math_p50_ms": statistics.median(prefix_math_samples),
+            "fallback_check_p50_ms": statistics.median(fallback_check_samples),
+            "fallback_sync_wall_p50_ms": statistics.median(
+                fallback_sync_wall_samples
+            ),
             "fast_scale_apply_p50_ms": statistics.median(fast_scale_samples),
             "fast_scatter_apply_p50_ms": statistics.median(fast_scatter_samples),
             "scale_fast_top_p_p50_ms": statistics.median(scale_full_samples),
@@ -357,6 +410,21 @@ def run_capture_bench(args, aot) -> None:
                 value = row["selection_variants"][f"topk{prefix}_{suffix}"]
                 fields.append(f"{value['p50_ms']:.3f}/{value['fast_path_rate']:.0%}")
         print(f"{row['batch_size']:>5} " + " ".join(f"{x:>14}" for x in fields))
+
+    print("\ntopk32 selection breakdown (p50 ms)")
+    print(
+        f"{'bs':>5} {'row sum':>10} {'torch.topk':>10} {'prefix math':>12} "
+        f"{'GPU all':>10} {'CPU sync':>10} {'combined':>10}"
+    )
+    for row in output["rows"]:
+        print(
+            f"{row['batch_size']:>5} {row['row_sum_p50_ms']:>10.3f} "
+            f"{row['topk32_p50_ms']:>10.3f} "
+            f"{row['prefix_math_p50_ms']:>12.3f} "
+            f"{row['fallback_check_p50_ms']:>10.3f} "
+            f"{row['fallback_sync_wall_p50_ms']:>10.3f} "
+            f"{row['fast_prefix_p50_ms']:>10.3f}"
+        )
 
 
 def describe(probs: torch.Tensor, top_p: float, sample_rows: int = 64):
