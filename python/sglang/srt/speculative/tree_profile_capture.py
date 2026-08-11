@@ -229,8 +229,14 @@ def get_tree_profile_capture() -> Optional[TreeProfileCapture]:
     global _CAPTURE
 
     output_dir = envs.SGLANG_DEBUG_SPEC_PROBS_CAPTURE_DIR.get()
+    arm_file = envs.SGLANG_DEBUG_SPEC_PROBS_CAPTURE_ARM_FILE.get()
     max_rows = envs.SGLANG_DEBUG_SPEC_PROBS_CAPTURE_MAX_ROWS.get()
-    if not output_dir or max_rows <= 0 or not _is_primary_process():
+    if (
+        not output_dir
+        or (arm_file and not Path(arm_file).exists())
+        or max_rows <= 0
+        or not _is_primary_process()
+    ):
         return None
     if _CAPTURE is None:
         _CAPTURE = TreeProfileCapture(output_dir, max_rows)

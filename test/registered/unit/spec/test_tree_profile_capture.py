@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.speculative import tree_profile_capture
 from sglang.srt.speculative.tree_profile_capture import TreeProfileCapture
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -79,6 +81,24 @@ class TestTreeProfileCapture(CustomTestCase):
             ]
             self.assertEqual([row["call_index"] for row in manifest], [0, 1])
             self.assertEqual([row["batch_bucket"] for row in manifest], [4, 4])
+
+    def test_arm_file_delays_capture_initialization(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "output"
+            arm_file = Path(temp_dir) / "capture.arm"
+            tree_profile_capture._CAPTURE = None
+            try:
+                with (
+                    envs.SGLANG_DEBUG_SPEC_PROBS_CAPTURE_DIR.override(str(output_dir)),
+                    envs.SGLANG_DEBUG_SPEC_PROBS_CAPTURE_ARM_FILE.override(str(arm_file)),
+                ):
+                    self.assertIsNone(tree_profile_capture.get_tree_profile_capture())
+                    arm_file.touch()
+                    self.assertIsNotNone(
+                        tree_profile_capture.get_tree_profile_capture()
+                    )
+            finally:
+                tree_profile_capture._CAPTURE = None
 
 
 if __name__ == "__main__":
