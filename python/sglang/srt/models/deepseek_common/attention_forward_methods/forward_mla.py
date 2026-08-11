@@ -224,15 +224,6 @@ def _run_tuned_mxfp4_bmm(
 
     batch, m, _ = x.shape
     _, n, packed_k = weight.shape
-    if not getattr(_run_tuned_mxfp4_bmm, "_logged_config", False):
-        logger.warning(
-            "GLM tuned MXFP4 BMM source=%s shape=%s weight=%s config=%s",
-            __file__,
-            tuple(x.shape),
-            tuple(weight.shape),
-            config,
-        )
-        _run_tuned_mxfp4_bmm._logged_config = True
     config["SPLITK_BLOCK_SIZE"] = 2 * packed_k
     if config["BLOCK_SIZE_K"] >= 2 * packed_k:
         config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * packed_k)
@@ -280,10 +271,8 @@ def _run_mxfp4_k_bmm(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     output: torch.Tensor,
-    *,
-    use_tuned_config: bool,
 ) -> None:
-    if use_tuned_config:
+    if x.shape[2] == 192 and weight.shape[1] == 512:
         _run_tuned_mxfp4_bmm(
             x,
             weight,
@@ -308,10 +297,8 @@ def _run_mxfp4_v_bmm(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     output: torch.Tensor,
-    *,
-    use_tuned_config: bool,
 ) -> torch.Tensor:
-    if use_tuned_config:
+    if x.shape[2] == 512 and weight.shape[1] == 256:
         return _run_tuned_mxfp4_bmm(
             x,
             weight,
@@ -848,7 +835,6 @@ class DeepseekMLAForwardMixin:
                         self.w_kc.transpose(-2, -1),
                         self.w_scale_k.transpose(-2, -1),
                         q_nope_out,
-                        use_tuned_config=self.use_mxfp4_mla_bmm,
                     )
                 else:
                     if (
@@ -1295,7 +1281,6 @@ class DeepseekMLAForwardMixin:
                     self.w_vc.transpose(-2, -1),
                     self.w_scale_v.transpose(-2, -1),
                     _bmm_buf,
-                    use_tuned_config=self.use_mxfp4_mla_bmm,
                 )
                 attn_bmm_output = _bmm_buf
             else:

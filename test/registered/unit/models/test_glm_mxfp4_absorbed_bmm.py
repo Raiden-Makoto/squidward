@@ -119,27 +119,29 @@ class TestGlmMxfp4AbsorbedWeightSelection(CustomTestCase):
 
 
 class TestMxfp4KDispatch(CustomTestCase):
-    def test_uses_prequant_packed_activation_kernel(self):
+    def test_non_glm_uint8_geometry_uses_prequant_fallback(self):
         x = torch.randn(2, 3, 8, dtype=torch.bfloat16)
         weight = torch.zeros(2, 4, 4, dtype=torch.uint8)
         scale = torch.zeros(2, 4, 1, dtype=torch.uint8)
         output = torch.empty(2, 3, 4, dtype=torch.bfloat16)
 
-        with mock.patch.object(
-            forward_mla, "batched_gemm_afp4wfp4_pre_quant", create=True
-        ) as prequant_bmm:
-            result = forward_mla._run_mxfp4_k_bmm(
-                x, weight, scale, output, use_tuned_config=False
-            )
+        with (
+            mock.patch.object(
+                forward_mla, "batched_gemm_afp4wfp4_pre_quant", create=True
+            ) as prequant_bmm,
+            mock.patch.object(forward_mla, "_run_tuned_mxfp4_bmm") as tuned_bmm,
+        ):
+            result = forward_mla._run_mxfp4_k_bmm(x, weight, scale, output)
 
         prequant_bmm.assert_called_once_with(x, weight, scale, torch.bfloat16, output)
+        tuned_bmm.assert_not_called()
         self.assertIsNone(result)
 
-    def test_feature_uses_safe_k_block_without_split_k(self):
-        x = torch.randn(2, 3, 8, dtype=torch.bfloat16)
-        weight = torch.zeros(2, 4, 4, dtype=torch.uint8)
-        scale = torch.zeros(2, 4, 1, dtype=torch.uint8)
-        output = torch.empty(2, 3, 4, dtype=torch.bfloat16)
+    def test_glm_geometry_uses_safe_k_block_without_split_k(self):
+        x = torch.randn(2, 3, 192, dtype=torch.bfloat16)
+        weight = torch.zeros(2, 512, 96, dtype=torch.uint8)
+        scale = torch.zeros(2, 512, 6, dtype=torch.uint8)
+        output = torch.empty(2, 3, 512, dtype=torch.bfloat16)
         tuned_config = {"BLOCK_SIZE_K": 256, "NUM_KSPLIT": 4}
 
         with (
@@ -154,9 +156,7 @@ class TestMxfp4KDispatch(CustomTestCase):
                 forward_mla, "batched_gemm_afp4wfp4_pre_quant", create=True
             ) as prequant_bmm,
         ):
-            result = forward_mla._run_mxfp4_k_bmm(
-                x, weight, scale, output, use_tuned_config=True
-            )
+            result = forward_mla._run_mxfp4_k_bmm(x, weight, scale, output)
 
         args, kwargs = tuned_bmm.call_args
         self.assertIs(args[0], x)
@@ -171,11 +171,11 @@ class TestMxfp4KDispatch(CustomTestCase):
         prequant_bmm.assert_not_called()
         self.assertIsNone(result)
 
-    def test_feature_output_matches_bf16_reference(self):
-        x = torch.randn(2, 3, 8, dtype=torch.bfloat16)
-        weight = torch.randn(2, 4, 8, dtype=torch.bfloat16)
-        scale = torch.zeros(2, 4, 1, dtype=torch.uint8)
-        output = torch.empty(2, 3, 4, dtype=torch.bfloat16)
+    def test_glm_geometry_output_matches_bf16_reference(self):
+        x = torch.randn(2, 3, 192, dtype=torch.bfloat16)
+        weight = torch.randn(2, 512, 192, dtype=torch.bfloat16)
+        scale = torch.zeros(2, 512, 6, dtype=torch.uint8)
+        output = torch.empty(2, 3, 512, dtype=torch.bfloat16)
         expected = torch.bmm(x, weight.transpose(-2, -1))
 
         def reference_bmm(x, weight, _scale, output, _config, *, transpose_bm):
@@ -198,9 +198,7 @@ class TestMxfp4KDispatch(CustomTestCase):
                 side_effect=reference_bmm,
             ),
         ):
-            result = forward_mla._run_mxfp4_k_bmm(
-                x, weight, scale, output, use_tuned_config=True
-            )
+            result = forward_mla._run_mxfp4_k_bmm(x, weight, scale, output)
 
         self.assertIsNone(result)
         torch.testing.assert_close(output, expected)
@@ -310,7 +308,7 @@ class TestTunedMxfp4Bmm(CustomTestCase):
 
 
 class TestMxfp4VDispatch(CustomTestCase):
-    def _inputs(self):
+    def _fallback_inputs(self):
         return (
             torch.randn(2, 3, 8, dtype=torch.bfloat16),
             torch.zeros(2, 4, 4, dtype=torch.uint8),
@@ -318,17 +316,23 @@ class TestMxfp4VDispatch(CustomTestCase):
             torch.empty(3, 2, 4, dtype=torch.bfloat16),
         )
 
-    def test_flag_off_uses_existing_prequant_kernel(self):
-        x, weight, scale, output = self._inputs()
+    def _glm_inputs(self):
+        return (
+            torch.randn(2, 3, 512, dtype=torch.bfloat16),
+            torch.zeros(2, 256, 256, dtype=torch.uint8),
+            torch.zeros(2, 256, 16, dtype=torch.uint8),
+            torch.empty(3, 2, 256, dtype=torch.bfloat16),
+        )
+
+    def test_non_glm_uint8_geometry_uses_prequant_fallback(self):
+        x, weight, scale, output = self._fallback_inputs()
         with (
             mock.patch.object(
                 forward_mla, "batched_gemm_afp4wfp4_pre_quant", create=True
             ) as prequant_bmm,
             mock.patch.object(forward_mla, "_run_tuned_mxfp4_bmm") as tuned_bmm,
         ):
-            result = forward_mla._run_mxfp4_v_bmm(
-                x, weight, scale, output, use_tuned_config=False
-            )
+            result = forward_mla._run_mxfp4_v_bmm(x, weight, scale, output)
         args, kwargs = prequant_bmm.call_args
         self.assertEqual(kwargs, {})
         self.assertIs(args[0], x)
@@ -341,8 +345,8 @@ class TestMxfp4VDispatch(CustomTestCase):
         tuned_bmm.assert_not_called()
         self.assertIs(result, output)
 
-    def test_flag_on_uses_atom_batch_major_dispatch(self):
-        x, weight, scale, output = self._inputs()
+    def test_glm_geometry_uses_atom_batch_major_dispatch(self):
+        x, weight, scale, output = self._glm_inputs()
         tuned_config = {"BLOCK_SIZE_K": 256, "NUM_KSPLIT": 4}
         with (
             mock.patch.object(
@@ -360,9 +364,7 @@ class TestMxfp4VDispatch(CustomTestCase):
                 forward_mla, "batched_gemm_afp4wfp4_pre_quant", create=True
             ) as prequant_bmm,
         ):
-            result = forward_mla._run_mxfp4_v_bmm(
-                x, weight, scale, output, use_tuned_config=True
-            )
+            result = forward_mla._run_mxfp4_v_bmm(x, weight, scale, output)
         args, kwargs = tuned_bmm.call_args
         self.assertIs(args[0], x)
         self.assertIs(args[1], weight)
@@ -377,11 +379,11 @@ class TestMxfp4VDispatch(CustomTestCase):
         self.assertIs(result, output)
         self.assertTrue(result.is_contiguous())
 
-    def test_feature_batch_major_output_matches_bf16_reference(self):
-        x = torch.randn(2, 3, 8, dtype=torch.bfloat16)
-        weight = torch.randn(2, 4, 8, dtype=torch.bfloat16)
-        scale = torch.zeros(2, 4, 1, dtype=torch.uint8)
-        output = torch.empty(3, 2, 4, dtype=torch.bfloat16)
+    def test_glm_geometry_batch_major_output_matches_bf16_reference(self):
+        x = torch.randn(2, 3, 512, dtype=torch.bfloat16)
+        weight = torch.randn(2, 256, 512, dtype=torch.bfloat16)
+        scale = torch.zeros(2, 256, 16, dtype=torch.uint8)
+        output = torch.empty(3, 2, 256, dtype=torch.bfloat16)
         expected = torch.bmm(x, weight.transpose(-2, -1)).transpose(0, 1)
 
         def reference_bmm(x, weight, _scale, output, _config, *, transpose_bm):
@@ -404,9 +406,7 @@ class TestMxfp4VDispatch(CustomTestCase):
                 side_effect=reference_bmm,
             ),
         ):
-            result = forward_mla._run_mxfp4_v_bmm(
-                x, weight, scale, output, use_tuned_config=True
-            )
+            result = forward_mla._run_mxfp4_v_bmm(x, weight, scale, output)
 
         self.assertIs(result, output)
         torch.testing.assert_close(result, expected)
