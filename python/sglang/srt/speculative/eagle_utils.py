@@ -21,6 +21,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.speculative.tree_profile_capture import get_tree_profile_capture
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -765,6 +766,19 @@ def eagle_sample(
             next_token_logits / expanded_temperature, dim=-1
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+        tree_profile_capture = get_tree_profile_capture()
+        pending_tree_profile_capture = (
+            tree_profile_capture.begin(
+                softmax_probs=target_probs.reshape(
+                    bs, verify_input.draft_token_num, -1
+                ),
+                candidates=candidates,
+                verify_input=verify_input,
+                sampling_info=sampling_info,
+            )
+            if tree_profile_capture is not None
+            else None
+        )
         if sampling_info.need_top_k_sampling:
             target_probs = top_k_renorm_probs(
                 target_probs,
@@ -774,6 +788,11 @@ def eagle_sample(
             )  # (bs * num_draft_tokens, vocab_size)
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
         if sampling_info.need_top_p_sampling:
+            if tree_profile_capture is not None:
+                tree_profile_capture.set_top_p_input(
+                    pending_tree_profile_capture,
+                    target_probs.reshape(bs, verify_input.draft_token_num, -1),
+                )
             target_probs = top_p_renorm_probs(
                 target_probs,
                 torch.repeat_interleave(
@@ -825,6 +844,14 @@ def eagle_sample(
             threshold_acc=get_spec().speculative_accept_threshold_acc,
             deterministic=True,
         )
+        if tree_profile_capture is not None:
+            tree_profile_capture.finish(
+                pending_tree_profile_capture,
+                renormalized_probs=target_probs,
+                coins=coins,
+                final_coins=coins_for_final_sampling,
+                accept_token_num=num_correct_drafts,
+            )
 
         # Sync sampling results across TP ranks: different GPUs may
         # produce slightly different target_probs due to floating-point
