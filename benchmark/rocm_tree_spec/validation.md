@@ -121,12 +121,32 @@ Milliseconds, p50. CPU sync is wall time; remaining columns use GPU events.
 | 128 | 0.083 | 1.015 | 0.102 | 0.009 | 0.019 | 1.158 |
 | 256 | 0.170 | 1.814 | 0.101 | 0.009 | 0.019 | 2.053 |
 
+## MI355X hierarchical topk32 selection
+
+Configuration: chunk 2048, 4 warps. Fast-path coverage: 192 / 192 captured rows.
+
+| Batch | Rows | Stage 1 p50 | Stage 1 p95 | Stage 2 p50 | Stage 2 p95 | CPU fallback sync p50 | Scale apply p50 | Full top-p p50 | Full top-p p95 |
+| ----: | ---: | -----------: | -----------: | -----------: | -----------: | --------------------: | --------------: | -------------: | -------------: |
+| 1 | 6 | 0.019 | 0.024 | 0.057 | 0.060 | 0.019 | 0.016 | 0.135 | 0.152 |
+| 8 | 48 | 0.057 | 0.059 | 0.057 | 0.060 | 0.019 | 0.018 | 0.165 | 0.197 |
+| 32 | 192 | 0.175 | 0.178 | 0.062 | 0.065 | 0.019 | 0.039 | 0.305 | 0.316 |
+| 128 | 768 | 0.651 | 0.657 | 0.083 | 0.085 | 0.019 | 0.196 | 0.940 | 0.960 |
+| 256 | 1536 | 1.283 | 1.318 | 0.124 | 0.126 | 0.019 | 0.390 | 1.780 | 1.800 |
+
+| Batch | Topk32 selection | Hierarchical selection | Selection speedup | Scale full | Hierarchical full | Full speedup |
+| ----: | ---------------: | ---------------------: | ----------------: | ---------: | ----------------: | -----------: |
+| 1 | 0.140 | 0.095 | 1.47x | 0.203 | 0.135 | 1.50x |
+| 8 | 0.208 | 0.133 | 1.56x | 0.267 | 0.165 | 1.62x |
+| 32 | 0.368 | 0.256 | 1.44x | 0.441 | 0.305 | 1.45x |
+| 128 | 1.159 | 0.753 | 1.54x | 1.368 | 0.940 | 1.46x |
+| 256 | 2.054 | 1.426 | 1.44x | 2.434 | 1.780 | 1.37x |
+
 ## Optimization ranking
 
 | Rank | Path | Batch-8 ms | Batch-8 share | Batch-256 ms | Batch-256 share |
 | ---: | ---- | ---------: | ------------: | -----------: | --------------: |
-| 1 | DSA index relocation, 78 layers | 1.867 | 82.9% | 1.887 | 41.5% |
-| 2 | Top-p topk32 selection | 0.207 | 9.2% | 2.055 | 45.2% |
-| 3 | Target-only tree verifier | 0.096 | 4.2% | 0.198 | 4.3% |
-| 4 | Top-p scale apply | 0.018 | 0.8% | 0.388 | 8.5% |
+| 1 | DSA index relocation, 78 layers | 1.867 | 88.3% | 1.887 | 48.4% |
+| 2 | Hierarchical top-p selection | 0.133 | 6.3% | 1.426 | 36.6% |
+| 3 | Target-only tree verifier | 0.096 | 4.5% | 0.198 | 5.1% |
+| 4 | Top-p scale apply | 0.018 | 0.9% | 0.390 | 10.0% |
 | 5 | Top-p full-sort fallback | 0 | 0.0% | 0 | 0.0% |
