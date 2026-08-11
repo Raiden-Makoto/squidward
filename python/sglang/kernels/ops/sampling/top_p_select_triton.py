@@ -15,13 +15,15 @@ def _top32_local_sum_kernel(
     partial_sums_ptr,
     vocab_size,
     num_chunks: tl.constexpr,
+    TOP_K: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     chunk = tl.program_id(1).to(tl.int64)
     row_base = row * vocab_size
     chunk_base = chunk * CHUNK_SIZE
-    offsets = chunk_base + tl.arange(0, _TILE_SIZE)
+    offsets = chunk_base + tl.arange(0, TILE_SIZE)
     valid = offsets < vocab_size
     values = tl.load(
         probs_ptr + row_base + offsets,
@@ -29,11 +31,11 @@ def _top32_local_sum_kernel(
         other=float("-inf"),
     )
     row_sum = tl.sum(tl.where(valid, values, 0.0), axis=0)
-    top_values = tl.topk(values, _TOP_K, dim=0)
+    top_values = tl.topk(values, TOP_K, dim=0)
 
-    for tile in range(1, CHUNK_SIZE // _TILE_SIZE):
+    for tile in range(1, CHUNK_SIZE // TILE_SIZE):
         top_values = tl.bitonic_merge(top_values)
-        offsets = chunk_base + tile * _TILE_SIZE + tl.arange(0, _TILE_SIZE)
+        offsets = chunk_base + tile * TILE_SIZE + tl.arange(0, TILE_SIZE)
         valid = offsets < vocab_size
         values = tl.load(
             probs_ptr + row_base + offsets,
@@ -41,11 +43,11 @@ def _top32_local_sum_kernel(
             other=float("-inf"),
         )
         row_sum += tl.sum(tl.where(valid, values, 0.0), axis=0)
-        top_values = tl.maximum(top_values, tl.topk(values, _TOP_K, dim=0))
+        top_values = tl.maximum(top_values, tl.topk(values, TOP_K, dim=0))
 
     top_values = tl.sort(top_values, dim=0, descending=True)
     output_offsets = (
-        (row * num_chunks + chunk) * _TOP_K + tl.arange(0, _TOP_K)
+        (row * num_chunks + chunk) * TOP_K + tl.arange(0, TOP_K)
     )
     tl.store(local_values_ptr + output_offsets, top_values)
     tl.store(partial_sums_ptr + row * num_chunks + chunk, row_sum)
@@ -63,21 +65,22 @@ def _top32_merge_pivot_kernel(
     fast_path_ptr,
     fallback_ptr,
     num_chunks: tl.constexpr,
+    TOP_K: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
-    offsets = (row * num_chunks) * _TOP_K + tl.arange(0, _TOP_K)
+    offsets = (row * num_chunks) * TOP_K + tl.arange(0, TOP_K)
     top_values = tl.load(local_values_ptr + offsets)
-    top_values = tl.topk(top_values, _TOP_K, dim=0)
+    top_values = tl.topk(top_values, TOP_K, dim=0)
     row_sum = tl.load(partial_sums_ptr + row * num_chunks)
 
     for chunk in range(1, num_chunks):
         top_values = tl.bitonic_merge(top_values)
         offsets = (
-            (row * num_chunks + chunk) * _TOP_K + tl.arange(0, _TOP_K)
+            (row * num_chunks + chunk) * TOP_K + tl.arange(0, TOP_K)
         )
         values = tl.load(local_values_ptr + offsets)
         top_values = tl.maximum(
-            top_values, tl.topk(values, _TOP_K, dim=0)
+            top_values, tl.topk(values, TOP_K, dim=0)
         )
         row_sum += tl.load(partial_sums_ptr + row * num_chunks + chunk)
 
@@ -87,22 +90,22 @@ def _top32_merge_pivot_kernel(
     prefix_mass = tl.cumsum(top_values, axis=0) - top_values
     within = prefix_mass <= budget
     position = tl.maximum(tl.sum(within.to(tl.int32), axis=0) - 1, 0)
-    positions = tl.arange(0, _TOP_K)
+    positions = tl.arange(0, TOP_K)
     pivot = tl.sum(tl.where(positions == position, top_values, 0.0), axis=0)
     normalizer = tl.sum(tl.where(top_values >= pivot, top_values, 0.0), axis=0)
     last_value = tl.sum(
-        tl.where(positions == _TOP_K - 1, top_values, 0.0), axis=0
+        tl.where(positions == TOP_K - 1, top_values, 0.0), axis=0
     )
     last_within = (
         tl.sum(
-            tl.where(positions == _TOP_K - 1, within.to(tl.int32), 0),
+            tl.where(positions == TOP_K - 1, within.to(tl.int32), 0),
             axis=0,
         )
         != 0
     )
     fast_path = (~last_within) & (last_value < pivot) & (normalizer > 0)
 
-    output_offsets = row * _TOP_K + positions
+    output_offsets = row * TOP_K + positions
     tl.store(top_values_ptr + output_offsets, top_values)
     tl.store(row_sums_ptr + row, row_sum)
     tl.store(pivots_ptr + row, pivot)
@@ -153,6 +156,8 @@ def top_p_select_hierarchical_triton(
         partial_sums,
         vocab_size,
         num_chunks=num_chunks,
+        TOP_K=_TOP_K,
+        TILE_SIZE=_TILE_SIZE,
         CHUNK_SIZE=chunk_size,
         num_warps=num_warps,
     )
@@ -167,6 +172,7 @@ def top_p_select_hierarchical_triton(
         fast_path,
         fallback,
         num_chunks=num_chunks,
+        TOP_K=_TOP_K,
         num_warps=num_warps,
     )
     return top_values, row_sums, pivots, normalizers, fast_path, fallback
