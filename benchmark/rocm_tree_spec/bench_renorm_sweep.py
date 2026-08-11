@@ -141,11 +141,7 @@ def top_p_selection_variant(
     if prefix == probs.shape[1]:
         fast_path = normalizers > 0
     else:
-        fast_path = (
-            ~within[:, -1]
-            & (values[:, -1] < pivots)
-            & (normalizers > 0)
-        )
+        fast_path = ~within[:, -1] & (values[:, -1] < pivots) & (normalizers > 0)
     return pivots, normalizers, fast_path
 
 
