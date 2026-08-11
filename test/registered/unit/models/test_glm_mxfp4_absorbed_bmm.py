@@ -8,7 +8,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.models.deepseek_common import deepseek_weight_loader as weight_loader
-from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mla
+from sglang.srt.models.deepseek_common.attention_forward_methods import (
+    forward_mla,
+    forward_mla_rocm,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -202,6 +205,75 @@ class TestMxfp4KDispatch(CustomTestCase):
 
         self.assertIsNone(result)
         torch.testing.assert_close(output, expected)
+
+
+class TestRocmMxfp4AbsorbedBmmRoute(CustomTestCase):
+    def test_q_route_dispatches_transposed_tensors_to_mxfp4_helper(self):
+        q_nope = torch.randn(3, 2, 8, dtype=torch.bfloat16)
+        w_kc = torch.zeros(2, 4, 5, dtype=torch.uint8)
+        w_scale_k = torch.zeros(2, 1, 5, dtype=torch.uint8)
+        attn = SimpleNamespace(w_kc=w_kc, w_scale_k=w_scale_k)
+
+        with (
+            mock.patch.object(forward_mla_rocm, "_use_aiter_gfx95", True),
+            mock.patch.object(forward_mla_rocm, "_run_mxfp4_k_bmm") as run_mxfp4_k_bmm,
+        ):
+            result = forward_mla_rocm.rocm_absorb_q_bmm(
+                attn, q_nope, is_capture_mode=False
+            )
+
+        args, kwargs = run_mxfp4_k_bmm.call_args
+        self.assertEqual(kwargs, {})
+        self.assertEqual(args[0].shape, (2, 3, 8))
+        self.assertEqual(args[0].stride(), q_nope.transpose(0, 1).stride())
+        self.assertEqual(args[0].data_ptr(), q_nope.data_ptr())
+        self.assertEqual(args[1].shape, (2, 5, 4))
+        self.assertEqual(args[1].stride(), w_kc.transpose(-2, -1).stride())
+        self.assertEqual(args[1].data_ptr(), w_kc.data_ptr())
+        self.assertEqual(args[2].shape, (2, 5, 1))
+        self.assertEqual(args[2].stride(), w_scale_k.transpose(-2, -1).stride())
+        self.assertEqual(args[2].data_ptr(), w_scale_k.data_ptr())
+        self.assertIs(args[3], result)
+        self.assertEqual(result.shape, (2, 3, 5))
+        self.assertEqual(result.dtype, torch.bfloat16)
+
+    def test_v_route_flattens_batch_major_mxfp4_output_as_view(self):
+        attn_output = torch.randn(3, 2, 8, dtype=torch.bfloat16)
+        w_vc = torch.zeros(2, 4, 5, dtype=torch.uint8)
+        w_scale_v = torch.zeros(2, 1, 5, dtype=torch.uint8)
+        attn = SimpleNamespace(
+            w_vc=w_vc,
+            w_scale_v=w_scale_v,
+            o_proj=SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16)),
+        )
+
+        with (
+            mock.patch.object(forward_mla_rocm, "_use_aiter_gfx95", True),
+            mock.patch.object(
+                forward_mla_rocm,
+                "_run_mxfp4_v_bmm",
+                side_effect=lambda _x, _weight, _scale, output: output,
+            ) as run_mxfp4_v_bmm,
+        ):
+            result = forward_mla_rocm.rocm_absorb_v_bmm(attn, attn_output)
+
+        args, kwargs = run_mxfp4_v_bmm.call_args
+        self.assertEqual(kwargs, {})
+        self.assertEqual(args[0].shape, (2, 3, 8))
+        self.assertEqual(args[0].stride(), attn_output.transpose(0, 1).stride())
+        self.assertEqual(args[0].data_ptr(), attn_output.data_ptr())
+        self.assertEqual(args[1].shape, (2, 5, 4))
+        self.assertEqual(args[1].stride(), w_vc.transpose(-2, -1).stride())
+        self.assertEqual(args[1].data_ptr(), w_vc.data_ptr())
+        self.assertEqual(args[2].shape, (2, 5, 1))
+        self.assertEqual(args[2].stride(), w_scale_v.transpose(-2, -1).stride())
+        self.assertEqual(args[2].data_ptr(), w_scale_v.data_ptr())
+        bmm_output = args[3]
+        self.assertEqual(bmm_output.shape, (3, 2, 5))
+        self.assertTrue(bmm_output.is_contiguous())
+        self.assertEqual(result.shape, (3, 10))
+        self.assertEqual(result.dtype, torch.bfloat16)
+        self.assertEqual(result.data_ptr(), bmm_output.data_ptr())
 
 
 class TestTunedMxfp4Bmm(CustomTestCase):
