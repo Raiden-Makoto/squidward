@@ -16,15 +16,24 @@ real model produces.
 from __future__ import annotations
 
 import argparse
+import json
+import statistics
+from pathlib import Path
 
 import torch
+import triton
 
 from sglang.kernels.ops.sampling.renorm import (
     _TOP_P_PREFIX,
+    top_p_pivots,
     top_k_renorm_probs_torch,
     top_p_renorm_probs_torch,
 )
 from sglang.kernels.ops.sampling.renorm_triton import (
+    _BLOCK_SIZE,
+    _masked_row_sum_kernel,
+    _masked_scale_kernel,
+    apply_pivot_triton,
     top_k_renorm_probs_triton,
     top_p_renorm_probs_triton,
 )
@@ -67,6 +76,168 @@ def timeit(fn, iters: int) -> float:
     return start.elapsed_time(end) / iters
 
 
+def latency_samples(fn, iters: int) -> list[float]:
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    samples = []
+    for _ in range(iters):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn()
+        end.record()
+        end.synchronize()
+        samples.append(start.elapsed_time(end))
+    return samples
+
+
+def percentile(samples: list[float], fraction: float) -> float:
+    ordered = sorted(samples)
+    return ordered[min(int(len(ordered) * fraction), len(ordered) - 1)]
+
+
+def load_capture_rows(capture_dir: Path):
+    softmax = []
+    probs = []
+    expected = []
+    top_ps = []
+    top_ks = []
+    for path in sorted(capture_dir.glob("rank0_*.pt")):
+        record = torch.load(path, map_location="cpu", weights_only=True)
+        num_draft = record["metadata"]["num_draft_tokens"]
+        softmax.append(record["softmax_probs"].flatten(0, 1))
+        probs.append(record["top_p_input_probs"].flatten(0, 1))
+        expected.append(record["renormalized_probs"].flatten(0, 1))
+        top_ps.append(record["top_ps"].reshape(-1).repeat_interleave(num_draft))
+        top_ks.append(record["top_ks"].reshape(-1).repeat_interleave(num_draft))
+    if not probs:
+        raise ValueError(f"No rank0_*.pt captures found under {capture_dir}")
+    return tuple(torch.cat(x) for x in (softmax, probs, expected, top_ps, top_ks))
+
+
+def run_capture_bench(args, aot) -> None:
+    captured_softmax, captured, captured_expected, captured_top_ps, captured_top_ks = (
+        load_capture_rows(args.capture_dir)
+    )
+    output = {
+        "device": torch.cuda.get_device_name(0),
+        "capture_dir": str(args.capture_dir),
+        "captured_rows": captured.shape[0],
+        "vocab_size": captured.shape[1],
+        "num_draft_tokens": args.num_draft,
+        "rows": [],
+    }
+    print(
+        f"{output['device']}  capture_rows={captured.shape[0]}  "
+        f"vocab={captured.shape[1]}"
+    )
+    print(
+        f"{'bs':>5} {'rows':>6} {'nuc_p50':>8} {'nuc_max':>8} {'ovf':>5} "
+        f"{'pivot':>8} {'sum':>8} {'scale':>8} {'apply':>8} "
+        f"{'full_p50':>9} {'full_p95':>9}"
+    )
+
+    for batch_size in args.batches:
+        rows = batch_size * args.num_draft
+        selected = torch.arange(rows) % captured.shape[0]
+        softmax_probs = captured_softmax[selected].to(DEV)
+        probs = captured[selected].to(DEV)
+        expected = captured_expected[selected].to(DEV)
+        top_ps = captured_top_ps[selected].to(DEV)
+        top_ks = captured_top_ks[selected].to(DEV)
+        values = probs.sort(dim=-1, descending=True).values
+        budgets = probs.sum(dim=-1) - (1.0 - top_ps)
+        nucleus = ((values.cumsum(dim=-1) - values) <= budgets[:, None]).sum(dim=-1)
+        overflow_rate = float((nucleus > _TOP_P_PREFIX).float().mean())
+
+        pivots = top_p_pivots(probs, top_ps)
+        num_chunks = triton.cdiv(probs.shape[1], _BLOCK_SIZE)
+        grid = (rows, num_chunks)
+        partial = torch.empty((rows, num_chunks), device=DEV, dtype=torch.float32)
+        row_sums = torch.empty(rows, device=DEV, dtype=torch.float32)
+        out = torch.empty_like(probs)
+
+        pivot_samples = latency_samples(
+            lambda: top_p_pivots(probs, top_ps), args.iters
+        )
+        sum_samples = latency_samples(
+            lambda: _masked_row_sum_kernel[grid](
+                probs,
+                pivots,
+                partial,
+                probs.shape[1],
+                num_chunks,
+                BLOCK_SIZE=_BLOCK_SIZE,
+            ),
+            args.iters,
+        )
+        torch.sum(partial, dim=1, out=row_sums)
+        scale_samples = latency_samples(
+            lambda: _masked_scale_kernel[grid](
+                probs,
+                pivots,
+                row_sums,
+                out,
+                probs.shape[1],
+                BLOCK_SIZE=_BLOCK_SIZE,
+            ),
+            args.iters,
+        )
+        apply_samples = latency_samples(
+            lambda: apply_pivot_triton(probs, pivots), args.iters
+        )
+        full_samples = latency_samples(
+            lambda: top_p_renorm_probs_triton(probs, top_ps), args.iters
+        )
+        got = top_p_renorm_probs_triton(probs, top_ps)
+        torch.testing.assert_close(got, expected, rtol=2e-5, atol=2e-6)
+
+        row = {
+            "batch_size": batch_size,
+            "rows": rows,
+            "max_token_probability_median": float(probs.max(dim=-1).values.median()),
+            "nucleus_p50": int(nucleus.median()),
+            "nucleus_max": int(nucleus.max()),
+            "overflow_rate": overflow_rate,
+            "top_p_pivot_p50_ms": statistics.median(pivot_samples),
+            "masked_row_sum_p50_ms": statistics.median(sum_samples),
+            "masked_scale_p50_ms": statistics.median(scale_samples),
+            "apply_pivot_p50_ms": statistics.median(apply_samples),
+            "full_top_p_p50_ms": statistics.median(full_samples),
+            "full_top_p_p95_ms": percentile(full_samples, 0.95),
+        }
+        top_k_is_active = bool((top_ks < probs.shape[1]).any())
+        if top_k_is_active:
+            top_k_samples = latency_samples(
+                lambda: top_k_renorm_probs_triton(softmax_probs, top_ks), args.iters
+            )
+            row["full_top_k_p50_ms"] = statistics.median(top_k_samples)
+            torch.testing.assert_close(
+                top_k_renorm_probs_triton(softmax_probs, top_ks),
+                probs,
+                rtol=2e-5,
+                atol=2e-6,
+            )
+        if aot is not None:
+            aot_samples = latency_samples(lambda: aot[1](probs, top_ps), args.iters)
+            row["aot_top_p_p50_ms"] = statistics.median(aot_samples)
+        output["rows"].append(row)
+        print(
+            f"{batch_size:>5} {rows:>6} {row['nucleus_p50']:>8} "
+            f"{row['nucleus_max']:>8} {overflow_rate:>5.0%} "
+            f"{row['top_p_pivot_p50_ms']:>8.3f} "
+            f"{row['masked_row_sum_p50_ms']:>8.3f} "
+            f"{row['masked_scale_p50_ms']:>8.3f} "
+            f"{row['apply_pivot_p50_ms']:>8.3f} "
+            f"{row['full_top_p_p50_ms']:>9.3f} "
+            f"{row['full_top_p_p95_ms']:>9.3f}"
+        )
+
+    if args.output_json:
+        args.output_json.write_text(json.dumps(output, indent=2))
+
+
 def describe(probs: torch.Tensor, top_p: float, sample_rows: int = 64):
     """Mean top-1 mass, median nucleus size, and the fraction of rows whose
     nucleus exceeds the prefix, which is what triggers the sort fallback."""
@@ -88,6 +259,12 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--capture-dir", type=Path)
+    parser.add_argument("--output-json", type=Path)
+    parser.add_argument("--num-draft", type=int, default=6)
+    parser.add_argument(
+        "--batches", type=int, nargs="+", default=(1, 2, 4, 8, 32, 128, 256)
+    )
     parser.add_argument(
         "--scales",
         type=float,
@@ -100,6 +277,9 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     aot = load_aot()
+    if args.capture_dir:
+        run_capture_bench(args, aot)
+        return
     name = torch.cuda.get_device_name(0)
     print(f"{name}  vocab={args.vocab}  rows={args.rows}  top_p={args.top_p}  top_k={args.top_k}")
     print(f"AOT renorm kernel: {'available' if aot else 'unavailable (expected on ROCm)'}")

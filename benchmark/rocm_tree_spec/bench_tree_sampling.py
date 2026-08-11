@@ -18,10 +18,14 @@ Usage:  python3 bench_tree_sampling.py [--vocab 151936] [--iters 20]
 from __future__ import annotations
 
 import argparse
+import json
 import statistics
+from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
+from sglang.kernels.ops.attention.dsa.index_buf_accessor import MoveKAndS
 from sglang.kernels.ops.speculative.tree_sampling import (
     tree_speculative_sampling_target_only_triton,
 )
@@ -213,10 +217,225 @@ def time_kernel(kernel, args: dict, iters: int) -> tuple[float, float]:
     return statistics.median(samples), args["accept_token_num"].float().mean().item()
 
 
+def latency_samples(fn, iters: int, prepare=None) -> list[float]:
+    for _ in range(3):
+        if prepare is not None:
+            prepare()
+        fn()
+    torch.cuda.synchronize()
+    samples = []
+    for _ in range(iters):
+        if prepare is not None:
+            prepare()
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn()
+        end.record()
+        end.synchronize()
+        samples.append(start.elapsed_time(end))
+    return samples
+
+
+def percentile(samples: list[float], fraction: float) -> float:
+    ordered = sorted(samples)
+    return ordered[min(int(len(ordered) * fraction), len(ordered) - 1)]
+
+
+def load_capture_requests(capture_dir: Path):
+    requests = []
+    for path in sorted(capture_dir.glob("rank0_*.pt")):
+        record = torch.load(path, map_location="cpu", weights_only=True)
+        for index, acceptance_length in enumerate(
+            record["metadata"]["acceptance_length"]
+        ):
+            requests.append(
+                {
+                    "target_probs": record["renormalized_probs"][index],
+                    "candidates": record["candidates"][index],
+                    "next_token": record["retrieve_next_token"][index],
+                    "next_sibling": record["retrieve_next_sibling"][index],
+                    "coins": record["uniform_samples"][index],
+                    "final_coin": record["uniform_samples_for_final_sampling"][index],
+                    "acceptance_length": acceptance_length,
+                    "max_tree_depth": record["metadata"]["max_tree_depth"],
+                }
+            )
+    if not requests:
+        raise ValueError(f"No rank0_*.pt captures found under {capture_dir}")
+    return requests
+
+
+def make_captured_inputs(requests, batch_size: int):
+    selected = [requests[index % len(requests)] for index in range(batch_size)]
+    num_draft_tokens = selected[0]["candidates"].numel()
+    max_tree_depth = selected[0]["max_tree_depth"]
+    return (
+        {
+            "predicts": torch.full(
+                (batch_size * num_draft_tokens,),
+                -1,
+                dtype=torch.int32,
+                device=DEVICE,
+            ),
+            "accept_index": torch.full(
+                (batch_size, max_tree_depth),
+                -1,
+                dtype=torch.int32,
+                device=DEVICE,
+            ),
+            "accept_token_num": torch.zeros(
+                batch_size, dtype=torch.int32, device=DEVICE
+            ),
+            "candidates": torch.stack([x["candidates"] for x in selected]).to(DEVICE),
+            "retrive_index": torch.arange(
+                batch_size * num_draft_tokens, dtype=torch.int64, device=DEVICE
+            ).view(batch_size, num_draft_tokens),
+            "retrive_next_token": torch.stack(
+                [x["next_token"] for x in selected]
+            ).to(DEVICE),
+            "retrive_next_sibling": torch.stack(
+                [x["next_sibling"] for x in selected]
+            ).to(DEVICE),
+            "uniform_samples": torch.stack([x["coins"] for x in selected]).to(
+                DEVICE
+            ),
+            "uniform_samples_for_final_sampling": torch.stack(
+                [x["final_coin"] for x in selected]
+            ).to(DEVICE),
+            "target_probs": torch.stack([x["target_probs"] for x in selected]).to(
+                DEVICE
+            ),
+            "draft_probs": torch.zeros(
+                (
+                    batch_size,
+                    num_draft_tokens,
+                    selected[0]["target_probs"].shape[-1],
+                ),
+                dtype=torch.float32,
+                device=DEVICE,
+            ),
+        },
+        torch.tensor(
+            [x["acceptance_length"] for x in selected],
+            dtype=torch.int32,
+            device=DEVICE,
+        ),
+    )
+
+
+def run_capture_bench(args, aot) -> None:
+    requests = load_capture_requests(args.capture_dir)
+    output = {
+        "device": torch.cuda.get_device_name(0),
+        "capture_dir": str(args.capture_dir),
+        "captured_requests": len(requests),
+        "rows": [],
+    }
+    print(
+        f"{output['device']}  capture_requests={len(requests)}  "
+        f"iters={args.iters}"
+    )
+    print(
+        f"{'bs':>5} {'tree_p50':>10} {'tree_p95':>10} {'accept':>8} "
+        f"{'move_slots':>10} {'move/layer':>11}"
+    )
+
+    for batch_size in args.batches:
+        inputs, expected_acceptance = make_captured_inputs(requests, batch_size)
+
+        def call_tree():
+            tree_speculative_sampling_target_only_triton(
+                **inputs,
+                threshold_single=1.0,
+                threshold_acc=1.0,
+                deterministic=True,
+            )
+
+        inputs["draft_probs"].zero_()
+        call_tree()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            inputs["accept_token_num"], expected_acceptance, rtol=0, atol=0
+        )
+        tree_samples = latency_samples(
+            call_tree, args.iters, prepare=inputs["draft_probs"].zero_
+        )
+
+        moved_slots = batch_size * inputs["candidates"].shape[1]
+        pool = SimpleNamespace(
+            page_size=64,
+            index_head_dim=128,
+            quant_block_size=128,
+        )
+        src_loc = torch.arange(moved_slots, device=DEVICE, dtype=torch.int64) + 64
+        tgt_loc = src_loc + moved_slots + 64
+        num_pages = int(tgt_loc.max().item() // pool.page_size + 1)
+        index_buffer = torch.zeros(
+            (num_pages, pool.page_size * (pool.index_head_dim + 4)),
+            dtype=torch.uint8,
+            device=DEVICE,
+        )
+        scratch = torch.empty(
+            (moved_slots, pool.index_head_dim + 4),
+            dtype=torch.uint8,
+            device=DEVICE,
+        )
+        move_samples = latency_samples(
+            lambda: MoveKAndS.execute(
+                pool,
+                index_buffer,
+                tgt_loc=tgt_loc,
+                src_loc=src_loc,
+                scratch=scratch,
+            ),
+            args.iters,
+        )
+
+        row = {
+            "batch_size": batch_size,
+            "num_draft_tokens": inputs["candidates"].shape[1],
+            "tree_p50_ms": statistics.median(tree_samples),
+            "tree_p95_ms": percentile(tree_samples, 0.95),
+            "acceptance_length_mean": float(expected_acceptance.float().mean()),
+            "relocation_slots": moved_slots,
+            "relocation_p50_ms_per_layer": statistics.median(move_samples),
+            "relocation_p95_ms_per_layer": percentile(move_samples, 0.95),
+        }
+        if aot is not None:
+            aot_samples = latency_samples(
+                lambda: aot(
+                    **inputs,
+                    threshold_single=1.0,
+                    threshold_acc=1.0,
+                    deterministic=True,
+                ),
+                args.iters,
+                prepare=inputs["draft_probs"].zero_,
+            )
+            row["aot_tree_p50_ms"] = statistics.median(aot_samples)
+        output["rows"].append(row)
+        print(
+            f"{batch_size:>5} {row['tree_p50_ms']:>10.4f} "
+            f"{row['tree_p95_ms']:>10.4f} "
+            f"{row['acceptance_length_mean']:>8.2f} "
+            f"{moved_slots:>10} {row['relocation_p50_ms_per_layer']:>11.4f}"
+        )
+
+    if args.output_json:
+        args.output_json.write_text(json.dumps(output, indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--vocab", type=int, default=151936, help="GLM-5.2 vocabulary")
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--capture-dir", type=Path)
+    parser.add_argument("--output-json", type=Path)
+    parser.add_argument(
+        "--batches", type=int, nargs="+", default=(1, 2, 4, 8, 32, 128, 256)
+    )
     parser.add_argument(
         "--agreement",
         type=float,
@@ -235,6 +454,10 @@ def main():
         help="sweep logit scale and report accept length only",
     )
     args = parser.parse_args()
+
+    if args.capture_dir:
+        run_capture_bench(args, load_aot_kernel())
+        return
 
     if args.calibrate:
         print(f"{torch.cuda.get_device_name(0)}   vocab={args.vocab}")
