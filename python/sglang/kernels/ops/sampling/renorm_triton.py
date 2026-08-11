@@ -210,9 +210,7 @@ def top_p_renorm_probs_triton_hierarchical(
     pivots = values.gather(1, position.unsqueeze(1)).squeeze(1)
     kept = values >= pivots.unsqueeze(1)
     normalizers = torch.where(kept, values, torch.zeros_like(values)).sum(dim=-1)
-    fast_path = (
-        ~within[:, -1] & (values[:, -1] < pivots) & (normalizers > 0)
-    )
+    fast_path = ~within[:, -1] & (values[:, -1] < pivots) & (normalizers > 0)
     if not bool(fast_path.all()):
         return top_p_renorm_probs_triton_baseline(probs, top_ps)
 
@@ -234,10 +232,7 @@ def top_p_renorm_probs_triton(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
 ) -> torch.Tensor:
-    if (
-        torch.version.hip is not None
-        and probs.shape[0] >= _HIERARCHICAL_TOP_P_MIN_ROWS
-    ):
+    if torch.version.hip is not None and probs.shape[0] >= _HIERARCHICAL_TOP_P_MIN_ROWS:
         return top_p_renorm_probs_triton_hierarchical(probs, top_p)
     return top_p_renorm_probs_triton_scale_fast(probs, top_p)
 

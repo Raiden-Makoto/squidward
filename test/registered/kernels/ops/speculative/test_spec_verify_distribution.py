@@ -440,9 +440,7 @@ class TestTritonTopPFastPath(CustomTestCase):
         for rows, expected_calls in ((12, 0), (24, 1)):
             with self.subTest(rows=rows):
                 probs = torch.softmax(
-                    torch.randn(
-                        (rows, 1549), dtype=torch.float32, device=self.device
-                    )
+                    torch.randn((rows, 1549), dtype=torch.float32, device=self.device)
                     * 8,
                     dim=-1,
                 )
