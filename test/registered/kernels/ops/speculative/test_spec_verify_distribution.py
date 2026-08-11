@@ -241,6 +241,7 @@ class TestTritonTopPFastPath(CustomTestCase):
         from sglang.kernels.ops.sampling.renorm_triton import (
             top_p_renorm_probs_triton,
             top_p_renorm_probs_triton_baseline,
+            top_p_renorm_probs_triton_hierarchical,
             top_p_renorm_probs_triton_scale_fast,
             top_p_renorm_probs_triton_scatter_fast,
         )
@@ -249,6 +250,7 @@ class TestTritonTopPFastPath(CustomTestCase):
         functions = [
             top_p_renorm_probs_triton_scale_fast,
             top_p_renorm_probs_triton_scatter_fast,
+            top_p_renorm_probs_triton_hierarchical,
             top_p_renorm_probs_triton,
         ]
         if torch.version.hip is not None:
@@ -342,6 +344,60 @@ class TestTritonTopPFastPath(CustomTestCase):
         top_ps = torch.tensor([1.0, 1.0], device=self.device)
         *_, fast_path = top_p_fast_prefix(probs.contiguous(), top_ps)
         self.assertTrue(bool(fast_path.all()))
+
+    def test_hierarchical_selector_values_sums_and_metadata(self):
+        from sglang.kernels.ops.sampling.renorm import top_p_fast_prefix
+        from sglang.kernels.ops.sampling.top_p_select_triton import (
+            top_p_select_hierarchical_triton,
+        )
+
+        for rows, vocab_size, chunk_size in (
+            (1, 127, 512),
+            (6, 1549, 512),
+            (2, 154880, 1024),
+        ):
+            with self.subTest(
+                rows=rows, vocab_size=vocab_size, chunk_size=chunk_size
+            ):
+                generator = torch.Generator(device=self.device).manual_seed(vocab_size)
+                probs = torch.softmax(
+                    torch.randn(
+                        (rows, vocab_size),
+                        dtype=torch.float32,
+                        device=self.device,
+                        generator=generator,
+                    )
+                    * 8,
+                    dim=-1,
+                )
+                top_ps = torch.full(
+                    (rows,), 0.95, dtype=torch.float32, device=self.device
+                )
+                expected_values, _, expected_pivots, expected_normalizers, expected_fast = (
+                    top_p_fast_prefix(probs, top_ps)
+                )
+                (
+                    values,
+                    row_sums,
+                    pivots,
+                    normalizers,
+                    fast_path,
+                    fallback,
+                ) = top_p_select_hierarchical_triton(
+                    probs, top_ps, chunk_size=chunk_size
+                )
+                torch.testing.assert_close(values, expected_values, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    row_sums, probs.sum(dim=-1), rtol=2e-5, atol=2e-6
+                )
+                torch.testing.assert_close(
+                    pivots, expected_pivots, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    normalizers, expected_normalizers, rtol=2e-5, atol=2e-6
+                )
+                self.assertTrue(torch.equal(fast_path, expected_fast))
+                self.assertEqual(bool(fallback.item()), not bool(expected_fast.all()))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "GPU is required for this test.")

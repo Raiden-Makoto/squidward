@@ -22,6 +22,9 @@ from sglang.kernels.ops.sampling.renorm import (
     top_p_fast_prefix,
     top_p_pivots,
 )
+from sglang.kernels.ops.sampling.top_p_select_triton import (
+    top_p_select_hierarchical_triton,
+)
 
 _BLOCK_SIZE = 1024
 
@@ -179,6 +182,42 @@ def top_p_renorm_probs_triton_scatter_fast(
     return torch.zeros_like(probs).scatter_(1, indices, normalized)
 
 
+def top_p_renorm_probs_triton_hierarchical(
+    probs: torch.Tensor,
+    top_p: Union[torch.Tensor, float],
+    *,
+    chunk_size: int = 1024,
+    num_warps: int = 4,
+) -> torch.Tensor:
+    """Hierarchical fused row-sum/top32 selection with exact fallback."""
+    probs, top_ps = _prepare_top_p(probs, top_p)
+    if probs.shape[0] == 0:
+        return probs.clone()
+    assert probs.shape[1] > 0
+
+    _, _, pivots, normalizers, _, fallback = top_p_select_hierarchical_triton(
+        probs,
+        top_ps,
+        chunk_size=chunk_size,
+        num_warps=num_warps,
+    )
+    if bool(fallback.item()):
+        return top_p_renorm_probs_triton_baseline(probs, top_ps)
+
+    batch_size, vocab_size = probs.shape
+    grid = (batch_size, triton.cdiv(vocab_size, _BLOCK_SIZE))
+    out = torch.empty_like(probs)
+    _masked_scale_kernel[grid](
+        probs,
+        pivots,
+        normalizers,
+        out,
+        vocab_size,
+        BLOCK_SIZE=_BLOCK_SIZE,
+    )
+    return out
+
+
 def top_p_renorm_probs_triton(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
@@ -191,6 +230,7 @@ __all__ = [
     "top_k_renorm_probs_triton",
     "top_p_renorm_probs_triton",
     "top_p_renorm_probs_triton_baseline",
+    "top_p_renorm_probs_triton_hierarchical",
     "top_p_renorm_probs_triton_scale_fast",
     "top_p_renorm_probs_triton_scatter_fast",
 ]
