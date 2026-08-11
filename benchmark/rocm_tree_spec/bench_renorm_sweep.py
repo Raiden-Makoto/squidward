@@ -216,9 +216,7 @@ def run_capture_bench(args, aot) -> None:
             torch.zeros_like(fast_values),
         )
         fast_scatter_samples = latency_samples(
-            lambda: torch.zeros_like(probs).scatter_(
-                1, fast_indices, fast_normalized
-            ),
+            lambda: torch.zeros_like(probs).scatter_(1, fast_indices, fast_normalized),
             args.iters,
         )
         scale_full_samples = latency_samples(
