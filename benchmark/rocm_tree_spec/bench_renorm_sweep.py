@@ -26,6 +26,7 @@ import triton
 from sglang.kernels.ops.sampling.renorm import (
     _TOP_P_PREFIX,
     top_k_renorm_probs_torch,
+    top_p_fast_prefix,
     top_p_pivots,
     top_p_renorm_probs_torch,
 )
@@ -36,6 +37,9 @@ from sglang.kernels.ops.sampling.renorm_triton import (
     apply_pivot_triton,
     top_k_renorm_probs_triton,
     top_p_renorm_probs_triton,
+    top_p_renorm_probs_triton_baseline,
+    top_p_renorm_probs_triton_scale_fast,
+    top_p_renorm_probs_triton_scatter_fast,
 )
 
 DEV = torch.device("cuda")
@@ -134,8 +138,8 @@ def run_capture_bench(args, aot) -> None:
     )
     print(
         f"{'bs':>5} {'rows':>6} {'nuc_p50':>8} {'nuc_max':>8} {'ovf':>5} "
-        f"{'pivot':>8} {'sum':>8} {'scale':>8} {'apply':>8} "
-        f"{'full_p50':>9} {'full_p95':>9}"
+        f"{'old':>8} {'select64':>8} {'scale':>8} {'scatter':>8} "
+        f"{'scale_all':>9} {'scatter_all':>11}"
     )
 
     for batch_size in args.batches:
@@ -152,6 +156,10 @@ def run_capture_bench(args, aot) -> None:
         overflow_rate = float((nucleus > _TOP_P_PREFIX).float().mean())
 
         pivots = top_p_pivots(probs, top_ps)
+        fast_values, fast_indices, fast_pivots, fast_normalizers, fast_path = (
+            top_p_fast_prefix(probs, top_ps)
+        )
+        fast_path_rate = float(fast_path.float().mean())
         num_chunks = triton.cdiv(probs.shape[1], _BLOCK_SIZE)
         grid = (rows, num_chunks)
         partial = torch.empty((rows, num_chunks), device=DEV, dtype=torch.float32)
@@ -186,10 +194,48 @@ def run_capture_bench(args, aot) -> None:
             lambda: apply_pivot_triton(probs, pivots), args.iters
         )
         full_samples = latency_samples(
-            lambda: top_p_renorm_probs_triton(probs, top_ps), args.iters
+            lambda: top_p_renorm_probs_triton_baseline(probs, top_ps), args.iters
         )
-        got = top_p_renorm_probs_triton(probs, top_ps)
-        torch.testing.assert_close(got, expected, rtol=2e-5, atol=2e-6)
+        fast_selection_samples = latency_samples(
+            lambda: top_p_fast_prefix(probs, top_ps), args.iters
+        )
+        fast_scale_samples = latency_samples(
+            lambda: _masked_scale_kernel[grid](
+                probs,
+                fast_pivots,
+                fast_normalizers,
+                out,
+                probs.shape[1],
+                BLOCK_SIZE=_BLOCK_SIZE,
+            ),
+            args.iters,
+        )
+        fast_normalized = torch.where(
+            fast_values >= fast_pivots.unsqueeze(1),
+            fast_values / fast_normalizers.unsqueeze(1),
+            torch.zeros_like(fast_values),
+        )
+        fast_scatter_samples = latency_samples(
+            lambda: torch.zeros_like(probs).scatter_(
+                1, fast_indices, fast_normalized
+            ),
+            args.iters,
+        )
+        scale_full_samples = latency_samples(
+            lambda: top_p_renorm_probs_triton_scale_fast(probs, top_ps), args.iters
+        )
+        scatter_full_samples = latency_samples(
+            lambda: top_p_renorm_probs_triton_scatter_fast(probs, top_ps),
+            args.iters,
+        )
+        for fn in (
+            top_p_renorm_probs_triton_scale_fast,
+            top_p_renorm_probs_triton_scatter_fast,
+            top_p_renorm_probs_triton,
+        ):
+            got = fn(probs, top_ps)
+            torch.testing.assert_close(got, expected, rtol=2e-5, atol=2e-6)
+            assert torch.equal(got > 0, expected > 0)
 
         row = {
             "batch_size": batch_size,
@@ -198,13 +244,27 @@ def run_capture_bench(args, aot) -> None:
             "nucleus_p50": int(nucleus.median()),
             "nucleus_max": int(nucleus.max()),
             "overflow_rate": overflow_rate,
+            "fast_path_rate": fast_path_rate,
             "top_p_pivot_p50_ms": statistics.median(pivot_samples),
             "masked_row_sum_p50_ms": statistics.median(sum_samples),
             "masked_scale_p50_ms": statistics.median(scale_samples),
             "apply_pivot_p50_ms": statistics.median(apply_samples),
-            "full_top_p_p50_ms": statistics.median(full_samples),
-            "full_top_p_p95_ms": percentile(full_samples, 0.95),
+            "baseline_top_p_p50_ms": statistics.median(full_samples),
+            "baseline_top_p_p95_ms": percentile(full_samples, 0.95),
+            "fast_prefix_p50_ms": statistics.median(fast_selection_samples),
+            "fast_scale_apply_p50_ms": statistics.median(fast_scale_samples),
+            "fast_scatter_apply_p50_ms": statistics.median(fast_scatter_samples),
+            "scale_fast_top_p_p50_ms": statistics.median(scale_full_samples),
+            "scale_fast_top_p_p95_ms": percentile(scale_full_samples, 0.95),
+            "scatter_fast_top_p_p50_ms": statistics.median(scatter_full_samples),
+            "scatter_fast_top_p_p95_ms": percentile(scatter_full_samples, 0.95),
         }
+        row["scale_fast_speedup"] = (
+            row["baseline_top_p_p50_ms"] / row["scale_fast_top_p_p50_ms"]
+        )
+        row["scatter_fast_speedup"] = (
+            row["baseline_top_p_p50_ms"] / row["scatter_fast_top_p_p50_ms"]
+        )
         top_k_is_active = bool((top_ks < probs.shape[1]).any())
         if top_k_is_active:
             top_k_samples = latency_samples(
@@ -224,12 +284,12 @@ def run_capture_bench(args, aot) -> None:
         print(
             f"{batch_size:>5} {rows:>6} {row['nucleus_p50']:>8} "
             f"{row['nucleus_max']:>8} {overflow_rate:>5.0%} "
-            f"{row['top_p_pivot_p50_ms']:>8.3f} "
-            f"{row['masked_row_sum_p50_ms']:>8.3f} "
-            f"{row['masked_scale_p50_ms']:>8.3f} "
-            f"{row['apply_pivot_p50_ms']:>8.3f} "
-            f"{row['full_top_p_p50_ms']:>9.3f} "
-            f"{row['full_top_p_p95_ms']:>9.3f}"
+            f"{row['baseline_top_p_p50_ms']:>8.3f} "
+            f"{row['fast_prefix_p50_ms']:>8.3f} "
+            f"{row['fast_scale_apply_p50_ms']:>8.3f} "
+            f"{row['fast_scatter_apply_p50_ms']:>8.3f} "
+            f"{row['scale_fast_top_p_p50_ms']:>9.3f} "
+            f"{row['scatter_fast_top_p_p50_ms']:>11.3f}"
         )
 
     if args.output_json:
