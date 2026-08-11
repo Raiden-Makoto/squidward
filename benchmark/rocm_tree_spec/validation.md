@@ -124,7 +124,8 @@ Milliseconds, p50. CPU sync is wall time; remaining columns use GPU events.
 
 ## MI355X hierarchical topk32 candidate
 
-Configuration: chunk 2048, 4 warps. Fast-path coverage: 192 / 192 captured rows.
+Configuration: chunk 2048, 4 warps, hierarchical dispatch at 24 or more rows.
+Fast-path coverage: 192 / 192 captured rows.
 
 | Batch | Rows | Stage 1 p50 | Stage 1 p95 | Stage 2 p50 | Stage 2 p95 | CPU fallback sync p50 | Scale apply p50 | Exact full p50 | Exact full p95 |
 | ----: | ---: | -----------: | -----------: | -----------: | -----------: | --------------------: | --------------: | -------------: | -------------: |
@@ -141,6 +142,13 @@ Configuration: chunk 2048, 4 warps. Fast-path coverage: 192 / 192 captured rows.
 | 32 | 0.442 | 0.401 | 1.10x |
 | 128 | 1.361 | 1.105 | 1.23x |
 | 256 | 2.434 | 2.032 | 1.20x |
+
+| Active sequences | Rows | Topk32 full | Exact hierarchical full | Selected path | Selected p50 |
+| ---------------: | ---: | ----------: | ----------------------: | ------------- | -----------: |
+| 1 | 6 | 0.198 | 0.208 | Topk32 | 0.198 |
+| 2 | 12 | 0.213 | 0.216 | Topk32 | 0.213 |
+| 4 | 24 | 0.244 | 0.218 | Hierarchical | 0.218 |
+| 8 | 48 | 0.262 | 0.250 | Hierarchical | 0.250 |
 
 ## GLM hierarchical top-p smoke
 
