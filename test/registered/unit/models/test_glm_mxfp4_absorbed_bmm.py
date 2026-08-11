@@ -277,7 +277,7 @@ class TestRocmMxfp4AbsorbedBmmRoute(CustomTestCase):
 
 
 class TestTunedMxfp4Bmm(CustomTestCase):
-    def test_launches_aiter_triton_kernel_with_single_split_metadata(self):
+    def test_calls_aiter_public_wrapper_with_tuned_config(self):
         cases = (
             {
                 "name": "k",
@@ -314,13 +314,13 @@ class TestTunedMxfp4Bmm(CustomTestCase):
                 output = torch.empty(output_shape, dtype=torch.bfloat16)
                 config = case["config"]
                 original_config = config.copy()
-                launch = mock.Mock()
-                kernel = mock.MagicMock()
-                kernel.__getitem__.return_value = launch
+                wrapper_result = mock.sentinel.wrapper_result
 
                 with mock.patch.object(
-                    forward_mla, "_batched_gemm_a16wfp4_kernel", kernel
-                ):
+                    forward_mla,
+                    "batched_gemm_a16wfp4",
+                    return_value=wrapper_result,
+                ) as batched_gemm:
                     result = forward_mla._run_tuned_mxfp4_bmm(
                         x,
                         weight,
@@ -331,52 +331,19 @@ class TestTunedMxfp4Bmm(CustomTestCase):
                     )
 
                 self.assertEqual(config, original_config)
-                kernel.__getitem__.assert_called_once()
-                grid = kernel.__getitem__.call_args.args[0]
-                args, metadata = launch.call_args
-                self.assertEqual(
-                    grid(metadata),
-                    (
-                        batch,
-                        forward_mla.triton.cdiv(m, config["BLOCK_SIZE_M"])
-                        * forward_mla.triton.cdiv(n, config["BLOCK_SIZE_N"]),
-                    ),
+                batched_gemm.assert_called_once_with(
+                    x,
+                    weight,
+                    scale,
+                    y=output,
+                    config=original_config,
+                    transpose_bm=case["transpose_bm"],
+                    prequant=True,
+                    y_scale=None,
+                    dtype=torch.bfloat16,
                 )
-                self.assertIs(args[0], x)
-                self.assertIs(args[1], weight)
-                self.assertIs(args[2], output)
-                self.assertIs(args[3], scale)
-                self.assertIsNone(args[4])
-                self.assertEqual(args[5:8], (m, n, packed_k))
-                self.assertEqual(args[8:11], x.stride())
-                self.assertEqual(args[11:14], weight.stride())
-                expected_stride_cb = (
-                    output.stride(1) if case["transpose_bm"] else output.stride(0)
-                )
-                expected_stride_cm = (
-                    output.stride(0) if case["transpose_bm"] else output.stride(1)
-                )
-                self.assertEqual(
-                    args[14:18],
-                    (
-                        expected_stride_cb,
-                        0,
-                        expected_stride_cm,
-                        output.stride(2),
-                    ),
-                )
-                self.assertEqual(args[18:21], scale.stride())
-                self.assertTrue(metadata["PRE_QUANT"])
-                self.assertFalse(metadata["HAVE_Y_SCALE"])
-                self.assertEqual(metadata["NUM_KSPLIT"], 1)
-                self.assertEqual(metadata["SPLITK_BLOCK_SIZE"], 2 * packed_k)
-                for block_size in (
-                    "BLOCK_SIZE_M",
-                    "BLOCK_SIZE_N",
-                    "BLOCK_SIZE_K",
-                ):
-                    self.assertEqual(metadata[block_size], config[block_size])
-                self.assertIs(result, output)
+                self.assertIs(batched_gemm.call_args.kwargs["config"], config)
+                self.assertIs(result, wrapper_result)
 
 
 class TestMxfp4VDispatch(CustomTestCase):

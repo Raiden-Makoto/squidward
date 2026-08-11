@@ -159,12 +159,10 @@ if _use_aiter:
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
 if _use_aiter_gfx95:
-    import triton
-
     from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
-        _batched_gemm_a16wfp4_kernel,
         _get_config as _get_mxfp4_bmm_config,
     )
+    from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
     from aiter.ops.triton.fused_fp8_quant import (
         fused_flatten_fp8_group_quant,
         fused_rms_fp8_group_quant,
@@ -216,54 +214,17 @@ def _run_tuned_mxfp4_bmm(
     *,
     transpose_bm: bool,
 ) -> torch.Tensor:
-    # AITER d9e5ef7's custom-op wrapper can silently resume with config=None
-    # after a compile graph break. Launch its existing single-split Triton
-    # kernel directly so these explicit meta-parameters remain authoritative.
-    config = config.copy()
-    assert config["NUM_KSPLIT"] == 1
-
-    batch, m, _ = x.shape
-    _, n, packed_k = weight.shape
-    config["SPLITK_BLOCK_SIZE"] = 2 * packed_k
-    if config["BLOCK_SIZE_K"] >= 2 * packed_k:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * packed_k)
-
-    stride_cb = output.stride(1) if transpose_bm else output.stride(0)
-    stride_cm = output.stride(0) if transpose_bm else output.stride(1)
-    stride_cn = output.stride(2)
-    grid = lambda meta: (
-        batch,
-        triton.cdiv(m, meta["BLOCK_SIZE_M"])
-        * triton.cdiv(n, meta["BLOCK_SIZE_N"]),
-    )
-
-    _batched_gemm_a16wfp4_kernel[grid](
+    return batched_gemm_a16wfp4(
         x,
         weight,
-        output,
         weight_scale,
-        None,
-        m,
-        n,
-        packed_k,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
-        weight.stride(0),
-        weight.stride(1),
-        weight.stride(2),
-        stride_cb,
-        0,
-        stride_cm,
-        stride_cn,
-        weight_scale.stride(0),
-        weight_scale.stride(1),
-        weight_scale.stride(2),
-        PRE_QUANT=True,
-        HAVE_Y_SCALE=False,
-        **config,
+        y=output,
+        config=config,
+        transpose_bm=transpose_bm,
+        prequant=True,
+        y_scale=None,
+        dtype=torch.bfloat16,
     )
-    return output
 
 
 def _run_mxfp4_k_bmm(
