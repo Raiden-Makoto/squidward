@@ -1,6 +1,9 @@
 # ROCm tree speculative sampling validation
 
-Branch `RM/rocm-tree-spec-sampling-triton`, Jacob stack tip `1ea4bd1ce5`.
+Branch `RM/rocm-tree-spec-sampling-triton`.
+
+Capture `ac114dcb0b`, component benchmark `d903206a6f`, model
+`zai-org/GLM-5.2-FP8@ba978f7d347eaf65d22f1a86833408afdb953541`.
 
 ## Triton tree verifier
 
@@ -40,20 +43,46 @@ Branch `RM/rocm-tree-spec-sampling-triton`, Jacob stack tip `1ea4bd1ce5`.
 | MI355X / ROCm | `tree_speculative_sampling_target_only_triton` | `top_k_renorm_probs_triton`, `top_p_renorm_probs_triton` |
 | B200 / CUDA | `sgl_kernel.tree_speculative_sampling_target_only` | FlashInfer `top_k_renorm_probs`, `top_p_renorm_probs` |
 
-## Cross-platform performance
+## Production capture
 
-1536 rows, vocabulary 151936; probability distributions swept by top-1 mass.
+| Hardware | Vocab | Top-k | Steps | Draft tokens | Captured rows | Batch sizes | Decode call indices |
+| -------- | ----: | ----: | ----: | -----------: | ------------: | ----------- | ------------------ |
+| MI355X | 154880 | 2 | 5 | 6 | 192 | 1 / 2 / 4 / 8 | 0–7485 |
 
-| Operation | Distribution / batch | Faster platform | Margin |
-| --------- | -------------------- | --------------- | -----: |
-| Tree verification | bs=256 | B200 AOT | 1.20x / 0.038 ms |
-| Top-k renormalization | all rows | B200 AOT | 1.81x |
-| Top-p renormalization | top1 ≤ 0.07 | B200 AOT | 5.2–6.5x |
-| Top-p renormalization | top1 0.20–0.60 | B200 AOT | 1.31–1.45x |
-| Top-p renormalization | top1 ≥ 0.76 | MI355X Triton | 1.37–1.40x |
+| Metric | Min | Median | Max |
+| ------ | --: | -----: | --: |
+| Maximum token probability | 0.3132 | 0.9970 | 1.0000 |
+| Top-p nucleus size | 1 | 1 | 15 |
+| Acceptance length | 0 | 3 | 5 |
 
-## Remaining performance boundary
+| Metric | Value |
+| ------ | ----: |
+| Rows with nucleus > 4096 | 0 / 192 |
+| Top-k renormalization calls | 0 |
+| Batch-8 decode calls | 7336 |
+| Total decode calls | 7486–8191 |
+| Batch-8 call share | 89.6–98.0% |
 
-| Path | Trigger | Cost |
-| ---- | ------- | ---- |
-| `torch.sort` fallback | Nucleus exceeds 4096 entries | Approximately 5x vs B200 AOT |
+## MI355X component latency
+
+Milliseconds, p50 unless marked p95. Real captured rows repeated to each batch size.
+
+| Batch | Rows | Top-p pivot | Masked sum | Masked scale | Apply | Full top-p | Full top-p p95 | Tree verifier | Tree p95 | Index move / layer | Index move / 78 layers |
+| ----: | ---: | ----------: | ---------: | -----------: | ----: | ---------: | -------------: | ------------: | --------: | -----------------: | ----------------------: |
+| 1 | 6 | 0.162 | 0.016 | 0.017 | 0.037 | 0.210 | 0.244 | 0.085 | 0.088 | 0.0286 | 1.886 |
+| 2 | 12 | 0.200 | 0.016 | 0.016 | 0.036 | 0.252 | 0.292 | 0.085 | 0.089 | 0.0267 | 1.924 |
+| 4 | 24 | 0.227 | 0.015 | 0.015 | 0.036 | 0.265 | 0.307 | 0.085 | 0.095 | 0.0264 | 1.901 |
+| 8 | 48 | 0.257 | 0.014 | 0.017 | 0.035 | 0.297 | 0.328 | 0.096 | 0.106 | 0.0262 | 1.867 |
+| 32 | 192 | 0.445 | 0.025 | 0.038 | 0.060 | 0.512 | 0.545 | 0.126 | 0.131 | 0.0268 | 1.885 |
+| 128 | 768 | 1.360 | 0.086 | 0.199 | 0.279 | 1.651 | 1.662 | 0.163 | 0.165 | 0.0268 | 1.891 |
+| 256 | 1536 | 2.334 | 0.166 | 0.370 | 0.539 | 2.885 | 2.901 | 0.198 | 0.202 | 0.0266 | 1.887 |
+
+## Optimization ranking
+
+| Rank | Path | Batch-8 ms | Batch-8 share | Batch-256 ms | Batch-256 share |
+| ---: | ---- | ---------: | ------------: | -----------: | --------------: |
+| 1 | DSA index relocation, 78 layers | 1.867 | 81.7% | 1.887 | 37.8% |
+| 2 | Top-p pivot selection | 0.257 | 11.3% | 2.334 | 46.7% |
+| 3 | Top-p Triton apply | 0.035 | 1.5% | 0.539 | 10.8% |
+| 4 | Target-only tree verifier | 0.096 | 4.2% | 0.198 | 4.0% |
+| 5 | Top-p full-sort fallback | 0 | 0.0% | 0 | 0.0% |
