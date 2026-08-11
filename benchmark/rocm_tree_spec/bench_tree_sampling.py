@@ -29,6 +29,7 @@ from sglang.kernels.ops.attention.dsa.index_buf_accessor import MoveKAndS
 from sglang.kernels.ops.speculative.tree_sampling import (
     tree_speculative_sampling_target_only_triton,
 )
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 DEVICE = torch.device("cuda")
 
@@ -336,7 +337,7 @@ def run_capture_bench(args, aot) -> None:
     )
     print(
         f"{'bs':>5} {'tree_p50':>10} {'tree_p95':>10} {'accept':>8} "
-        f"{'move_slots':>10} {'move/layer':>11}"
+        f"{'move_slots':>10} {'move/layer':>11} {'move/78L':>10}"
     )
 
     for batch_size in args.batches:
@@ -389,6 +390,17 @@ def run_capture_bench(args, aot) -> None:
             ),
             args.iters,
         )
+        full_pool = object.__new__(DSATokenToKVPool)
+        full_pool.page_size = pool.page_size
+        full_pool.index_head_dim = pool.index_head_dim
+        full_pool.quant_block_size = pool.quant_block_size
+        full_pool.index_k_with_scale_buffer = [
+            torch.zeros_like(index_buffer) for _ in range(78)
+        ]
+        full_move_samples = latency_samples(
+            lambda: full_pool._move_index_k_cache(tgt_loc, src_loc),
+            args.iters,
+        )
 
         row = {
             "batch_size": batch_size,
@@ -399,6 +411,8 @@ def run_capture_bench(args, aot) -> None:
             "relocation_slots": moved_slots,
             "relocation_p50_ms_per_layer": statistics.median(move_samples),
             "relocation_p95_ms_per_layer": percentile(move_samples, 0.95),
+            "relocation_p50_ms_78_layers": statistics.median(full_move_samples),
+            "relocation_p95_ms_78_layers": percentile(full_move_samples, 0.95),
         }
         if aot is not None:
             aot_samples = latency_samples(
@@ -417,7 +431,8 @@ def run_capture_bench(args, aot) -> None:
             f"{batch_size:>5} {row['tree_p50_ms']:>10.4f} "
             f"{row['tree_p95_ms']:>10.4f} "
             f"{row['acceptance_length_mean']:>8.2f} "
-            f"{moved_slots:>10} {row['relocation_p50_ms_per_layer']:>11.4f}"
+            f"{moved_slots:>10} {row['relocation_p50_ms_per_layer']:>11.4f} "
+            f"{row['relocation_p50_ms_78_layers']:>10.3f}"
         )
 
     if args.output_json:
