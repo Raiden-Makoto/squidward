@@ -63,7 +63,7 @@ if _use_aiter_gfx95:
     )
 
 
-def _resolve_attn_backend(forward_batch: ForwardBatch):
+def resolve_attn_backend(forward_batch: ForwardBatch):
     backend = get_attn_backend()
     if isinstance(backend, TboAttnBackend):
         backend = backend.primary
@@ -82,7 +82,7 @@ def _maybe_quant_o_proj_input(
     )
 
 
-def _forward_dsa_indexer_for_mha(
+def forward_dsa_indexer_for_mha(
     indexer,
     *,
     hidden_states: torch.Tensor,
@@ -237,7 +237,7 @@ class DeepseekMHAForwardMixin:
                         -1, self.num_local_heads, self.qk_head_dim
                     )
                 if self.should_run_indexer():
-                    _forward_dsa_indexer_for_mha(
+                    forward_dsa_indexer_for_mha(
                         self.indexer,
                         hidden_states=hidden_states,
                         q_lora=q_lora,
@@ -313,12 +313,11 @@ class DeepseekMHAForwardMixin:
                 group_size=128,
                 dtype_quant=torch.float8_e4m3fn,
                 res1=None,
-                output_unquantized_inp1=True,  # return unqaunt kv_a
+                output_unquantized_inp1=True,
                 transpose_scale=False,
             )
             if _use_aiter_bpreshuffle_gfx95:
                 kv_a_quanted = materialize_bpreshuffle_fp8_scale_tuple(kv_a_quanted)
-
         else:
             kv_a = self.kv_a_layernorm(kv_a)
 
@@ -328,7 +327,7 @@ class DeepseekMHAForwardMixin:
         # (fused RoPE + quantize for Q/K, direct FP8 KV-cache write) and
         # returns FP8 tensors ready for its kernel. Backends without the
         # hook fall through to the BF16 path below.
-        backend = _resolve_attn_backend(forward_batch)
+        backend = resolve_attn_backend(forward_batch)
         if hasattr(backend, "prepare_prefill_qkv"):
             q_out, k_out, v_out = backend.prepare_prefill_qkv(
                 q=q,
@@ -415,7 +414,7 @@ class DeepseekMHAForwardMixin:
             k_nope = kv[..., : self.qk_nope_head_dim]
             v = kv[..., self.qk_nope_head_dim :]
 
-            k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
+        k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
         return q, k, v, forward_batch
 
     def forward_normal_core(
@@ -524,7 +523,7 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         # kv_b_proj needs BF16 input, but legacy q.dtype was BF16 by accident.
-        backend = _resolve_attn_backend(forward_batch)
+        backend = resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
         kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype
 
