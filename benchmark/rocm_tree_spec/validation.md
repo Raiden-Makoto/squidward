@@ -141,6 +141,12 @@ Configuration: chunk 2048, 4 warps. Fast-path coverage: 192 / 192 captured rows.
 | 128 | 1.159 | 0.753 | 1.54x | 1.368 | 0.940 | 1.46x |
 | 256 | 2.054 | 1.426 | 1.44x | 2.434 | 1.780 | 1.37x |
 
+## GLM top-p smoke
+
+| Commit | Model | Choices | Exact outputs | Normal stops | HTTP status | Completion tokens |
+| ------ | ----- | ------: | ------------: | -----------: | ----------: | ----------------: |
+| `881612341a` | GLM-5.2-FP8 | 8 | 8 / 8 | 8 / 8 | 200 | 64 |
+
 ## Optimization ranking
 
 | Rank | Path | Batch-8 ms | Batch-8 share | Batch-256 ms | Batch-256 share |
