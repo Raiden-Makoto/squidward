@@ -25,6 +25,7 @@ from sglang.kernels.ops.sampling.renorm import (
 from sglang.kernels.ops.sampling.top_p_select_triton import (
     top_p_select_hierarchical_triton,
 )
+from sglang.srt.environ import envs
 
 _BLOCK_SIZE = 1024
 
@@ -222,7 +223,10 @@ def top_p_renorm_probs_triton(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
 ) -> torch.Tensor:
-    if torch.version.hip is not None:
+    if (
+        torch.version.hip is not None
+        and envs.SGLANG_OPT_USE_HIERARCHICAL_TOP_P.get()
+    ):
         return top_p_renorm_probs_triton_hierarchical(probs, top_p)
     return top_p_renorm_probs_triton_scale_fast(probs, top_p)
 
