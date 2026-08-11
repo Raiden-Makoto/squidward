@@ -195,13 +195,24 @@ def top_p_renorm_probs_triton_hierarchical(
         return probs.clone()
     assert probs.shape[1] > 0
 
-    _, _, pivots, normalizers, _, fallback = top_p_select_hierarchical_triton(
+    values, _, _, _, _, _ = top_p_select_hierarchical_triton(
         probs,
         top_ps,
         chunk_size=chunk_size,
         num_warps=num_warps,
     )
-    if bool(fallback.item()):
+    # Preserve the established topk32 path's reduction order exactly. A different
+    # row-sum or prefix-sum tree can move a near-boundary pivot by one token.
+    budget = probs.sum(dim=-1) - (1.0 - top_ps)
+    within = (values.cumsum(dim=-1) - values) <= budget.unsqueeze(1)
+    position = (within.sum(dim=-1) - 1).clamp(min=0)
+    pivots = values.gather(1, position.unsqueeze(1)).squeeze(1)
+    kept = values >= pivots.unsqueeze(1)
+    normalizers = torch.where(kept, values, torch.zeros_like(values)).sum(dim=-1)
+    fast_path = (
+        ~within[:, -1] & (values[:, -1] < pivots) & (normalizers > 0)
+    )
+    if not bool(fast_path.all()):
         return top_p_renorm_probs_triton_baseline(probs, top_ps)
 
     batch_size, vocab_size = probs.shape
@@ -222,6 +233,8 @@ def top_p_renorm_probs_triton(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
 ) -> torch.Tensor:
+    if torch.version.hip is not None:
+        return top_p_renorm_probs_triton_hierarchical(probs, top_p)
     return top_p_renorm_probs_triton_scale_fast(probs, top_p)
 
 

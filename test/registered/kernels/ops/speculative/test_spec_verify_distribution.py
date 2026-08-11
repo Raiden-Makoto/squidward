@@ -398,6 +398,41 @@ class TestTritonTopPFastPath(CustomTestCase):
                 self.assertTrue(torch.equal(fast_path, expected_fast))
                 self.assertEqual(bool(fallback.item()), not bool(expected_fast.all()))
 
+    def test_hierarchical_matches_topk_path_at_large_vocab_boundaries(self):
+        from sglang.kernels.ops.sampling.renorm_triton import (
+            top_p_renorm_probs_triton_hierarchical,
+            top_p_renorm_probs_triton_scale_fast,
+        )
+
+        vocab_size = 154880
+        probs = torch.zeros((6, vocab_size), dtype=torch.float32, device=self.device)
+        indices = torch.tensor(
+            [3, 2051, 4099, 8197, 16391, 32771, 65537, 131071],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        masses = torch.tensor(
+            [0.50, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.01, 0.005625],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        row_indices = (
+            indices.unsqueeze(0)
+            + torch.arange(6, dtype=torch.int64, device=self.device).unsqueeze(1) * 17
+        ) % vocab_size
+        probs.scatter_(1, row_indices, masses.expand(6, -1))
+        top_ps = torch.tensor(
+            [0.5, 0.75, 0.875, 0.9375, 0.96875, 0.984375],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        expected = top_p_renorm_probs_triton_scale_fast(probs, top_ps)
+        got = top_p_renorm_probs_triton_hierarchical(probs, top_ps)
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
+        self.assertTrue(torch.equal(got > 0, expected > 0))
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "GPU is required for this test.")
 class TestSpecRenormFallbacks(CustomTestCase):
     """The torch renorm fallbacks must match the kernels they stand in for.
