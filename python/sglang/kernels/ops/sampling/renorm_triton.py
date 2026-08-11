@@ -222,8 +222,6 @@ def top_p_renorm_probs_triton(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
 ) -> torch.Tensor:
-    if torch.version.hip is not None:
-        return top_p_renorm_probs_triton_hierarchical(probs, top_p)
     return top_p_renorm_probs_triton_scale_fast(probs, top_p)
 
 

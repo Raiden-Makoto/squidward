@@ -4,7 +4,7 @@ Branch `RM/rocm-tree-spec-sampling-triton`.
 
 Capture `ac114dcb0b`, component benchmark `d903206a6f`, top-p candidate
 `f1849b3772`, candidate benchmark `9d069df673`, selection breakdown
-`b681a216c7`, hierarchical selector `fce4a0d2b6`, active path `881612341a`, model
+`b681a216c7`, hierarchical selector `fce4a0d2b6`, model
 `zai-org/GLM-5.2-FP8@ba978f7d347eaf65d22f1a86833408afdb953541`.
 
 ## Triton tree verifier
@@ -121,7 +121,7 @@ Milliseconds, p50. CPU sync is wall time; remaining columns use GPU events.
 | 128 | 0.083 | 1.015 | 0.102 | 0.009 | 0.019 | 1.158 |
 | 256 | 0.170 | 1.814 | 0.101 | 0.009 | 0.019 | 2.053 |
 
-## MI355X hierarchical topk32 selection
+## MI355X hierarchical topk32 candidate
 
 Configuration: chunk 2048, 4 warps. Fast-path coverage: 192 / 192 captured rows.
 
@@ -141,18 +141,26 @@ Configuration: chunk 2048, 4 warps. Fast-path coverage: 192 / 192 captured rows.
 | 128 | 1.159 | 0.753 | 1.54x | 1.368 | 0.940 | 1.46x |
 | 256 | 2.054 | 1.426 | 1.44x | 2.434 | 1.780 | 1.37x |
 
-## GLM top-p smoke
+## GLM hierarchical top-p smoke
 
 | Commit | Model | Choices | Exact outputs | Normal stops | HTTP status | Completion tokens |
 | ------ | ----- | ------: | ------------: | -----------: | ----------: | ----------------: |
 | `881612341a` | GLM-5.2-FP8 | 8 | 8 / 8 | 8 / 8 | 200 | 64 |
 
+## GLM customer correctness
+
+| Path | Correct | Rate | Normal stops | Completion tokens | Mean accept | Exceptions |
+| ---- | ------: | ---: | -----------: | ----------------: | ----------: | ---------: |
+| No speculative decoding | 6 / 8 | 75.0% | 8 / 8 | 256763 | — | 0 |
+| Previous tree top-k=2 | 7 / 8 | 87.5% | 8 / 8 | 317649 | 4.463 | 0 |
+| Hierarchical top-p candidate | 4 / 8 | 50.0% | 8 / 8 | 324252 | 4.389 | 0 |
+
 ## Optimization ranking
 
 | Rank | Path | Batch-8 ms | Batch-8 share | Batch-256 ms | Batch-256 share |
 | ---: | ---- | ---------: | ------------: | -----------: | --------------: |
-| 1 | DSA index relocation, 78 layers | 1.867 | 88.3% | 1.887 | 48.4% |
-| 2 | Hierarchical top-p selection | 0.133 | 6.3% | 1.426 | 36.6% |
-| 3 | Target-only tree verifier | 0.096 | 4.5% | 0.198 | 5.1% |
-| 4 | Top-p scale apply | 0.018 | 0.9% | 0.390 | 10.0% |
+| 1 | DSA index relocation, 78 layers | 1.867 | 82.9% | 1.887 | 41.5% |
+| 2 | Top-p topk32 selection | 0.207 | 9.2% | 2.055 | 45.2% |
+| 3 | Target-only tree verifier | 0.096 | 4.2% | 0.198 | 4.3% |
+| 4 | Top-p scale apply | 0.018 | 0.8% | 0.388 | 8.5% |
 | 5 | Top-p full-sort fallback | 0 | 0.0% | 0 | 0.0% |
