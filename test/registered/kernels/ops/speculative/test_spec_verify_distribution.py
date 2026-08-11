@@ -4,6 +4,7 @@ register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd")
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
