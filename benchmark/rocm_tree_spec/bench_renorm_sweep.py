@@ -44,7 +44,6 @@ from sglang.kernels.ops.sampling.renorm_triton import (
     top_p_renorm_probs_triton_scatter_fast,
 )
 from sglang.kernels.ops.sampling.top_p_select_triton import (
-    _TILE_SIZE,
     _TOP_K,
     _top32_local_sum_kernel,
     _top32_merge_pivot_kernel,
@@ -399,7 +398,6 @@ def run_capture_bench(args, aot) -> None:
                         probs.shape[1],
                         num_chunks=num_local_chunks,
                         TOP_K=_TOP_K,
-                        TILE_SIZE=_TILE_SIZE,
                         CHUNK_SIZE=chunk_size,
                         num_warps=num_warps,
                     )

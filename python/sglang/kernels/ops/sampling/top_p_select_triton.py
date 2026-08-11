@@ -5,7 +5,6 @@ import triton
 import triton.language as tl
 
 _TOP_K = 32
-_TILE_SIZE = 32
 
 
 @triton.jit
@@ -16,14 +15,13 @@ def _top32_local_sum_kernel(
     vocab_size,
     num_chunks: tl.constexpr,
     TOP_K: tl.constexpr,
-    TILE_SIZE: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     chunk = tl.program_id(1).to(tl.int64)
     row_base = row * vocab_size
     chunk_base = chunk * CHUNK_SIZE
-    offsets = chunk_base + tl.arange(0, TILE_SIZE)
+    offsets = chunk_base + tl.arange(0, CHUNK_SIZE)
     valid = offsets < vocab_size
     values = tl.load(
         probs_ptr + row_base + offsets,
@@ -32,18 +30,6 @@ def _top32_local_sum_kernel(
     )
     row_sum = tl.sum(tl.where(valid, values, 0.0), axis=0)
     top_values = tl.topk(values, TOP_K, dim=0)
-
-    for tile in range(1, CHUNK_SIZE // TILE_SIZE):
-        top_values = tl.bitonic_merge(top_values)
-        offsets = chunk_base + tile * TILE_SIZE + tl.arange(0, TILE_SIZE)
-        valid = offsets < vocab_size
-        values = tl.load(
-            probs_ptr + row_base + offsets,
-            mask=valid,
-            other=float("-inf"),
-        )
-        row_sum += tl.sum(tl.where(valid, values, 0.0), axis=0)
-        top_values = tl.maximum(top_values, tl.topk(values, TOP_K, dim=0))
 
     top_values = tl.sort(top_values, dim=0, descending=True)
     output_offsets = (row * num_chunks + chunk) * TOP_K + tl.arange(0, TOP_K)
@@ -149,7 +135,6 @@ def top_p_select_hierarchical_triton(
         vocab_size,
         num_chunks=num_chunks,
         TOP_K=_TOP_K,
-        TILE_SIZE=_TILE_SIZE,
         CHUNK_SIZE=chunk_size,
         num_warps=num_warps,
     )
