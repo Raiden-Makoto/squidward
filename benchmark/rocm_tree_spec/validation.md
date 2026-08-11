@@ -4,7 +4,7 @@ Branch `RM/rocm-tree-spec-sampling-triton`.
 
 Capture `ac114dcb0b`, component benchmark `d903206a6f`, top-p candidate
 `f1849b3772`, candidate benchmark `9d069df673`, selection breakdown
-`b681a216c7`, model
+`b681a216c7`, hierarchical selector `fce4a0d2b6`, active path `881612341a`, model
 `zai-org/GLM-5.2-FP8@ba978f7d347eaf65d22f1a86833408afdb953541`.
 
 ## Triton tree verifier
