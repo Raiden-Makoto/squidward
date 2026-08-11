@@ -53,7 +53,7 @@ elif _is_musa:
     from sgl_kernel import concat_mla_k
 
 if _use_aiter_gfx95:
-    from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+    from aiter.ops.triton.quant.fused_fp8_quant import fused_rms_fp8_group_quant
 
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant

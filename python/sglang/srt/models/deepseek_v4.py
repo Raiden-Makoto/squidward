@@ -297,7 +297,7 @@ _is_gfx942_supported = is_gfx942_supported()
 
 if _use_aiter:
     if _is_gfx95_supported:
-        from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+        from aiter.ops.triton.quant.fused_fp8_quant import fused_rms_fp8_group_quant
 
 
 def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):

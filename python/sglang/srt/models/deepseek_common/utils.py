@@ -113,7 +113,7 @@ if _use_aiter_gfx95:
 
     except ImportError:
         from aiter.ops.quant import per_token_quant_hip as _aiter_per_token_quant_hip
-        from aiter.ops.triton.fused_fp8_quant import (
+        from aiter.ops.triton.quant.fused_fp8_quant import (
             fused_rms_fp8_group_quant as _triton_fused_rms_fp8_group_quant,
         )
 

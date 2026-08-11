@@ -146,15 +146,15 @@ if _use_aiter:
             fused_qk_rmsnorm as fused_qk_rmsnorm_bf16,
         )
 
-    from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
+    from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
 if _use_aiter_gfx95:
     from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
         _get_config as _get_mxfp4_bmm_config,
     )
-    from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
-    from aiter.ops.triton.fused_fp8_quant import (
+    from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
+    from aiter.ops.triton.quant.fused_fp8_quant import (
         fused_flatten_fp8_group_quant,
         fused_rms_fp8_group_quant,
     )
