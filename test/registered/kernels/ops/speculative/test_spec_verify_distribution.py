@@ -216,6 +216,137 @@ class TestPortableSpecRenorm(CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "GPU is required for this test.")
+class TestTritonTopPFastPath(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.device = torch.device("cuda")
+
+    def _distribution_with_nucleus(self, nucleus_size: int, vocab_size: int = 128):
+        weights = torch.arange(
+            vocab_size,
+            0,
+            step=-1,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        probs = weights / weights.sum()
+        cumulative = probs.cumsum(dim=0)
+        lower = cumulative[nucleus_size - 2] if nucleus_size > 1 else 0.0
+        top_p = (lower + cumulative[nucleus_size - 1]) / 2
+        return probs.unsqueeze(0), top_p.unsqueeze(0)
+
+    def _assert_matches_baseline(self, probs, top_ps):
+        from sglang.kernels.ops.sampling import top_p_renorm_probs
+        from sglang.kernels.ops.sampling.renorm_triton import (
+            top_p_renorm_probs_triton,
+            top_p_renorm_probs_triton_baseline,
+            top_p_renorm_probs_triton_scale_fast,
+            top_p_renorm_probs_triton_scatter_fast,
+        )
+
+        expected = top_p_renorm_probs_triton_baseline(probs, top_ps)
+        functions = [
+            top_p_renorm_probs_triton_scale_fast,
+            top_p_renorm_probs_triton_scatter_fast,
+            top_p_renorm_probs_triton,
+        ]
+        if torch.version.hip is not None:
+            functions.append(top_p_renorm_probs)
+        for fn in functions:
+            got = fn(probs, top_ps)
+            self.assertTrue(torch.equal(got > 0, expected > 0))
+            torch.testing.assert_close(got, expected, rtol=2e-5, atol=2e-6)
+            torch.testing.assert_close(
+                got.sum(dim=-1), expected.sum(dim=-1), rtol=1e-6, atol=1e-6
+            )
+
+    def test_fast_nucleus_sizes(self):
+        from sglang.kernels.ops.sampling.renorm import top_p_fast_prefix
+
+        for nucleus_size in (1, 15, 63):
+            with self.subTest(nucleus_size=nucleus_size):
+                probs, top_ps = self._distribution_with_nucleus(nucleus_size)
+                *_, fast_path = top_p_fast_prefix(probs, top_ps)
+                self.assertTrue(bool(fast_path.all()))
+                self._assert_matches_baseline(probs, top_ps)
+
+    def test_boundary_and_cross_prefix_ties_fall_back(self):
+        from sglang.kernels.ops.sampling.renorm import top_p_fast_prefix
+
+        boundary_probs, boundary_top_ps = self._distribution_with_nucleus(64)
+        tied_probs = torch.zeros((1, 128), dtype=torch.float32, device=self.device)
+        tied_probs[:, :70] = 1.0 / 70
+        tied_top_ps = torch.tensor([0.5], device=self.device)
+
+        for probs, top_ps in (
+            (boundary_probs, boundary_top_ps),
+            (tied_probs, tied_top_ps),
+        ):
+            *_, fast_path = top_p_fast_prefix(probs, top_ps)
+            self.assertFalse(bool(fast_path.any()))
+            self._assert_matches_baseline(probs, top_ps)
+
+    def test_ties_contained_inside_prefix_use_fast_path(self):
+        from sglang.kernels.ops.sampling.renorm import top_p_fast_prefix
+
+        probs = torch.full(
+            (1, 128), 0.1 / 113, dtype=torch.float32, device=self.device
+        )
+        probs[:, :15] = 0.9 / 15
+        top_ps = torch.tensor([0.5], device=self.device)
+        *_, fast_path = top_p_fast_prefix(probs, top_ps)
+        self.assertTrue(bool(fast_path.all()))
+        self._assert_matches_baseline(probs, top_ps)
+
+    def test_mixed_p_one_and_zero_rows_fall_back(self):
+        from sglang.kernels.ops.sampling.renorm import top_p_fast_prefix
+
+        fast_probs = torch.full(
+            (1, 128), 0.04 / 127, dtype=torch.float32, device=self.device
+        )
+        fast_probs[:, 0] = 0.96
+        full_probs = torch.arange(
+            128, 0, -1, dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
+        full_probs /= full_probs.sum(dim=-1, keepdim=True)
+        zero_probs = torch.zeros_like(full_probs)
+        probs = torch.cat((fast_probs, full_probs, zero_probs))
+        top_ps = torch.tensor([0.95, 1.0, 0.95], device=self.device)
+
+        *_, fast_path = top_p_fast_prefix(probs, top_ps)
+        self.assertEqual(fast_path.tolist(), [True, False, False])
+        self._assert_matches_baseline(probs, top_ps)
+
+    def test_small_vocab_threshold_forms_and_non_contiguous_input(self):
+        from sglang.kernels.ops.sampling.renorm import top_p_fast_prefix
+        from sglang.kernels.ops.sampling.renorm_triton import (
+            top_p_renorm_probs_triton,
+            top_p_renorm_probs_triton_baseline,
+        )
+
+        base = torch.rand((2, 64), dtype=torch.float32, device=self.device)
+        probs = base[:, ::2]
+        probs /= probs.sum(dim=-1, keepdim=True)
+        self.assertFalse(probs.is_contiguous())
+
+        for top_p in (
+            0.0,
+            0.9,
+            torch.tensor([0.9], device=self.device),
+            torch.tensor([0.5, 0.95], device=self.device),
+        ):
+            expected = top_p_renorm_probs_triton_baseline(probs, top_p)
+            got = top_p_renorm_probs_triton(probs, top_p)
+            self.assertTrue(torch.equal(got > 0, expected > 0))
+            torch.testing.assert_close(got, expected, rtol=2e-5, atol=2e-6)
+
+        top_ps = torch.tensor([1.0, 1.0], device=self.device)
+        *_, fast_path = top_p_fast_prefix(probs.contiguous(), top_ps)
+        self.assertTrue(bool(fast_path.all()))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "GPU is required for this test.")
 class TestSpecRenormFallbacks(CustomTestCase):
     """The torch renorm fallbacks must match the kernels they stand in for.
 
