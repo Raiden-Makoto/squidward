@@ -4,7 +4,8 @@ Branch `RM/rocm-tree-spec-sampling-triton`.
 
 Capture `ac114dcb0b`, component benchmark `d903206a6f`, top-p candidate
 `f1849b3772`, candidate benchmark `9d069df673`, selection breakdown
-`b681a216c7`, hierarchical selector `fce4a0d2b6`, model
+`b681a216c7`, hierarchical selector `fce4a0d2b6`, exact metadata
+`b073058644`, model
 `zai-org/GLM-5.2-FP8@ba978f7d347eaf65d22f1a86833408afdb953541`.
 
 ## Triton tree verifier
@@ -125,21 +126,21 @@ Milliseconds, p50. CPU sync is wall time; remaining columns use GPU events.
 
 Configuration: chunk 2048, 4 warps. Fast-path coverage: 192 / 192 captured rows.
 
-| Batch | Rows | Stage 1 p50 | Stage 1 p95 | Stage 2 p50 | Stage 2 p95 | CPU fallback sync p50 | Scale apply p50 | Full top-p p50 | Full top-p p95 |
+| Batch | Rows | Stage 1 p50 | Stage 1 p95 | Stage 2 p50 | Stage 2 p95 | CPU fallback sync p50 | Scale apply p50 | Exact full p50 | Exact full p95 |
 | ----: | ---: | -----------: | -----------: | -----------: | -----------: | --------------------: | --------------: | -------------: | -------------: |
-| 1 | 6 | 0.019 | 0.024 | 0.057 | 0.060 | 0.019 | 0.016 | 0.135 | 0.152 |
-| 8 | 48 | 0.057 | 0.059 | 0.057 | 0.060 | 0.019 | 0.018 | 0.165 | 0.197 |
-| 32 | 192 | 0.175 | 0.178 | 0.062 | 0.065 | 0.019 | 0.039 | 0.305 | 0.316 |
-| 128 | 768 | 0.651 | 0.657 | 0.083 | 0.085 | 0.019 | 0.196 | 0.940 | 0.960 |
-| 256 | 1536 | 1.283 | 1.318 | 0.124 | 0.126 | 0.019 | 0.390 | 1.780 | 1.800 |
+| 1 | 6 | 0.019 | 0.021 | 0.057 | 0.059 | 0.019 | 0.016 | 0.214 | 0.278 |
+| 8 | 48 | 0.057 | 0.060 | 0.058 | 0.060 | 0.019 | 0.019 | 0.251 | 0.394 |
+| 32 | 192 | 0.175 | 0.181 | 0.061 | 0.062 | 0.019 | 0.039 | 0.401 | 0.462 |
+| 128 | 768 | 0.649 | 0.657 | 0.082 | 0.084 | 0.019 | 0.196 | 1.105 | 1.116 |
+| 256 | 1536 | 1.285 | 1.303 | 0.124 | 0.129 | 0.019 | 0.388 | 2.032 | 2.067 |
 
-| Batch | Topk32 selection | Hierarchical selection | Selection speedup | Scale full | Hierarchical full | Full speedup |
-| ----: | ---------------: | ---------------------: | ----------------: | ---------: | ----------------: | -----------: |
-| 1 | 0.140 | 0.095 | 1.47x | 0.203 | 0.135 | 1.50x |
-| 8 | 0.208 | 0.133 | 1.56x | 0.267 | 0.165 | 1.62x |
-| 32 | 0.368 | 0.256 | 1.44x | 0.441 | 0.305 | 1.45x |
-| 128 | 1.159 | 0.753 | 1.54x | 1.368 | 0.940 | 1.46x |
-| 256 | 2.054 | 1.426 | 1.44x | 2.434 | 1.780 | 1.37x |
+| Batch | Topk32 full | Exact hierarchical full | Speedup |
+| ----: | ----------: | ----------------------: | ------: |
+| 1 | 0.199 | 0.214 | 0.93x |
+| 8 | 0.266 | 0.251 | 1.06x |
+| 32 | 0.442 | 0.401 | 1.10x |
+| 128 | 1.361 | 1.105 | 1.23x |
+| 256 | 2.434 | 2.032 | 1.20x |
 
 ## GLM hierarchical top-p smoke
 
@@ -153,14 +154,14 @@ Configuration: chunk 2048, 4 warps. Fast-path coverage: 192 / 192 captured rows.
 | ---- | ------: | ---: | -----------: | ----------------: | ----------: | ---------: |
 | No speculative decoding | 6 / 8 | 75.0% | 8 / 8 | 256763 | — | 0 |
 | Previous tree top-k=2 | 7 / 8 | 87.5% | 8 / 8 | 317649 | 4.463 | 0 |
-| Hierarchical top-p candidate | 4 / 8 | 50.0% | 8 / 8 | 324252 | 4.389 | 0 |
+| Fused-metadata hierarchical | 4 / 8 | 50.0% | 8 / 8 | 324252 | 4.389 | 0 |
+| Exact-metadata hierarchical | 8 / 8 | 100.0% | 8 / 8 | 332964 | 4.445 | 0 |
 
 ## Optimization ranking
 
 | Rank | Path | Batch-8 ms | Batch-8 share | Batch-256 ms | Batch-256 share |
 | ---: | ---- | ---------: | ------------: | -----------: | --------------: |
-| 1 | DSA index relocation, 78 layers | 1.867 | 82.9% | 1.887 | 41.5% |
-| 2 | Top-p topk32 selection | 0.207 | 9.2% | 2.055 | 45.2% |
-| 3 | Target-only tree verifier | 0.096 | 4.2% | 0.198 | 4.3% |
-| 4 | Top-p scale apply | 0.018 | 0.8% | 0.388 | 8.5% |
-| 5 | Top-p full-sort fallback | 0 | 0.0% | 0 | 0.0% |
+| 1 | DSA index relocation, 78 layers | 1.867 | 84.3% | 1.887 | 45.8% |
+| 2 | Exact hierarchical top-p | 0.251 | 11.3% | 2.032 | 49.4% |
+| 3 | Target-only tree verifier | 0.096 | 4.3% | 0.198 | 4.8% |
+| 4 | Top-p full-sort fallback | 0 | 0.0% | 0 | 0.0% |
