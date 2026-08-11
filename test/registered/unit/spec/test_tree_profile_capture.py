@@ -90,7 +90,9 @@ class TestTreeProfileCapture(CustomTestCase):
             try:
                 with (
                     envs.SGLANG_DEBUG_SPEC_PROBS_CAPTURE_DIR.override(str(output_dir)),
-                    envs.SGLANG_DEBUG_SPEC_PROBS_CAPTURE_ARM_FILE.override(str(arm_file)),
+                    envs.SGLANG_DEBUG_SPEC_PROBS_CAPTURE_ARM_FILE.override(
+                        str(arm_file)
+                    ),
                 ):
                     self.assertIsNone(tree_profile_capture.get_tree_profile_capture())
                     arm_file.touch()
