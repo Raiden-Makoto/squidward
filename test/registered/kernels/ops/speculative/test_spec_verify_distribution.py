@@ -290,9 +290,7 @@ class TestTritonTopPFastPath(CustomTestCase):
     def test_ties_contained_inside_prefix_use_fast_path(self):
         from sglang.kernels.ops.sampling.renorm import top_p_fast_prefix
 
-        probs = torch.full(
-            (1, 128), 0.1 / 113, dtype=torch.float32, device=self.device
-        )
+        probs = torch.full((1, 128), 0.1 / 113, dtype=torch.float32, device=self.device)
         probs[:, :15] = 0.9 / 15
         top_ps = torch.tensor([0.5], device=self.device)
         *_, fast_path = top_p_fast_prefix(probs, top_ps)

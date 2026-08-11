@@ -100,11 +100,7 @@ def top_p_fast_prefix(
     if prefix == vocab_size:
         fast_path = normalizers > 0
     else:
-        fast_path = (
-            ~within[:, -1]
-            & (values[:, -1] < pivots)
-            & (normalizers > 0)
-        )
+        fast_path = ~within[:, -1] & (values[:, -1] < pivots) & (normalizers > 0)
     return values, indices, pivots, normalizers, fast_path
 
 
