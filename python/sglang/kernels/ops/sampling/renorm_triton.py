@@ -183,7 +183,7 @@ def top_p_renorm_probs_triton(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
 ) -> torch.Tensor:
-    return top_p_renorm_probs_triton_scatter_fast(probs, top_p)
+    return top_p_renorm_probs_triton_scale_fast(probs, top_p)
 
 
 __all__ = [
