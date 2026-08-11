@@ -3,7 +3,8 @@
 Branch `RM/rocm-tree-spec-sampling-triton`.
 
 Capture `ac114dcb0b`, component benchmark `d903206a6f`, top-p candidate
-`f1849b3772`, candidate benchmark `9d069df673`, model
+`f1849b3772`, candidate benchmark `9d069df673`, selection breakdown
+`b681a216c7`, model
 `zai-org/GLM-5.2-FP8@ba978f7d347eaf65d22f1a86833408afdb953541`.
 
 ## Triton tree verifier
@@ -105,6 +106,20 @@ Milliseconds, p50. Fast-path coverage: 192 / 192 captured rows.
 | 32 | 0.365 | 0.374 | 0.367 | 0.376 | 0.368 | 0.376 |
 | 128 | 1.154 | 1.162 | 1.156 | 1.165 | 1.159 | 1.169 |
 | 256 | 2.046 | 2.052 | 2.051 | 2.059 | 2.059 | 2.068 |
+
+## MI355X topk32 selection breakdown
+
+Milliseconds, p50. CPU sync is wall time; remaining columns use GPU events.
+
+| Batch | Row sum | `torch.topk` | Prefix math | GPU fallback check | CPU fallback sync | Combined selection |
+| ----: | ------: | -----------: | ----------: | -----------------: | ----------------: | -----------------: |
+| 1 | 0.016 | 0.078 | 0.096 | 0.007 | 0.019 | 0.142 |
+| 2 | 0.015 | 0.101 | 0.087 | 0.006 | 0.018 | 0.157 |
+| 4 | 0.015 | 0.117 | 0.086 | 0.006 | 0.018 | 0.186 |
+| 8 | 0.016 | 0.132 | 0.100 | 0.009 | 0.019 | 0.208 |
+| 32 | 0.029 | 0.286 | 0.101 | 0.009 | 0.019 | 0.366 |
+| 128 | 0.083 | 1.015 | 0.102 | 0.009 | 0.019 | 1.158 |
+| 256 | 0.170 | 1.814 | 0.101 | 0.009 | 0.019 | 2.053 |
 
 ## Optimization ranking
 
