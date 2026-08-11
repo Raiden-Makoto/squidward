@@ -356,9 +356,7 @@ class TestTritonTopPFastPath(CustomTestCase):
             (6, 1549, 512),
             (2, 154880, 1024),
         ):
-            with self.subTest(
-                rows=rows, vocab_size=vocab_size, chunk_size=chunk_size
-            ):
+            with self.subTest(rows=rows, vocab_size=vocab_size, chunk_size=chunk_size):
                 generator = torch.Generator(device=self.device).manual_seed(vocab_size)
                 probs = torch.softmax(
                     torch.randn(
@@ -373,9 +371,13 @@ class TestTritonTopPFastPath(CustomTestCase):
                 top_ps = torch.full(
                     (rows,), 0.95, dtype=torch.float32, device=self.device
                 )
-                expected_values, _, expected_pivots, expected_normalizers, expected_fast = (
-                    top_p_fast_prefix(probs, top_ps)
-                )
+                (
+                    expected_values,
+                    _,
+                    expected_pivots,
+                    expected_normalizers,
+                    expected_fast,
+                ) = top_p_fast_prefix(probs, top_ps)
                 (
                     values,
                     row_sums,
@@ -390,9 +392,7 @@ class TestTritonTopPFastPath(CustomTestCase):
                 torch.testing.assert_close(
                     row_sums, probs.sum(dim=-1), rtol=2e-5, atol=2e-6
                 )
-                torch.testing.assert_close(
-                    pivots, expected_pivots, rtol=0, atol=0
-                )
+                torch.testing.assert_close(pivots, expected_pivots, rtol=0, atol=0)
                 torch.testing.assert_close(
                     normalizers, expected_normalizers, rtol=2e-5, atol=2e-6
                 )

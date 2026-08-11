@@ -46,9 +46,7 @@ def _top32_local_sum_kernel(
         top_values = tl.maximum(top_values, tl.topk(values, TOP_K, dim=0))
 
     top_values = tl.sort(top_values, dim=0, descending=True)
-    output_offsets = (
-        (row * num_chunks + chunk) * TOP_K + tl.arange(0, TOP_K)
-    )
+    output_offsets = (row * num_chunks + chunk) * TOP_K + tl.arange(0, TOP_K)
     tl.store(local_values_ptr + output_offsets, top_values)
     tl.store(partial_sums_ptr + row * num_chunks + chunk, row_sum)
 
@@ -75,13 +73,9 @@ def _top32_merge_pivot_kernel(
 
     for chunk in range(1, num_chunks):
         top_values = tl.bitonic_merge(top_values)
-        offsets = (
-            (row * num_chunks + chunk) * TOP_K + tl.arange(0, TOP_K)
-        )
+        offsets = (row * num_chunks + chunk) * TOP_K + tl.arange(0, TOP_K)
         values = tl.load(local_values_ptr + offsets)
-        top_values = tl.maximum(
-            top_values, tl.topk(values, TOP_K, dim=0)
-        )
+        top_values = tl.maximum(top_values, tl.topk(values, TOP_K, dim=0))
         row_sum += tl.load(partial_sums_ptr + row * num_chunks + chunk)
 
     top_values = tl.sort(top_values, dim=0, descending=True)
@@ -93,9 +87,7 @@ def _top32_merge_pivot_kernel(
     positions = tl.arange(0, TOP_K)
     pivot = tl.sum(tl.where(positions == position, top_values, 0.0), axis=0)
     normalizer = tl.sum(tl.where(top_values >= pivot, top_values, 0.0), axis=0)
-    last_value = tl.sum(
-        tl.where(positions == TOP_K - 1, top_values, 0.0), axis=0
-    )
+    last_value = tl.sum(tl.where(positions == TOP_K - 1, top_values, 0.0), axis=0)
     last_within = (
         tl.sum(
             tl.where(positions == TOP_K - 1, within.to(tl.int32), 0),

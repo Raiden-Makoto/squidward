@@ -39,8 +39,15 @@ from sglang.kernels.ops.sampling.renorm_triton import (
     top_k_renorm_probs_triton,
     top_p_renorm_probs_triton,
     top_p_renorm_probs_triton_baseline,
+    top_p_renorm_probs_triton_hierarchical,
     top_p_renorm_probs_triton_scale_fast,
     top_p_renorm_probs_triton_scatter_fast,
+)
+from sglang.kernels.ops.sampling.top_p_select_triton import (
+    _TILE_SIZE,
+    _TOP_K,
+    _top32_local_sum_kernel,
+    _top32_merge_pivot_kernel,
 )
 
 DEV = torch.device("cuda")
@@ -361,6 +368,103 @@ def run_capture_bench(args, aot) -> None:
                     "p95_ms": percentile(variant_samples, 0.95),
                     "fast_path_rate": float(variant_fast_path.float().mean()),
                 }
+        row["hierarchical_variants"] = {}
+        for chunk_size in (512, 1024, 2048):
+            num_local_chunks = triton.cdiv(probs.shape[1], chunk_size)
+            local_values = torch.empty(
+                (rows, num_local_chunks, _TOP_K),
+                dtype=torch.float32,
+                device=DEV,
+            )
+            partial_sums = torch.empty(
+                (rows, num_local_chunks), dtype=torch.float32, device=DEV
+            )
+            hierarchical_values = torch.empty(
+                (rows, _TOP_K), dtype=torch.float32, device=DEV
+            )
+            hierarchical_sums = torch.empty(rows, dtype=torch.float32, device=DEV)
+            hierarchical_pivots = torch.empty_like(hierarchical_sums)
+            hierarchical_normalizers = torch.empty_like(hierarchical_sums)
+            hierarchical_fast = torch.empty(rows, dtype=torch.bool, device=DEV)
+            hierarchical_fallback = torch.zeros((), dtype=torch.int32, device=DEV)
+
+            for num_warps in (4, 8):
+                name = f"chunk{chunk_size}_warps{num_warps}"
+
+                def stage1():
+                    _top32_local_sum_kernel[(rows, num_local_chunks)](
+                        probs,
+                        local_values,
+                        partial_sums,
+                        probs.shape[1],
+                        num_chunks=num_local_chunks,
+                        TOP_K=_TOP_K,
+                        TILE_SIZE=_TILE_SIZE,
+                        CHUNK_SIZE=chunk_size,
+                        num_warps=num_warps,
+                    )
+
+                def stage2():
+                    _top32_merge_pivot_kernel[(rows,)](
+                        local_values,
+                        partial_sums,
+                        top_ps,
+                        hierarchical_values,
+                        hierarchical_sums,
+                        hierarchical_pivots,
+                        hierarchical_normalizers,
+                        hierarchical_fast,
+                        hierarchical_fallback,
+                        num_chunks=num_local_chunks,
+                        TOP_K=_TOP_K,
+                        num_warps=num_warps,
+                    )
+
+                stage1()
+                stage2()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    hierarchical_values, topk32_values, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    hierarchical_sums, row_totals, rtol=2e-5, atol=2e-6
+                )
+                assert bool(hierarchical_fast.all())
+                assert not bool(hierarchical_fallback.item())
+                stage1_samples = latency_samples(stage1, args.iters)
+                stage2_samples = latency_samples(stage2, args.iters)
+                fallback_wall_samples = wall_latency_samples(
+                    lambda: bool(hierarchical_fallback.item()), args.iters
+                )
+                full_hierarchical_samples = latency_samples(
+                    lambda: top_p_renorm_probs_triton_hierarchical(
+                        probs,
+                        top_ps,
+                        chunk_size=chunk_size,
+                        num_warps=num_warps,
+                    ),
+                    args.iters,
+                )
+                got = top_p_renorm_probs_triton_hierarchical(
+                    probs,
+                    top_ps,
+                    chunk_size=chunk_size,
+                    num_warps=num_warps,
+                )
+                torch.testing.assert_close(got, expected, rtol=2e-5, atol=2e-6)
+                assert torch.equal(got > 0, expected > 0)
+                row["hierarchical_variants"][name] = {
+                    "stage1_p50_ms": statistics.median(stage1_samples),
+                    "stage1_p95_ms": percentile(stage1_samples, 0.95),
+                    "stage2_p50_ms": statistics.median(stage2_samples),
+                    "stage2_p95_ms": percentile(stage2_samples, 0.95),
+                    "fallback_sync_wall_p50_ms": statistics.median(
+                        fallback_wall_samples
+                    ),
+                    "full_p50_ms": statistics.median(full_hierarchical_samples),
+                    "full_p95_ms": percentile(full_hierarchical_samples, 0.95),
+                    "fast_path_rate": float(hierarchical_fast.float().mean()),
+                }
         top_k_is_active = bool((top_ks < probs.shape[1]).any())
         if top_k_is_active:
             top_k_samples = latency_samples(
@@ -419,6 +523,17 @@ def run_capture_bench(args, aot) -> None:
             f"{row['fallback_sync_wall_p50_ms']:>10.3f} "
             f"{row['fast_prefix_p50_ms']:>10.3f}"
         )
+
+    print("\nhierarchical top32 variants (selection p50/p95, full p50/p95 ms)")
+    print(f"{'bs':>5} {'config':>20} {'stage1':>13} {'stage2':>13} {'full':>13}")
+    for row in output["rows"]:
+        for name, value in row["hierarchical_variants"].items():
+            print(
+                f"{row['batch_size']:>5} {name:>20} "
+                f"{value['stage1_p50_ms']:.3f}/{value['stage1_p95_ms']:.3f} "
+                f"{value['stage2_p50_ms']:.3f}/{value['stage2_p95_ms']:.3f} "
+                f"{value['full_p50_ms']:.3f}/{value['full_p95_ms']:.3f}"
+            )
 
 
 def describe(probs: torch.Tensor, top_p: float, sample_rows: int = 64):
