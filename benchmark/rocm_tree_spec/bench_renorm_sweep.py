@@ -202,13 +202,11 @@ def run_capture_bench(args, aot) -> None:
 
         def prefix_math():
             budget = row_totals - (1.0 - top_ps)
-            within = (
-                topk32_values.cumsum(dim=-1) - topk32_values
-            ) <= budget.unsqueeze(1)
+            within = (topk32_values.cumsum(dim=-1) - topk32_values) <= budget.unsqueeze(
+                1
+            )
             position = (within.sum(dim=-1) - 1).clamp(min=0)
-            candidate_pivots = topk32_values.gather(
-                1, position.unsqueeze(1)
-            ).squeeze(1)
+            candidate_pivots = topk32_values.gather(1, position.unsqueeze(1)).squeeze(1)
             candidate_normalizers = torch.where(
                 topk32_values >= candidate_pivots.unsqueeze(1),
                 topk32_values,
@@ -264,9 +262,7 @@ def run_capture_bench(args, aot) -> None:
             lambda: torch.topk(probs, 32, dim=-1, sorted=True), args.iters
         )
         prefix_math_samples = latency_samples(prefix_math, args.iters)
-        fallback_check_samples = latency_samples(
-            lambda: fast_path.all(), args.iters
-        )
+        fallback_check_samples = latency_samples(lambda: fast_path.all(), args.iters)
         fallback_sync_wall_samples = wall_latency_samples(
             lambda: bool(fast_path.all()), args.iters
         )
@@ -325,9 +321,7 @@ def run_capture_bench(args, aot) -> None:
             "topk32_p50_ms": statistics.median(topk32_samples),
             "prefix_math_p50_ms": statistics.median(prefix_math_samples),
             "fallback_check_p50_ms": statistics.median(fallback_check_samples),
-            "fallback_sync_wall_p50_ms": statistics.median(
-                fallback_sync_wall_samples
-            ),
+            "fallback_sync_wall_p50_ms": statistics.median(fallback_sync_wall_samples),
             "fast_scale_apply_p50_ms": statistics.median(fast_scale_samples),
             "fast_scatter_apply_p50_ms": statistics.median(fast_scatter_samples),
             "scale_fast_top_p_p50_ms": statistics.median(scale_full_samples),
