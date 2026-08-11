@@ -3,7 +3,7 @@
 Branch `RM/rocm-tree-spec-sampling-triton`.
 
 Capture `ac114dcb0b`, component benchmark `d903206a6f`, top-p candidate
-`d24cec19d8`, candidate benchmark `ee081c5224`, model
+`f1849b3772`, candidate benchmark `9d069df673`, model
 `zai-org/GLM-5.2-FP8@ba978f7d347eaf65d22f1a86833408afdb953541`.
 
 ## Triton tree verifier
@@ -82,22 +82,36 @@ Milliseconds, p50 unless marked p95. Real captured rows repeated to each batch s
 
 Milliseconds, p50. Fast-path coverage: 192 / 192 captured rows.
 
-| Batch | Rows | Baseline | Topk64 selection | Scale apply | Scatter apply | Scale full | Scatter full | Scale speedup | Scatter speedup |
+| Batch | Rows | Baseline | Topk32 selection | Scale apply | Scatter apply | Scale full | Scatter full | Scale speedup | Scatter speedup |
 | ----: | ---: | -------: | ---------------: | ----------: | ------------: | ---------: | -----------: | ------------: | --------------: |
-| 1 | 6 | 0.211 | 0.141 | 0.016 | 0.013 | 0.199 | 0.202 | 1.059x | 1.043x |
-| 2 | 12 | 0.247 | 0.160 | 0.016 | 0.011 | 0.214 | 0.219 | 1.155x | 1.128x |
-| 4 | 24 | 0.262 | 0.192 | 0.015 | 0.011 | 0.246 | 0.251 | 1.067x | 1.043x |
-| 8 | 48 | 0.296 | 0.212 | 0.017 | 0.012 | 0.266 | 0.270 | 1.114x | 1.095x |
-| 32 | 192 | 0.513 | 0.365 | 0.038 | 0.023 | 0.438 | 0.431 | 1.170x | 1.190x |
-| 128 | 768 | 1.631 | 1.151 | 0.195 | 0.085 | 1.360 | 1.292 | 1.199x | 1.262x |
-| 256 | 1536 | 2.886 | 2.058 | 0.371 | 0.162 | 2.453 | 2.269 | 1.176x | 1.272x |
+| 1 | 6 | 0.211 | 0.139 | 0.017 | 0.012 | 0.201 | 0.200 | 1.049x | 1.058x |
+| 2 | 12 | 0.252 | 0.157 | 0.017 | 0.014 | 0.214 | 0.218 | 1.176x | 1.157x |
+| 4 | 24 | 0.266 | 0.189 | 0.017 | 0.013 | 0.246 | 0.249 | 1.083x | 1.068x |
+| 8 | 48 | 0.301 | 0.207 | 0.018 | 0.012 | 0.263 | 0.267 | 1.146x | 1.126x |
+| 32 | 192 | 0.516 | 0.367 | 0.039 | 0.023 | 0.440 | 0.434 | 1.172x | 1.190x |
+| 128 | 768 | 1.646 | 1.155 | 0.196 | 0.083 | 1.367 | 1.294 | 1.204x | 1.273x |
+| 256 | 1536 | 2.873 | 2.055 | 0.388 | 0.156 | 2.430 | 2.262 | 1.182x | 1.270x |
+
+## MI355X top-k sorting
+
+Milliseconds, p50. Fast-path coverage: 192 / 192 captured rows.
+
+| Batch | Topk16 sorted | Topk16 unsorted + sort | Topk32 sorted | Topk32 unsorted + sort | Topk64 sorted | Topk64 unsorted + sort |
+| ----: | ------------: | ----------------------: | ------------: | ----------------------: | ------------: | ----------------------: |
+| 1 | 0.137 | 0.156 | 0.136 | 0.156 | 0.137 | 0.156 |
+| 2 | 0.155 | 0.166 | 0.157 | 0.167 | 0.160 | 0.168 |
+| 4 | 0.186 | 0.193 | 0.189 | 0.197 | 0.192 | 0.201 |
+| 8 | 0.202 | 0.212 | 0.206 | 0.216 | 0.212 | 0.222 |
+| 32 | 0.365 | 0.374 | 0.367 | 0.376 | 0.368 | 0.376 |
+| 128 | 1.154 | 1.162 | 1.156 | 1.165 | 1.159 | 1.169 |
+| 256 | 2.046 | 2.052 | 2.051 | 2.059 | 2.059 | 2.068 |
 
 ## Optimization ranking
 
 | Rank | Path | Batch-8 ms | Batch-8 share | Batch-256 ms | Batch-256 share |
 | ---: | ---- | ---------: | ------------: | -----------: | --------------: |
-| 1 | DSA index relocation, 78 layers | 1.867 | 82.8% | 1.887 | 41.3% |
-| 2 | Top-p topk64 selection | 0.212 | 9.4% | 2.058 | 45.1% |
+| 1 | DSA index relocation, 78 layers | 1.867 | 82.9% | 1.887 | 41.5% |
+| 2 | Top-p topk32 selection | 0.207 | 9.2% | 2.055 | 45.2% |
 | 3 | Target-only tree verifier | 0.096 | 4.2% | 0.198 | 4.3% |
-| 4 | Top-p scale apply | 0.017 | 0.8% | 0.371 | 8.1% |
+| 4 | Top-p scale apply | 0.018 | 0.8% | 0.388 | 8.5% |
 | 5 | Top-p full-sort fallback | 0 | 0.0% | 0 | 0.0% |
