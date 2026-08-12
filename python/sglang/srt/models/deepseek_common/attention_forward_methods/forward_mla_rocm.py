@@ -882,6 +882,14 @@ class DeepseekMLARocmForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
 
+        if self.layer_id == 0 and num_tokens > 256:
+            logger.warning(
+                "MXFP4 V return: requested=%s type=%s shape=%s",
+                emit_mxfp4_v,
+                type(attn_output),
+                getattr(attn_output, "shape", None),
+            )
+
         # Dense-MHA fallback can be selected inside the backend after the eager
         # eligibility check. Only skip the normal reshape when the producer
         # actually returned the packed-value/scale tuple.
