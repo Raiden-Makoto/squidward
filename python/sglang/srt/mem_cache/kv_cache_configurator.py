@@ -114,6 +114,26 @@ def _should_enable_lazy_compaction() -> bool:
     return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
 
 
+def mm_runtime_reservation_gb(
+    *, is_multimodal: bool, mm_feature_transport: Optional[str]
+) -> float:
+    """Multimodal GPU memory allocated only after the KV pool is sized
+    (mm embedding cache + GPU feature-transport pools); reserve it out of
+    the KV budget so it doesn't have to fit in the runtime slack."""
+    if not is_multimodal:
+        return 0.0
+    reserved_mb = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
+    if mm_feature_transport in ("cuda_ipc", "cuda_vmm"):
+        reserved_mb += envs.SGLANG_MM_FEATURE_CACHE_MB.get()
+    if reserved_mb > 0:
+        logger.info(
+            "Reserving %.2f GB of the KV budget for post-sizing multimodal "
+            "allocations (feature-transport pools + embedding cache).",
+            reserved_mb / 1024,
+        )
+    return reserved_mb / 1024
+
+
 # base ratio of mamba pool size to max_running_requests. Under
 # SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK the decode-time skip frees one resident slot
 # per running request, so the base drops by 1 (overlap 5->4, lazy 4->3). no_buffer
@@ -353,17 +373,29 @@ class KVCacheConfigurator:
         # Unified-pool fast path: build req_to_token + token_to_kv pool + allocator
         # from one byte buffer, then return. Gated to the target worker
         # (req_to_token_pool is None); supports hybrid Mamba and hybrid SWA (not DSV4).
-        if (
-            get_memory().enable_unified_memory
-            and get_disagg().disaggregation_mode == "null"
-            and req_to_token_pool is None
-        ):
+        if get_memory().enable_unified_memory and req_to_token_pool is None:
+            pd_enabled = get_disagg().disaggregation_mode != "null"
             if self.mambaish_config is not None:
+                if pd_enabled and not self.use_mla_backend:
+                    raise ValueError(
+                        "--enable-unified-memory with PD disaggregation "
+                        "currently supports only MLA hybrid-Mamba models "
+                        "(e.g. kimi-linear); this model uses the MHA full-"
+                        "attention pool. Drop --enable-unified-memory or run "
+                        "without PD disaggregation."
+                    )
                 bundle = self._init_unified_mamba_pools(
                     max_num_reqs=sizes.max_running_requests,
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
             elif self.is_hybrid_swa and not is_deepseek_v4(self.model_config.hf_config):
+                if pd_enabled:
+                    raise ValueError(
+                        "--enable-unified-memory with PD disaggregation does "
+                        "not support hybrid-SWA models yet (no whole-envelope "
+                        "transfer scheme for the SWA sub-pool). Drop "
+                        "--enable-unified-memory or run without PD."
+                    )
                 bundle = self._init_unified_swa_pools(
                     max_num_reqs=sizes.max_running_requests,
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
@@ -564,6 +596,11 @@ class KVCacheConfigurator:
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             need_sort=get_disagg().disaggregation_mode in ("decode", "prefill"),
+            decode_pre_alloc_size=(
+                get_disagg().disaggregation_decode_extra_slots
+                if get_disagg().disaggregation_mode == "decode"
+                else 0
+            ),
             mamba_full_memory_ratio=get_schedule().mamba_full_memory_ratio,
             # Overlap mode: the allocator's `free` drops a wait_stream(forward_stream)
             # barrier so eager compaction serializes after the in-flight forward's
@@ -1715,7 +1752,11 @@ class KVCacheConfigurator:
                 )
                 / 1024,
             )
-        rest_memory = available_gpu_memory - slack_gb
+        mm_reservation_gb = mm_runtime_reservation_gb(
+            is_multimodal=self.model_config.is_multimodal,
+            mm_feature_transport=self.server_args.mm_feature_transport,
+        )
+        rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 
