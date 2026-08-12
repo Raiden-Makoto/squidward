@@ -257,6 +257,27 @@ class TestMxfp4KDispatch(CustomTestCase):
 
 
 class TestRocmMxfp4AbsorbedBmmRoute(CustomTestCase):
+    def test_k_overlap_rejects_dense_mha_prefill(self):
+        attn = SimpleNamespace(use_dsa=True, alt_stream=object())
+        with (
+            mock.patch.object(forward_mla_rocm, "_use_aiter_gfx95", True),
+            mock.patch.object(
+                forward_mla_rocm,
+                "get_attn_backend",
+                return_value=SimpleNamespace(use_mha=True),
+            ),
+        ):
+            eligible = (
+                forward_mla_rocm.DeepseekMLARocmForwardMixin._can_overlap_mxfp4_k_quant(
+                    attn,
+                    torch.empty(257, 16, 256),
+                    SimpleNamespace(),
+                    is_capture_mode=False,
+                    q_replicate_active=False,
+                )
+            )
+        self.assertFalse(eligible)
+
     def test_q_route_dispatches_transposed_tensors_to_mxfp4_helper(self):
         q_nope = torch.randn(3, 2, 8, dtype=torch.bfloat16)
         w_kc = torch.zeros(2, 4, 5, dtype=torch.uint8)

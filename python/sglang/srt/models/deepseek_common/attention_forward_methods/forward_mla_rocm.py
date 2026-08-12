@@ -44,7 +44,10 @@ from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
     _run_prepacked_mxfp4_k_bmm,
     _run_prepacked_mxfp4_v_bmm,
@@ -332,6 +335,8 @@ class DeepseekMLARocmForwardMixin:
         q_replicate_active: bool,
     ) -> bool:
         if not (_use_aiter_gfx95 and self.use_dsa and self.alt_stream is not None):
+            return False
+        if get_attn_backend().use_mha:
             return False
         if is_capture_mode or q_replicate_active or get_parallel().dcp_enabled:
             return False

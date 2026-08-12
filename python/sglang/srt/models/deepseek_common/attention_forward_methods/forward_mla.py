@@ -451,7 +451,8 @@ class DeepseekMLAForwardMixin:
             return False
         if self.current_attention_backend not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             return False
-        if get_attn_backend().dsa_prefill_impl != "triton":
+        backend = get_attn_backend()
+        if backend.dsa_prefill_impl != "triton" or backend.use_mha:
             return False
         if (
             not forward_batch.forward_mode.is_extend()
