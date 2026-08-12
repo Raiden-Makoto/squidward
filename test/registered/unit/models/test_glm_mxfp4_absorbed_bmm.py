@@ -286,6 +286,38 @@ class TestRocmMxfp4AbsorbedBmmRoute(CustomTestCase):
         self.assertEqual(result.shape, (2, 3, 5))
         self.assertEqual(result.dtype, torch.bfloat16)
 
+    def test_q_route_consumes_prepacked_activation_without_requantizing(self):
+        q_nope = torch.randn(3, 2, 8, dtype=torch.bfloat16)
+        packed_q = torch.zeros(2, 3, 4, dtype=torch.uint8)
+        q_scale = torch.zeros(2, 3, 1, dtype=torch.uint8)
+        w_kc = torch.zeros(2, 4, 5, dtype=torch.uint8)
+        w_scale_k = torch.zeros(2, 1, 5, dtype=torch.uint8)
+        attn = SimpleNamespace(w_kc=w_kc, w_scale_k=w_scale_k)
+
+        with (
+            mock.patch.object(
+                forward_mla_rocm,
+                "_run_prepacked_mxfp4_k_bmm",
+                side_effect=lambda _x, _xs, _w, _ws, output: output,
+            ) as run_prepacked,
+            mock.patch.object(forward_mla_rocm, "_run_mxfp4_k_bmm") as run_a16,
+        ):
+            result = forward_mla_rocm.rocm_absorb_q_bmm(
+                attn,
+                q_nope,
+                is_capture_mode=False,
+                prepacked_q_nope=(packed_q, q_scale),
+            )
+
+        args, kwargs = run_prepacked.call_args
+        self.assertEqual(kwargs, {})
+        self.assertIs(args[0], packed_q)
+        self.assertIs(args[1], q_scale)
+        self.assertEqual(args[2].shape, (2, 5, 4))
+        self.assertEqual(args[3].shape, (2, 5, 1))
+        self.assertIs(args[4], result)
+        run_a16.assert_not_called()
+
     def test_v_route_flattens_batch_major_mxfp4_output_as_view(self):
         attn_output = torch.randn(3, 2, 8, dtype=torch.bfloat16)
         w_vc = torch.zeros(2, 4, 5, dtype=torch.uint8)
@@ -323,6 +355,41 @@ class TestRocmMxfp4AbsorbedBmmRoute(CustomTestCase):
         self.assertEqual(result.shape, (3, 10))
         self.assertEqual(result.dtype, torch.bfloat16)
         self.assertEqual(result.data_ptr(), bmm_output.data_ptr())
+
+    def test_v_route_consumes_prepacked_attention_output(self):
+        packed_v = torch.zeros(3, 2, 4, dtype=torch.uint8)
+        v_scale = torch.zeros(3, 2, 1, dtype=torch.uint8)
+        w_vc = torch.zeros(2, 4, 5, dtype=torch.uint8)
+        w_scale_v = torch.zeros(2, 1, 5, dtype=torch.uint8)
+        attn = SimpleNamespace(
+            w_vc=w_vc,
+            w_scale_v=w_scale_v,
+            o_proj=SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16)),
+        )
+
+        with (
+            mock.patch.object(
+                forward_mla_rocm,
+                "_run_prepacked_mxfp4_v_bmm",
+                side_effect=lambda _x, _xs, _w, _ws, output: output,
+            ) as run_prepacked,
+            mock.patch.object(forward_mla_rocm, "_run_mxfp4_v_bmm") as run_a16,
+        ):
+            result = forward_mla_rocm.rocm_absorb_v_bmm(
+                attn, (packed_v, v_scale)
+            )
+
+        args, kwargs = run_prepacked.call_args
+        self.assertEqual(kwargs, {})
+        self.assertEqual(args[0].shape, (2, 3, 4))
+        self.assertEqual(args[0].data_ptr(), packed_v.data_ptr())
+        self.assertEqual(args[1].shape, (2, 3, 1))
+        self.assertEqual(args[1].data_ptr(), v_scale.data_ptr())
+        bmm_output = args[4]
+        self.assertEqual(bmm_output.shape, (3, 2, 5))
+        self.assertEqual(result.shape, (3, 10))
+        self.assertEqual(result.data_ptr(), bmm_output.data_ptr())
+        run_a16.assert_not_called()
 
 
 class TestTunedMxfp4Bmm(CustomTestCase):

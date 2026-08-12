@@ -214,6 +214,40 @@ def _get_glm_mxfp4_k_a4_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dic
     return config
 
 
+def _get_glm_prepacked_mxfp4_k_bmm_config(
+    packed_x: torch.Tensor, weight: torch.Tensor
+) -> dict:
+    config, _ = _get_mxfp4_a4_bmm_config(
+        packed_x.shape[1], weight.shape[1], packed_x.shape[2]
+    )
+    config = config.copy()
+    config.update(
+        BLOCK_SIZE_M=256,
+        BLOCK_SIZE_N=256,
+        BLOCK_SIZE_K=64,
+        NUM_KSPLIT=1,
+        SPLITK_BLOCK_SIZE=packed_x.shape[2] * 2,
+    )
+    return config
+
+
+def _get_glm_mxfp4_v_a4_bmm_config(
+    packed_x: torch.Tensor, weight: torch.Tensor
+) -> dict:
+    config, _ = _get_mxfp4_a4_bmm_config(
+        packed_x.shape[1], weight.shape[1], packed_x.shape[2]
+    )
+    config = config.copy()
+    config.update(
+        BLOCK_SIZE_M=256,
+        BLOCK_SIZE_N=256,
+        BLOCK_SIZE_K=128,
+        NUM_KSPLIT=1,
+        SPLITK_BLOCK_SIZE=packed_x.shape[2] * 2,
+    )
+    return config
+
+
 def _get_glm_mxfp4_v_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
     config = _get_single_split_mxfp4_bmm_config(x, weight)
     # Keep AITER's small-M decode buckets; use the profiled prefill tiles.
@@ -285,6 +319,25 @@ def _run_mxfp4_k_bmm(
     )
 
 
+def _run_prepacked_mxfp4_k_bmm(
+    packed_x: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    batched_gemm_afp4wfp4(
+        packed_x,
+        weight,
+        x_scale,
+        weight_scale,
+        dtype=torch.bfloat16,
+        y=output,
+        config=_get_glm_prepacked_mxfp4_k_bmm_config(packed_x, weight),
+    )
+    return output
+
+
 def _run_mxfp4_v_bmm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -307,6 +360,25 @@ def _run_mxfp4_v_bmm(
         weight_scale,
         torch.bfloat16,
         output.transpose(0, 1),
+    )
+    return output
+
+
+def _run_prepacked_mxfp4_v_bmm(
+    packed_x: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    batched_gemm_afp4wfp4(
+        packed_x,
+        weight,
+        x_scale,
+        weight_scale,
+        dtype=torch.bfloat16,
+        y=output.transpose(0, 1),
+        config=_get_glm_mxfp4_v_a4_bmm_config(packed_x, weight),
     )
     return output
 
@@ -365,6 +437,45 @@ class DeepseekMLAForwardMixin:
         if self.w_kc.dtype == torch.float8_e4m3fn:
             return False
         if self.current_attention_backend not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
+            return False
+        return True
+
+    def _can_emit_mxfp4_v_from_attention(
+        self: DeepseekV2AttentionMLA,
+        forward_batch: ForwardBatch,
+        num_tokens: int,
+    ) -> bool:
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        if not (_use_aiter_gfx95 and self.use_dsa):
+            return False
+        if self.current_attention_backend not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
+            return False
+        if get_attn_backend().dsa_prefill_impl != "triton":
+            return False
+        if (
+            not forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            return False
+        if num_tokens <= 256 or self.num_local_heads != 16 or self.kv_lora_rank != 512:
+            return False
+        if self.w_vc is None or self.w_vc.dtype != torch.uint8:
+            return False
+        if self.use_deep_gemm_bmm or is_kv_b_lora_active(self):
+            return False
+        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+            return False
+        if get_parallel().dcp_enabled:
+            return False
+        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+            return False
+        if is_graph_dsa_split_op_surface(forward_batch):
+            return False
+        if get_tc_piecewise_forward_context() is not None:
+            return False
+        if is_in_breakable_cuda_graph() or get_is_capture_mode():
             return False
         return True
 
@@ -1018,6 +1129,9 @@ class DeepseekMLAForwardMixin:
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
     ):
         save_kv_cache = True
+        emit_mxfp4_v = self._can_emit_mxfp4_v_from_attention(
+            forward_batch, q_nope_out.shape[0]
+        )
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
@@ -1143,6 +1257,7 @@ class DeepseekMLAForwardMixin:
                         q_rope=q_pe,
                         k_rope=k_pe,
                         **extra_args,
+                        **({"output_mxfp4": True} if emit_mxfp4_v else {}),
                         **(
                             dict(topk_indices=topk_indices)
                             if topk_indices is not None
@@ -1224,10 +1339,32 @@ class DeepseekMLAForwardMixin:
                         is_lse_base_on_e=is_lse_base_on_e,
                     )
                     attn_output = attn_output.transpose(0, 1)
-        attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+        if emit_mxfp4_v:
+            attn_output_packed, attn_output_scale = attn_output
+            attn_output = None
+        else:
+            attn_output = attn_output.view(
+                -1, self.num_local_heads, self.kv_lora_rank
+            )
 
         _kvb_v = None
-        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+        if emit_mxfp4_v:
+            _bmm_buf = torch.empty(
+                attn_output_packed.shape[0],
+                attn_output_packed.shape[1],
+                self.w_vc.shape[2],
+                device=attn_output_packed.device,
+                dtype=torch.bfloat16,
+            )
+            _run_prepacked_mxfp4_v_bmm(
+                attn_output_packed.transpose(0, 1),
+                attn_output_scale.transpose(0, 1),
+                self.w_vc.transpose(-2, -1),
+                self.w_scale_v.transpose(-2, -1),
+                _bmm_buf,
+            )
+            attn_bmm_output = _bmm_buf
+        elif _SGLANG_EXPERIMENTAL_LORA_OPTI:
             # Fork the kv_b v-correction A-step onto the LoRA side stream to overlap the bmm.
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
                 kv_b_lora_v_prepare,
@@ -1235,7 +1372,9 @@ class DeepseekMLAForwardMixin:
 
             _kvb_v = kv_b_lora_v_prepare(self, attn_output)
 
-        if self.use_deep_gemm_bmm:
+        if emit_mxfp4_v:
+            pass
+        elif self.use_deep_gemm_bmm:
             (
                 attn_output_val,
                 attn_output_scale,
