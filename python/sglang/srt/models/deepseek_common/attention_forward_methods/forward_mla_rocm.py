@@ -782,20 +782,38 @@ class DeepseekMLARocmForwardMixin:
                     q_pe_fused = q_cat[..., self.kv_lora_rank :]
                     if llama_4_scaling is not None:
                         q_nope_fused *= llama_4_scaling
-                    attn_output = self.attn_mqa(
-                        q_nope_fused,
-                        None,
-                        None,
-                        forward_batch,
-                        q_rope=q_pe_fused,
-                        k_rope=k_pe_fused,
-                        save_kv_cache=save_kv_cache,
-                        **(
-                            dict(topk_indices=topk_indices)
-                            if topk_indices is not None
-                            else {}
-                        ),
-                    )
+                    if emit_mxfp4_v:
+                        attn_output = get_attn_backend().forward(
+                            q_nope_fused,
+                            None,
+                            None,
+                            self.attn_mqa,
+                            forward_batch,
+                            q_rope=q_pe_fused,
+                            k_rope=k_pe_fused,
+                            save_kv_cache=save_kv_cache,
+                            output_mxfp4=True,
+                            **(
+                                dict(topk_indices=topk_indices)
+                                if topk_indices is not None
+                                else {}
+                            ),
+                        )
+                    else:
+                        attn_output = self.attn_mqa(
+                            q_nope_fused,
+                            None,
+                            None,
+                            forward_batch,
+                            q_rope=q_pe_fused,
+                            k_rope=k_pe_fused,
+                            save_kv_cache=save_kv_cache,
+                            **(
+                                dict(topk_indices=topk_indices)
+                                if topk_indices is not None
+                                else {}
+                            ),
+                        )
             else:
                 extra_args = {}
                 if self._fuse_rope_for_trtllm_mla(forward_batch):
