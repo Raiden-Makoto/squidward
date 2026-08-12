@@ -61,6 +61,8 @@ class TestTritonSparseMlaMxfp4(CustomTestCase):
         self.assertEqual(scales.shape, (tokens, heads, d_v // 32))
         self.assertEqual(packed.dtype, torch.uint8)
         self.assertEqual(scales.dtype, torch.uint8)
+        self.assertTrue(torch.equal(packed, reference_packed))
+        self.assertTrue(torch.equal(scales, reference_scales))
 
         fused_dequant = MXFP4QuantizeUtil.dequantize(
             packed, torch.float32, scales, [32]

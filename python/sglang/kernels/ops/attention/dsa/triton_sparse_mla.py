@@ -221,7 +221,9 @@ def _sparse_mla_fwd_split_dim_kernel(
         acc3 = acc3 * inv_l[:, None]
 
     if OUTPUT_MXFP4:
-        packed0, scales0 = _mxfp4_quant_op(acc0, _G, H, 32)
+        packed0, scales0 = _mxfp4_quant_op(
+            acc0.to(tl.bfloat16).to(tl.float32), _G, H, 32
+        )
         packed_cols = tl.arange(0, _G // 2)
         scale_cols = tl.arange(0, _G // 32)
         o_base = o_ptr + s_i * H * (D_V // 2) + h[:, None] * (D_V // 2)
@@ -231,15 +233,21 @@ def _sparse_mla_fwd_split_dim_kernel(
         tl.store(o_base + packed_cols[None, :], packed0)
         tl.store(scale_base + scale_cols[None, :], scales0)
         if NUM_GROUPS >= 2:
-            packed1, scales1 = _mxfp4_quant_op(acc1, _G, H, 32)
+            packed1, scales1 = _mxfp4_quant_op(
+                acc1.to(tl.bfloat16).to(tl.float32), _G, H, 32
+            )
             tl.store(o_base + _G // 2 + packed_cols[None, :], packed1)
             tl.store(scale_base + _G // 32 + scale_cols[None, :], scales1)
         if NUM_GROUPS >= 3:
-            packed2, scales2 = _mxfp4_quant_op(acc2, _G, H, 32)
+            packed2, scales2 = _mxfp4_quant_op(
+                acc2.to(tl.bfloat16).to(tl.float32), _G, H, 32
+            )
             tl.store(o_base + _G + packed_cols[None, :], packed2)
             tl.store(scale_base + 2 * (_G // 32) + scale_cols[None, :], scales2)
         if NUM_GROUPS >= 4:
-            packed3, scales3 = _mxfp4_quant_op(acc3, _G, H, 32)
+            packed3, scales3 = _mxfp4_quant_op(
+                acc3.to(tl.bfloat16).to(tl.float32), _G, H, 32
+            )
             tl.store(o_base + 3 * (_G // 2) + packed_cols[None, :], packed3)
             tl.store(scale_base + 3 * (_G // 32) + scale_cols[None, :], scales3)
     else:
