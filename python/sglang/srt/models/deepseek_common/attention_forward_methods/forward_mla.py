@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -32,7 +33,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
 from sglang.srt.layers.quantization.unquant import fp8_proj_gemm_active
-from sglang.srt.layers.radix_attention import unified_attention_with_output
+from sglang.srt.layers.radix_attention import (
+    force_eager_attention,
+    unified_attention_with_output,
+)
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
@@ -474,7 +478,7 @@ class DeepseekMLAForwardMixin:
             return False
         if is_graph_dsa_split_op_surface(forward_batch):
             return False
-        if get_tc_piecewise_forward_context() is not None:
+        if is_in_tc_piecewise_cuda_graph():
             return False
         if is_in_breakable_cuda_graph() or get_is_capture_mode():
             return False
@@ -1250,21 +1254,24 @@ class DeepseekMLAForwardMixin:
                         ),
                     )
                 else:
-                    attn_output = self.attn_mqa(
-                        q_nope_out,
-                        k_nope,
-                        k_nope,
-                        forward_batch,
-                        q_rope=q_pe,
-                        k_rope=k_pe,
-                        **extra_args,
-                        **({"output_mxfp4": True} if emit_mxfp4_v else {}),
-                        **(
-                            dict(topk_indices=topk_indices)
-                            if topk_indices is not None
-                            else {}
-                        ),
-                    )
+                    with (
+                        force_eager_attention() if emit_mxfp4_v else nullcontext()
+                    ):
+                        attn_output = self.attn_mqa(
+                            q_nope_out,
+                            k_nope,
+                            k_nope,
+                            forward_batch,
+                            q_rope=q_pe,
+                            k_rope=k_pe,
+                            **extra_args,
+                            **({"output_mxfp4": True} if emit_mxfp4_v else {}),
+                            **(
+                                dict(topk_indices=topk_indices)
+                                if topk_indices is not None
+                                else {}
+                            ),
+                        )
         else:
             if _use_aiter_gfx95 and self.current_attention_backend == "aiter":
                 cos = self.rotary_emb.cos_cache
