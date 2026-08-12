@@ -698,14 +698,17 @@ class DeepseekMLARocmForwardMixin:
 
         save_kv_cache = True
         cuda_graph_config = get_exec().graph.cuda_graph_config
+        num_tokens = q_nope_out.numel() // (
+            self.num_local_heads * self.kv_lora_rank
+        )
         emit_mxfp4_v = (
             _use_aiter_gfx95
-            and self.use_dsa
+            and self.current_attention_backend in ("dsa", "nsa")
             and get_attn_backend().dsa_prefill_impl == "triton"
             and self.w_vc is not None
             and self.w_vc.dtype == torch.uint8
             and self.kv_lora_rank == 512
-            and q_nope_out.shape[0] > 256
+            and num_tokens > 256
             and cuda_graph_config is not None
             and cuda_graph_config.prefill.backend == Backend.DISABLED
             and not get_parallel().dcp_enabled
