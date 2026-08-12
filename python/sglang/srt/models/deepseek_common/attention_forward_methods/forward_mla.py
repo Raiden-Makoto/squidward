@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -33,10 +32,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
 from sglang.srt.layers.quantization.unquant import fp8_proj_gemm_active
-from sglang.srt.layers.radix_attention import (
-    force_eager_attention,
-    unified_attention_with_output,
-)
+from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
@@ -1250,9 +1246,24 @@ class DeepseekMLAForwardMixin:
                         ),
                     )
                 else:
-                    with (
-                        force_eager_attention() if emit_mxfp4_v else nullcontext()
-                    ):
+                    if emit_mxfp4_v:
+                        attn_output = get_attn_backend().forward(
+                            q_nope_out,
+                            k_nope,
+                            k_nope,
+                            self.attn_mqa,
+                            forward_batch,
+                            q_rope=q_pe,
+                            k_rope=k_pe,
+                            output_mxfp4=True,
+                            **extra_args,
+                            **(
+                                dict(topk_indices=topk_indices)
+                                if topk_indices is not None
+                                else {}
+                            ),
+                        )
+                    else:
                         attn_output = self.attn_mqa(
                             q_nope_out,
                             k_nope,
@@ -1261,7 +1272,6 @@ class DeepseekMLAForwardMixin:
                             q_rope=q_pe,
                             k_rope=k_pe,
                             **extra_args,
-                            **({"output_mxfp4": True} if emit_mxfp4_v else {}),
                             **(
                                 dict(topk_indices=topk_indices)
                                 if topk_indices is not None

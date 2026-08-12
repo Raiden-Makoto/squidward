@@ -10,7 +10,6 @@ The BMM absorb steps stay module level to keep ROCm kernel selection localized.
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -34,7 +33,6 @@ from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
-from sglang.srt.layers.radix_attention import force_eager_attention
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
@@ -823,9 +821,24 @@ class DeepseekMLARocmForwardMixin:
                         ),
                     )
                 else:
-                    with (
-                        force_eager_attention() if emit_mxfp4_v else nullcontext()
-                    ):
+                    if emit_mxfp4_v:
+                        attn_output = get_attn_backend().forward(
+                            q_nope_out,
+                            k_nope,
+                            k_nope,
+                            self.attn_mqa,
+                            forward_batch,
+                            q_rope=q_pe,
+                            k_rope=k_pe,
+                            output_mxfp4=True,
+                            **extra_args,
+                            **(
+                                dict(topk_indices=topk_indices)
+                                if topk_indices is not None
+                                else {}
+                            ),
+                        )
+                    else:
                         attn_output = self.attn_mqa(
                             q_nope_out,
                             k_nope,
@@ -834,7 +847,6 @@ class DeepseekMLARocmForwardMixin:
                             q_rope=q_pe,
                             k_rope=k_pe,
                             **extra_args,
-                            **({"output_mxfp4": True} if emit_mxfp4_v else {}),
                             **(
                                 dict(topk_indices=topk_indices)
                                 if topk_indices is not None
