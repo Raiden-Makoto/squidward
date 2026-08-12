@@ -140,13 +140,41 @@ class TestMxfp4KDispatch(CustomTestCase):
         tuned_bmm.assert_not_called()
         self.assertIsNone(result)
 
-    def test_glm_geometry_uses_prequantized_a4w4(self):
-        x = torch.randn(2, 3, 192, dtype=torch.bfloat16)
+    def test_small_glm_geometry_preserves_a16(self):
+        x = torch.randn(2, 64, 192, dtype=torch.bfloat16)
         weight = torch.zeros(2, 512, 96, dtype=torch.uint8)
         weight_scale = torch.zeros(2, 512, 6, dtype=torch.uint8)
-        output = torch.empty(2, 3, 512, dtype=torch.bfloat16)
-        packed_x = torch.zeros(2, 3, 96, dtype=torch.uint8)
-        x_scale = torch.zeros(2, 3, 6, dtype=torch.uint8)
+        output = torch.empty(2, 64, 512, dtype=torch.bfloat16)
+        config = {"BLOCK_SIZE_K": 64, "NUM_KSPLIT": 1}
+
+        with (
+            mock.patch.object(
+                forward_mla,
+                "_get_glm_mxfp4_k_bmm_config",
+                return_value=config,
+            ),
+            mock.patch.object(forward_mla, "_run_tuned_mxfp4_bmm") as tuned_bmm,
+            mock.patch.object(forward_mla, "batched_mxfp4_quant") as quantize,
+        ):
+            result = forward_mla._run_mxfp4_k_bmm(x, weight, weight_scale, output)
+
+        args, kwargs = tuned_bmm.call_args
+        self.assertIs(args[0], x)
+        self.assertIs(args[1], weight)
+        self.assertIs(args[2], weight_scale)
+        self.assertIs(args[3], output)
+        self.assertIs(args[4], config)
+        self.assertFalse(kwargs["transpose_bm"])
+        quantize.assert_not_called()
+        self.assertIsNone(result)
+
+    def test_glm_geometry_uses_prequantized_a4w4(self):
+        x = torch.randn(2, 257, 192, dtype=torch.bfloat16)
+        weight = torch.zeros(2, 512, 96, dtype=torch.uint8)
+        weight_scale = torch.zeros(2, 512, 6, dtype=torch.uint8)
+        output = torch.empty(2, 257, 512, dtype=torch.bfloat16)
+        packed_x = torch.zeros(2, 257, 96, dtype=torch.uint8)
+        x_scale = torch.zeros(2, 257, 6, dtype=torch.uint8)
         config = {
             "BLOCK_SIZE_M": 256,
             "BLOCK_SIZE_N": 256,
@@ -182,13 +210,13 @@ class TestMxfp4KDispatch(CustomTestCase):
         self.assertIsNone(result)
 
     def test_glm_geometry_output_matches_bf16_reference(self):
-        x = torch.randn(2, 3, 192, dtype=torch.bfloat16)
+        x = torch.randn(2, 257, 192, dtype=torch.bfloat16)
         weight = torch.randn(2, 512, 192, dtype=torch.bfloat16)
         weight_scale = torch.zeros(2, 512, 6, dtype=torch.uint8)
-        output = torch.empty(2, 3, 512, dtype=torch.bfloat16)
+        output = torch.empty(2, 257, 512, dtype=torch.bfloat16)
         expected = torch.bmm(x, weight.transpose(-2, -1))
-        packed_x = torch.zeros(2, 3, 96, dtype=torch.uint8)
-        x_scale = torch.zeros(2, 3, 6, dtype=torch.uint8)
+        packed_x = torch.zeros(2, 257, 96, dtype=torch.uint8)
+        x_scale = torch.zeros(2, 257, 6, dtype=torch.uint8)
 
         def reference_a4w4(
             _packed_x,

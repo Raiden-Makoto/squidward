@@ -251,7 +251,8 @@ def _run_mxfp4_k_bmm(
     weight_scale: torch.Tensor,
     output: torch.Tensor,
 ) -> None:
-    if x.shape[2] == 192 and weight.shape[1] == 512:
+    is_glm_k_up = x.shape[2] == 192 and weight.shape[1] == 512
+    if is_glm_k_up and x.shape[1] > 256:
         packed_x, x_scale = batched_mxfp4_quant(x, block_size_m=32)
         batched_gemm_afp4wfp4(
             packed_x,
@@ -261,6 +262,17 @@ def _run_mxfp4_k_bmm(
             dtype=torch.bfloat16,
             y=output,
             config=_get_glm_mxfp4_k_a4_bmm_config(x, weight),
+        )
+        return
+
+    if is_glm_k_up:
+        _run_tuned_mxfp4_bmm(
+            x,
+            weight,
+            weight_scale,
+            output,
+            _get_glm_mxfp4_k_bmm_config(x, weight),
+            transpose_bm=False,
         )
         return
 
