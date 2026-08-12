@@ -694,9 +694,24 @@ class DeepseekMLARocmForwardMixin:
         topk_indices,
         llama_4_scaling,
     ):
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
         save_kv_cache = True
-        emit_mxfp4_v = self._can_emit_mxfp4_v_from_attention(
-            forward_batch, q_nope_out.shape[0]
+        emit_mxfp4_v = (
+            _use_aiter_gfx95
+            and self.use_dsa
+            and get_attn_backend().dsa_prefill_impl == "triton"
+            and self.w_vc is not None
+            and self.w_vc.dtype == torch.uint8
+            and self.kv_lora_rank == 512
+            and q_nope_out.shape[0] > 256
+            and not get_is_capture_mode()
+            and not get_parallel().dcp_enabled
+            and not self.use_deep_gemm_bmm
+            and not is_kv_b_lora_active(self)
+            and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
         )
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
