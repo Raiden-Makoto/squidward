@@ -694,9 +694,10 @@ class DeepseekMLARocmForwardMixin:
         topk_indices,
         llama_4_scaling,
     ):
-        from sglang.srt.model_executor.runner import get_is_capture_mode
+        from sglang.srt.model_executor.cuda_graph_config import Backend
 
         save_kv_cache = True
+        cuda_graph_config = get_exec().graph.cuda_graph_config
         emit_mxfp4_v = (
             _use_aiter_gfx95
             and self.use_dsa
@@ -705,7 +706,8 @@ class DeepseekMLARocmForwardMixin:
             and self.w_vc.dtype == torch.uint8
             and self.kv_lora_rank == 512
             and q_nope_out.shape[0] > 256
-            and not get_is_capture_mode()
+            and cuda_graph_config is not None
+            and cuda_graph_config.prefill.backend == Backend.DISABLED
             and not get_parallel().dcp_enabled
             and not self.use_deep_gemm_bmm
             and not is_kv_b_lora_active(self)
