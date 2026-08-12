@@ -22,49 +22,10 @@ proto/
 
 # --- Upstream docs, examples, benchmarks (we use utilities/ + results/) ---
 docs_new/
-examples/
-benchmark/
 
 # --- Unrelated language stacks ---
 sgl-model-gateway/
 rust/
-experimental/
-
-# --- Upstream scripts (fork tooling lives in utilities/) ---
-scripts/
-scratch/
-
-# --- CI / integration test tree ---
-test/
-
-# --- Python: non-runtime packages ---
-python/sglang/multimodal_gen/
-python/sglang/lang/
-python/sglang/cli/
-python/sglang/test/
-python/tools/
-
-# --- Python runtime: autotuned triton JSON (375+ files, never hand-edited) ---
-python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/
-
-# --- Python runtime: layers unrelated to MoE/quant work ---
-python/sglang/srt/layers/attention/
-python/sglang/srt/layers/rotary_embedding/
-python/sglang/srt/layers/cp/
-python/sglang/srt/layers/dcp/
-python/sglang/srt/layers/deep_gemm_wrapper/
-
-# --- Python runtime: subsystems outside GLM/MoE serving path ---
-python/sglang/srt/multimodal/
-python/sglang/srt/disaggregation/
-python/sglang/srt/lora/
-python/sglang/srt/function_call/
-python/sglang/srt/constrained/
-python/sglang/srt/kv_canary/
-python/sglang/srt/compilation/
-python/sglang/srt/parser/
-python/sglang/srt/sampling/
-python/sglang/srt/mem_cache/
 
 # --- Python runtime: non-AMD hardware backends ---
 python/sglang/srt/hardware_backend/cpu/
@@ -74,8 +35,6 @@ python/sglang/srt/hardware_backend/npu/
 python/sglang/srt/hardware_backend/xpu/
 
 # --- sgl-kernel: tests, benches, non-GPU backends ---
-sgl-kernel/tests/
-sgl-kernel/benchmark/
 sgl-kernel/csrc/cpu/
 sgl-kernel/csrc/musa/
 sgl-kernel/csrc/metal/
