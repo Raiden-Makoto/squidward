@@ -703,7 +703,8 @@ class DeepseekMLARocmForwardMixin:
         )
         emit_mxfp4_v = (
             _use_aiter_gfx95
-            and self.current_attention_backend in ("dsa", "nsa")
+            and self.current_attention_backend
+            in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
             and get_attn_backend().dsa_prefill_impl == "triton"
             and self.w_vc is not None
             and self.w_vc.dtype == torch.uint8
