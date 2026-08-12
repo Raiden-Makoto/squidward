@@ -70,7 +70,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -112,9 +112,7 @@ def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
 
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
-    # FlashMLA exposes natural-log softmax LSE. FlashInfer MLA and the other
-    # currently supported MLA DCP decode backends expose base-2 LSE.
-    return attention_backend == "flashmla"
+    return attention_backend in {"flashmla", "cutedsl_mla"}
 
 
 if _is_cuda:
