@@ -826,6 +826,11 @@ class DeepseekMLARocmForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
 
+        # Dense-MHA fallback can be selected inside the backend after the eager
+        # eligibility check. Only skip the normal reshape when the producer
+        # actually returned the packed-value/scale tuple.
+        emit_mxfp4_v = emit_mxfp4_v and isinstance(attn_output, tuple)
+
         # correct attn_output with respect to lse from other ranks
         if is_dcp_mla_decode_phase(forward_batch):
             attn_output = attn_output.view(
