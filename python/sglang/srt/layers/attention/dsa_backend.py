@@ -2024,6 +2024,12 @@ class DeepseekSparseAttnBackend(
                 triton_sparse_mla_fwd,
             )
 
+            if layer.layer_id == 0 and q_nope.shape[0] > 256:
+                logger.warning(
+                    "Sparse MLA output gate: output_mxfp4=%s shape=%s",
+                    output_mxfp4,
+                    tuple(q_nope.shape),
+                )
             return triton_sparse_mla_fwd(
                 q_nope=q_nope,
                 q_rope=q_rope,
