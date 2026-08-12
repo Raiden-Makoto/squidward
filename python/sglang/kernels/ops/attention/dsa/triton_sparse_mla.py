@@ -17,9 +17,6 @@ import triton.language as tl
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
-if torch.version.hip is not None:
-    from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
-
 _IS_FNUZ = is_fp8_fnuz()
 _FP8_MAX = 240.0 if _IS_FNUZ else 448.0
 _LOG2E = 1.4426950408889634
@@ -103,8 +100,7 @@ def _sparse_mla_fwd_split_dim_kernel(
     q_rope_ptr,  # [seq, H, D_TAIL] fp8
     kv_ptr,  # [num_pages, 1, DIM] fp8
     idx_ptr,  # [seq, topk]      int32
-    o_ptr,  # bf16 [seq, H, D_V] or packed MXFP4 [seq, H, D_V // 2]
-    o_scale_ptr,  # E8M0 [seq, H, D_V // 32] when OUTPUT_MXFP4
+    o_ptr,  # [seq, H, D_V]    bf16
     qk_scale,  # sm_scale * LOG2E (prescaled for exp2)
     fp8_max,
     topk,
@@ -117,7 +113,6 @@ def _sparse_mla_fwd_split_dim_kernel(
     STRIDE_QN_H: tl.constexpr,
     STRIDE_QR_T: tl.constexpr,
     STRIDE_QR_H: tl.constexpr,
-    OUTPUT_MXFP4: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     s_i = tl.program_id(0)
@@ -220,57 +215,23 @@ def _sparse_mla_fwd_split_dim_kernel(
     if NUM_GROUPS >= 4:
         acc3 = acc3 * inv_l[:, None]
 
-    if OUTPUT_MXFP4:
-        packed0, scales0 = _mxfp4_quant_op(
-            acc0.to(tl.bfloat16).to(tl.float32), _G, H, 32
-        )
-        packed_cols = tl.arange(0, _G // 2)
-        scale_cols = tl.arange(0, _G // 32)
-        o_base = o_ptr + s_i * H * (D_V // 2) + h[:, None] * (D_V // 2)
-        scale_base = (
-            o_scale_ptr + s_i * H * (D_V // 32) + h[:, None] * (D_V // 32)
-        )
-        tl.store(o_base + packed_cols[None, :], packed0)
-        tl.store(scale_base + scale_cols[None, :], scales0)
-        if NUM_GROUPS >= 2:
-            packed1, scales1 = _mxfp4_quant_op(
-                acc1.to(tl.bfloat16).to(tl.float32), _G, H, 32
-            )
-            tl.store(o_base + _G // 2 + packed_cols[None, :], packed1)
-            tl.store(scale_base + _G // 32 + scale_cols[None, :], scales1)
-        if NUM_GROUPS >= 3:
-            packed2, scales2 = _mxfp4_quant_op(
-                acc2.to(tl.bfloat16).to(tl.float32), _G, H, 32
-            )
-            tl.store(o_base + _G + packed_cols[None, :], packed2)
-            tl.store(scale_base + 2 * (_G // 32) + scale_cols[None, :], scales2)
-        if NUM_GROUPS >= 4:
-            packed3, scales3 = _mxfp4_quant_op(
-                acc3.to(tl.bfloat16).to(tl.float32), _G, H, 32
-            )
-            tl.store(o_base + 3 * (_G // 2) + packed_cols[None, :], packed3)
-            tl.store(scale_base + 3 * (_G // 32) + scale_cols[None, :], scales3)
-    else:
-        o_base = o_ptr + s_i * H * D_V
+    o_base = o_ptr + s_i * H * D_V
+    tl.store(o_base + h[:, None] * D_V + g[None, :], acc0.to(o_ptr.dtype.element_ty))
+    if NUM_GROUPS >= 2:
         tl.store(
-            o_base + h[:, None] * D_V + g[None, :],
-            acc0.to(o_ptr.dtype.element_ty),
+            o_base + h[:, None] * D_V + (_G + g)[None, :],
+            acc1.to(o_ptr.dtype.element_ty),
         )
-        if NUM_GROUPS >= 2:
-            tl.store(
-                o_base + h[:, None] * D_V + (_G + g)[None, :],
-                acc1.to(o_ptr.dtype.element_ty),
-            )
-        if NUM_GROUPS >= 3:
-            tl.store(
-                o_base + h[:, None] * D_V + (2 * _G + g)[None, :],
-                acc2.to(o_ptr.dtype.element_ty),
-            )
-        if NUM_GROUPS >= 4:
-            tl.store(
-                o_base + h[:, None] * D_V + (3 * _G + g)[None, :],
-                acc3.to(o_ptr.dtype.element_ty),
-            )
+    if NUM_GROUPS >= 3:
+        tl.store(
+            o_base + h[:, None] * D_V + (2 * _G + g)[None, :],
+            acc2.to(o_ptr.dtype.element_ty),
+        )
+    if NUM_GROUPS >= 4:
+        tl.store(
+            o_base + h[:, None] * D_V + (3 * _G + g)[None, :],
+            acc3.to(o_ptr.dtype.element_ty),
+        )
 
 
 def _triton_sparse_mla_fwd_single(
@@ -280,8 +241,7 @@ def _triton_sparse_mla_fwd_single(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
-    output_mxfp4: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Single-pass prefill: grid=(seq,), loops over all topk per CTA."""
     seq, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
@@ -296,18 +256,7 @@ def _triton_sparse_mla_fwd_single(
     q_nope, stride_qn_t, stride_qn_h = _row_strides(q_nope)
     q_rope, stride_qr_t, stride_qr_h = _row_strides(q_rope)
     idx_flat = indices.squeeze(1).contiguous() if indices.dim() == 3 else indices
-    if output_mxfp4:
-        if H != 16 or d_v != 512:
-            raise ValueError(
-                "MXFP4 sparse MLA output requires the GLM geometry H=16, d_v=512"
-            )
-        out = torch.empty(seq, H, d_v // 2, device=q_nope.device, dtype=torch.uint8)
-        out_scale = torch.empty(
-            seq, H, d_v // 32, device=q_nope.device, dtype=torch.uint8
-        )
-    else:
-        out = torch.empty(seq, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
-        out_scale = out
+    out = torch.empty(seq, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
     qk_scale = float(sm_scale) * _LOG2E
     if H < 16:
         # Pad H to 16 so fp8 tl.dot maps to native MFMA tiles on CDNA4.
@@ -333,7 +282,6 @@ def _triton_sparse_mla_fwd_single(
             kv,
             idx_flat,
             out_pad,
-            out_pad,
             qk_scale,
             _FP8_MAX,
             topk,
@@ -346,7 +294,6 @@ def _triton_sparse_mla_fwd_single(
             STRIDE_QN_H=stride_qn_h,
             STRIDE_QR_T=stride_qr_t,
             STRIDE_QR_H=stride_qr_h,
-            OUTPUT_MXFP4=False,
         )
         out = out_pad[:, :H, :].contiguous()
     else:
@@ -356,7 +303,6 @@ def _triton_sparse_mla_fwd_single(
             kv,
             idx_flat,
             out,
-            out_scale,
             qk_scale,
             _FP8_MAX,
             topk,
@@ -369,10 +315,7 @@ def _triton_sparse_mla_fwd_single(
             STRIDE_QN_H=stride_qn_h,
             STRIDE_QR_T=stride_qr_t,
             STRIDE_QR_H=stride_qr_h,
-            OUTPUT_MXFP4=output_mxfp4,
         )
-    if output_mxfp4:
-        return out, out_scale
     return out.unsqueeze(0)
 
 
@@ -923,16 +866,13 @@ def triton_sparse_mla_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
-    output_mxfp4: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Unified sparse MLA forward. Auto-selects single-pass vs split-K.
 
     q_nope: [seq, H, d_v] fp8, q_rope: [seq, H, dim-d_v] fp8,
     kv: [num_pages, 1, dim] fp8, indices: [seq, 1, topk].
 
-    Returns [1, seq, H, d_v] bf16 to match tilelang_sparse_fwd. With
-    output_mxfp4=True, returns packed E2M1 [seq, H, d_v // 2] and E8M0 scales
-    [seq, H, d_v // 32].
+    Returns [1, seq, H, d_v] bf16 to match tilelang_sparse_fwd.
     """
     seq = q_nope.shape[0]
     H = q_nope.shape[1]
@@ -944,16 +884,6 @@ def triton_sparse_mla_fwd(
     head_blocks = max(1, (H + BLOCK_H - 1) // BLOCK_H)
     base_ctas = seq * head_blocks
     kv_work_per_cta = topk // BLOCK_K
-    if output_mxfp4:
-        return _triton_sparse_mla_fwd_single(
-            q_nope,
-            q_rope,
-            kv,
-            indices,
-            sm_scale,
-            d_v,
-            output_mxfp4=True,
-        )
     if base_ctas > num_cu:
         return _triton_sparse_mla_fwd_single(q_nope, q_rope, kv, indices, sm_scale, d_v)
     kv_splits = min(

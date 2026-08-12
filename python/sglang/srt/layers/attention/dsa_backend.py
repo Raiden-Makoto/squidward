@@ -1881,8 +1881,7 @@ class DeepseekSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
-        output_mxfp4: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
@@ -2024,12 +2023,6 @@ class DeepseekSparseAttnBackend(
                 triton_sparse_mla_fwd,
             )
 
-            if layer.layer_id == 0 and q_nope.shape[0] > 256:
-                logger.warning(
-                    "Sparse MLA output gate: output_mxfp4=%s shape=%s",
-                    output_mxfp4,
-                    tuple(q_nope.shape),
-                )
             return triton_sparse_mla_fwd(
                 q_nope=q_nope,
                 q_rope=q_rope,
@@ -2037,7 +2030,6 @@ class DeepseekSparseAttnBackend(
                 indices=page_table_1.unsqueeze(1),
                 sm_scale=layer.scaling,
                 d_v=layer.v_head_dim,
-                output_mxfp4=output_mxfp4,
             )
         elif dsa_impl in ("flashmla_sparse", "flashmla_sparse_q8"):
             if topk_transform_method == TopkTransformMethod.RAGGED:
