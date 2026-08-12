@@ -717,6 +717,26 @@ class DeepseekMLARocmForwardMixin:
             and not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_draft_extend_v2()
         )
+        if self.layer_id == 0 and num_tokens > 256:
+            logger.warning(
+                "MXFP4 V gate: enabled=%s gfx95=%s backend=%s dsa_prefill=%s "
+                "w_dtype=%s kv_rank=%s tokens=%s capture=%s dcp=%s deep=%s "
+                "lora=%s experimental_lora=%s target_verify=%s draft_extend=%s",
+                emit_mxfp4_v,
+                _use_aiter_gfx95,
+                self.current_attention_backend,
+                get_attn_backend().dsa_prefill_impl,
+                self.w_vc.dtype if self.w_vc is not None else None,
+                self.kv_lora_rank,
+                num_tokens,
+                get_is_capture_mode(),
+                get_parallel().dcp_enabled,
+                self.use_deep_gemm_bmm,
+                is_kv_b_lora_active(self),
+                _SGLANG_EXPERIMENTAL_LORA_OPTI,
+                forward_batch.forward_mode.is_target_verify(),
+                forward_batch.forward_mode.is_draft_extend_v2(),
+            )
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
