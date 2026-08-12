@@ -456,7 +456,7 @@ class DeepseekMLAForwardMixin:
         if self.current_attention_backend not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             return False
         backend = get_attn_backend()
-        if backend.dsa_prefill_impl != "triton" or backend.use_mha:
+        if backend.dsa_prefill_impl != "triton":
             return False
         if (
             not forward_batch.forward_mode.is_extend()
@@ -475,10 +475,6 @@ class DeepseekMLAForwardMixin:
         if get_parallel().dcp_enabled:
             return False
         if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
-            return False
-        if is_graph_dsa_split_op_surface(forward_batch):
-            return False
-        if is_in_tc_piecewise_cuda_graph():
             return False
         if is_in_breakable_cuda_graph() or get_is_capture_mode():
             return False
