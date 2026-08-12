@@ -140,68 +140,89 @@ class TestMxfp4KDispatch(CustomTestCase):
         tuned_bmm.assert_not_called()
         self.assertIsNone(result)
 
-    def test_glm_geometry_uses_safe_k_block_without_split_k(self):
+    def test_glm_geometry_uses_prequantized_a4w4(self):
         x = torch.randn(2, 3, 192, dtype=torch.bfloat16)
         weight = torch.zeros(2, 512, 96, dtype=torch.uint8)
-        scale = torch.zeros(2, 512, 6, dtype=torch.uint8)
+        weight_scale = torch.zeros(2, 512, 6, dtype=torch.uint8)
         output = torch.empty(2, 3, 512, dtype=torch.bfloat16)
-        tuned_config = {"BLOCK_SIZE_K": 256, "NUM_KSPLIT": 4}
+        packed_x = torch.zeros(2, 3, 96, dtype=torch.uint8)
+        x_scale = torch.zeros(2, 3, 6, dtype=torch.uint8)
+        config = {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 64,
+            "NUM_KSPLIT": 1,
+            "SPLITK_BLOCK_SIZE": 192,
+        }
 
         with (
             mock.patch.object(
                 forward_mla,
-                "_get_mxfp4_bmm_config",
-                create=True,
-                return_value=(tuned_config, None),
-            ),
-            mock.patch.object(forward_mla, "_run_tuned_mxfp4_bmm") as tuned_bmm,
+                "batched_mxfp4_quant",
+                return_value=(packed_x, x_scale),
+            ) as quantize,
             mock.patch.object(
-                forward_mla, "batched_gemm_afp4wfp4_pre_quant", create=True
-            ) as prequant_bmm,
+                forward_mla,
+                "_get_glm_mxfp4_k_a4_bmm_config",
+                return_value=config,
+            ),
+            mock.patch.object(forward_mla, "batched_gemm_afp4wfp4") as a4w4_bmm,
         ):
-            result = forward_mla._run_mxfp4_k_bmm(x, weight, scale, output)
+            result = forward_mla._run_mxfp4_k_bmm(x, weight, weight_scale, output)
 
-        args, kwargs = tuned_bmm.call_args
-        self.assertIs(args[0], x)
+        quantize.assert_called_once_with(x, block_size_m=32)
+        args, kwargs = a4w4_bmm.call_args
+        self.assertIs(args[0], packed_x)
         self.assertIs(args[1], weight)
-        self.assertIs(args[2], scale)
-        self.assertIs(args[3], output)
-        self.assertEqual(args[4]["NUM_KSPLIT"], 1)
-        self.assertEqual(args[4]["BLOCK_SIZE_K"], 64)
-        self.assertEqual(tuned_config["NUM_KSPLIT"], 4)
-        self.assertEqual(tuned_config["BLOCK_SIZE_K"], 256)
-        self.assertFalse(kwargs["transpose_bm"])
-        prequant_bmm.assert_not_called()
+        self.assertIs(args[2], x_scale)
+        self.assertIs(args[3], weight_scale)
+        self.assertIs(kwargs["dtype"], torch.bfloat16)
+        self.assertIs(kwargs["y"], output)
+        self.assertIs(kwargs["config"], config)
         self.assertIsNone(result)
 
     def test_glm_geometry_output_matches_bf16_reference(self):
         x = torch.randn(2, 3, 192, dtype=torch.bfloat16)
         weight = torch.randn(2, 512, 192, dtype=torch.bfloat16)
-        scale = torch.zeros(2, 512, 6, dtype=torch.uint8)
+        weight_scale = torch.zeros(2, 512, 6, dtype=torch.uint8)
         output = torch.empty(2, 3, 512, dtype=torch.bfloat16)
         expected = torch.bmm(x, weight.transpose(-2, -1))
+        packed_x = torch.zeros(2, 3, 96, dtype=torch.uint8)
+        x_scale = torch.zeros(2, 3, 6, dtype=torch.uint8)
 
-        def reference_bmm(x, weight, _scale, output, _config, *, transpose_bm):
-            result = torch.bmm(x, weight.transpose(-2, -1))
-            if transpose_bm:
-                result = result.transpose(0, 1)
-            output.copy_(result)
-            return output
+        def reference_a4w4(
+            _packed_x,
+            _weight,
+            _x_scale,
+            _weight_scale,
+            *,
+            dtype,
+            y,
+            config,
+        ):
+            self.assertIs(dtype, torch.bfloat16)
+            self.assertEqual(config["BLOCK_SIZE_K"], 64)
+            y.copy_(expected)
+            return y
 
         with (
             mock.patch.object(
                 forward_mla,
-                "_get_mxfp4_bmm_config",
-                create=True,
-                return_value=({"NUM_KSPLIT": 4}, None),
+                "batched_mxfp4_quant",
+                return_value=(packed_x, x_scale),
             ),
             mock.patch.object(
                 forward_mla,
-                "_run_tuned_mxfp4_bmm",
-                side_effect=reference_bmm,
+                "_get_glm_mxfp4_k_a4_bmm_config",
+                return_value={"BLOCK_SIZE_K": 64},
+            ),
+            mock.patch.object(
+                forward_mla,
+                "batched_gemm_afp4wfp4",
+                side_effect=reference_a4w4,
             ),
         ):
-            result = forward_mla._run_mxfp4_k_bmm(x, weight, scale, output)
+            result = forward_mla._run_mxfp4_k_bmm(x, weight, weight_scale, output)
 
         self.assertIsNone(result)
         torch.testing.assert_close(output, expected)

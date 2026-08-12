@@ -70,7 +70,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -162,6 +162,9 @@ if _use_aiter_gfx95:
     from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
         _get_config as _get_mxfp4_bmm_config,
     )
+    from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_afp4wfp4 import (
+        _get_config as _get_mxfp4_a4_bmm_config,
+    )
     from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
     from aiter.ops.triton.quant.fused_fp8_quant import (
         fused_flatten_fp8_group_quant,
@@ -169,7 +172,9 @@ if _use_aiter_gfx95:
     )
 
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
+        batched_gemm_afp4wfp4,
         batched_gemm_afp4wfp4_pre_quant,
+        batched_mxfp4_quant,
         fused_flatten_mxfp4_quant,
         fused_rms_mxfp4_quant,
     )
@@ -193,6 +198,19 @@ def _get_glm_mxfp4_k_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
     config = _get_single_split_mxfp4_bmm_config(x, weight)
     # GLM's K-up has K=192. Larger blocks over-read its six E8M0 scale groups.
     config["BLOCK_SIZE_K"] = 64
+    return config
+
+
+def _get_glm_mxfp4_k_a4_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    config, _ = _get_mxfp4_a4_bmm_config(x.shape[1], weight.shape[1], x.shape[2] // 2)
+    config = config.copy()
+    config.update(
+        BLOCK_SIZE_M=256,
+        BLOCK_SIZE_N=256,
+        BLOCK_SIZE_K=64,
+        NUM_KSPLIT=1,
+        SPLITK_BLOCK_SIZE=x.shape[2],
+    )
     return config
 
 
@@ -234,13 +252,15 @@ def _run_mxfp4_k_bmm(
     output: torch.Tensor,
 ) -> None:
     if x.shape[2] == 192 and weight.shape[1] == 512:
-        _run_tuned_mxfp4_bmm(
-            x,
+        packed_x, x_scale = batched_mxfp4_quant(x, block_size_m=32)
+        batched_gemm_afp4wfp4(
+            packed_x,
             weight,
+            x_scale,
             weight_scale,
-            output,
-            _get_glm_mxfp4_k_bmm_config(x, weight),
-            transpose_bm=False,
+            dtype=torch.bfloat16,
+            y=output,
+            config=_get_glm_mxfp4_k_a4_bmm_config(x, weight),
         )
         return
 
