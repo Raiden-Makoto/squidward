@@ -5,7 +5,7 @@ Branch `RM/rocm-tree-spec-sampling-triton`.
 Capture `ac114dcb0b`, component benchmark `d903206a6f`, top-p candidate
 `f1849b3772`, candidate benchmark `9d069df673`, selection breakdown
 `b681a216c7`, hierarchical selector `fce4a0d2b6`, exact metadata
-`b073058644`, batched DSA relocation `c20b6a3616`, model
+`b073058644`, batched full DSA relocation `0abfb68ee0`, model
 `zai-org/GLM-5.2-FP8@ba978f7d347eaf65d22f1a86833408afdb953541`.
 
 ## Triton tree verifier
@@ -152,7 +152,7 @@ Fast-path coverage: 192 / 192 captured rows.
 
 ## MI355X full DSA relocation
 
-78 layers; latent KV plus index K/scale; milliseconds.
+78 layers; batched latent KV plus index K/scale; milliseconds.
 
 | Batch | Slots | Old p50 | Old p95 | Batched p50 | Batched p95 | Speedup |
 | ----: | ----: | ------: | ------: | ----------: | ----------: | ------: |
@@ -177,6 +177,12 @@ Fast-path coverage: 192 / 192 captured rows.
 | Fused-metadata hierarchical | 4 / 8 | 50.0% | 8 / 8 | 324252 | 4.389 | 0 |
 | Exact-metadata hierarchical | 8 / 8 | 100.0% | 8 / 8 | 332964 | 4.445 | 0 |
 | Batched full DSA relocation | 6 / 8 | 75.0% | 8 / 8 | 298957 | 4.437 | 0 |
+
+## Full GSM8K
+
+| Path | Evaluated | Score | Threads | Latency | Output throughput | Exceptions |
+| ---- | --------: | ----: | ------: | ------: | ----------------: | ---------: |
+| Batched full DSA relocation | 1314 | 0.9475 | 128 | 68.874 s | 1952.484 tok/s | 0 |
 
 ## Optimization ranking
 
