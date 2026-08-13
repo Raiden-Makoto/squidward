@@ -232,7 +232,6 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         del self.remote_kv_buffer
         del self.remote_index_k_with_scale_buffer
         del self.index_k_with_scale_buffer
-        del self._dsa_move_index_ptrs
 
     # ---- MLA latent KV: owned-only writes, owner-broadcast reads ----------
 

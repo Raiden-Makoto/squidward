@@ -4339,7 +4339,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
         else:
             assert self.page_size == 64
         self._create_index_buffers()
-        self._init_dsa_move_metadata()
         self._finalize_allocation_log(size)
 
     def _index_buffer_shape(self, num_pages: int) -> tuple[int, int]:
@@ -4374,44 +4373,40 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def _clear_buffers(self):
         super()._clear_buffers()
         del self.index_k_with_scale_buffer
-        del self._dsa_move_index_ptrs
 
-    def _init_dsa_move_metadata(self) -> None:
-        active_pairs = [
-            (kv, index)
+    def _move_index_k_cache_batched(
+        self, tgt_loc: torch.Tensor, src_loc: torch.Tensor
+    ) -> None:
+        buffers = [
+            index
             for kv, index in zip(
                 self.kv_buffer, self.index_k_with_scale_buffer, strict=True
             )
             if kv.shape[0] > 0 and index.shape[0] > 0
         ]
+        if tgt_loc.numel() == 0 or not buffers:
+            return
         assert all(
             (kv.shape[0] > 0) == (index.shape[0] > 0)
             for kv, index in zip(
                 self.kv_buffer, self.index_k_with_scale_buffer, strict=True
             )
         )
-        device = self.kv_buffer[0].device
-        self._dsa_move_index_ptrs = torch.tensor(
-            [index.data_ptr() for _, index in active_pairs],
+        index_ptrs = torch.tensor(
+            [index.data_ptr() for index in buffers],
             dtype=torch.uint64,
-            device=device,
+            device=buffers[0].device,
         )
-
-    def _move_index_k_cache_batched(
-        self, tgt_loc: torch.Tensor, src_loc: torch.Tensor
-    ) -> None:
-        if tgt_loc.numel() == 0 or self._dsa_move_index_ptrs.numel() == 0:
-            return
-        num_layers = self._dsa_move_index_ptrs.numel()
+        num_layers = len(buffers)
         num_tokens = tgt_loc.numel()
         index_scratch = torch.empty(
             (num_layers, num_tokens, self.index_head_dim + 4),
             dtype=torch.uint8,
-            device=self._dsa_move_index_ptrs.device,
+            device=buffers[0].device,
         )
         index_buf_accessor.MoveKAndS.execute_many(
             self,
-            self._dsa_move_index_ptrs,
+            index_ptrs,
             tgt_loc,
             src_loc,
             index_scratch,

@@ -84,7 +84,6 @@ def _make_pool(pool_cls=DSATokenToKVPool, *, size=PAGE_SIZE * 7, layers=2):
         .to(torch.uint8)
         for layer in range(layers)
     ]
-    pool._init_dsa_move_metadata()
     return pool
 
 
@@ -168,7 +167,6 @@ class TestDSAIndexCacheMove(CustomTestCase):
         pool = _make_pool(LayerSplitDSATokenToKVPool, layers=2)
         pool.kv_buffer[1] = pool.kv_buffer[1][:0]
         pool.index_k_with_scale_buffer[1] = pool.index_k_with_scale_buffer[1][:0]
-        pool._init_dsa_move_metadata()
         src_loc = torch.tensor([77, 202], dtype=torch.int64, device="cuda")
         tgt_loc = torch.tensor([143, 271], dtype=torch.int64, device="cuda")
         self._assert_pool_move(pool, tgt_loc, src_loc)
