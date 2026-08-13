@@ -5,7 +5,8 @@ Branch `RM/rocm-tree-spec-sampling-triton`.
 Capture `ac114dcb0b`, component benchmark `d903206a6f`, top-p candidate
 `f1849b3772`, candidate benchmark `9d069df673`, selection breakdown
 `b681a216c7`, hierarchical selector `fce4a0d2b6`, exact metadata
-`b073058644`, batched full DSA relocation `0abfb68ee0`, model
+`b073058644`, batched full DSA relocation `0abfb68ee0`, relocation tests
+`a7d24fea6a`, model
 `zai-org/GLM-5.2-FP8@ba978f7d347eaf65d22f1a86833408afdb953541`.
 
 ## Triton tree verifier
@@ -161,6 +162,13 @@ Fast-path coverage: 192 / 192 captured rows.
 | 32 | 192 | 2.862 | 2.952 | 0.044 | 0.048 | 64.56x |
 | 128 | 768 | 2.916 | 2.961 | 0.112 | 0.115 | 26.04x |
 | 256 | 1536 | 2.901 | 2.935 | 0.239 | 0.246 | 12.16x |
+
+| DSA relocation correctness | Result |
+| -------------------------- | -----: |
+| MI355X edge cases | 11 / 11 |
+| Full GSM8K | 0.9475 |
+| Customer long-horizon | 6 / 8 |
+| Server exceptions | 0 |
 
 ## GLM hierarchical top-p smoke
 
