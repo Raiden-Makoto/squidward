@@ -192,6 +192,12 @@ Fast-path coverage: 192 / 192 captured rows.
 | ---- | --------: | ----: | ------: | ------: | ----------------: | ---------: |
 | Batched full DSA relocation | 1314 | 0.9475 | 128 | 68.874 s | 1952.484 tok/s | 0 |
 
+## AIME25
+
+| Path | Correct | Score | Temperature | Top-p | Max tokens | Latency | Output throughput | Exceptions |
+| ---- | ------: | ----: | ----------: | ----: | ---------: | ------: | ----------------: | ---------: |
+| Batched full DSA relocation | 27 / 30 | 0.9000 | 1.0 | 0.95 | 65536 | 3155.713 s | 212.678 tok/s | 0 |
+
 ## Optimization ranking
 
 | Rank | Path | Batch-8 ms | Batch-8 share | Batch-256 ms | Batch-256 share |
