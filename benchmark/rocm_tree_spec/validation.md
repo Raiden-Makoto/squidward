@@ -5,7 +5,7 @@ Branch `RM/rocm-tree-spec-sampling-triton`.
 Capture `ac114dcb0b`, component benchmark `d903206a6f`, top-p candidate
 `f1849b3772`, candidate benchmark `9d069df673`, selection breakdown
 `b681a216c7`, hierarchical selector `fce4a0d2b6`, exact metadata
-`b073058644`, model
+`b073058644`, batched DSA relocation `c20b6a3616`, model
 `zai-org/GLM-5.2-FP8@ba978f7d347eaf65d22f1a86833408afdb953541`.
 
 ## Triton tree verifier
@@ -150,6 +150,18 @@ Fast-path coverage: 192 / 192 captured rows.
 | 4 | 24 | 0.244 | 0.218 | Hierarchical | 0.218 |
 | 8 | 48 | 0.262 | 0.250 | Hierarchical | 0.250 |
 
+## MI355X full DSA relocation
+
+78 layers; latent KV plus index K/scale; milliseconds.
+
+| Batch | Slots | Old p50 | Old p95 | Batched p50 | Batched p95 | Speedup |
+| ----: | ----: | ------: | ------: | ----------: | ----------: | ------: |
+| 1 | 6 | 2.662 | 2.719 | 0.035 | 0.040 | 75.67x |
+| 8 | 48 | 2.773 | 3.021 | 0.038 | 0.044 | 73.76x |
+| 32 | 192 | 2.862 | 2.952 | 0.044 | 0.048 | 64.56x |
+| 128 | 768 | 2.916 | 2.961 | 0.112 | 0.115 | 26.04x |
+| 256 | 1536 | 2.901 | 2.935 | 0.239 | 0.246 | 12.16x |
+
 ## GLM hierarchical top-p smoke
 
 | Commit | Model | Choices | Exact outputs | Normal stops | HTTP status | Completion tokens |
@@ -169,7 +181,7 @@ Fast-path coverage: 192 / 192 captured rows.
 
 | Rank | Path | Batch-8 ms | Batch-8 share | Batch-256 ms | Batch-256 share |
 | ---: | ---- | ---------: | ------------: | -----------: | --------------: |
-| 1 | DSA index relocation, 78 layers | 1.867 | 84.3% | 1.887 | 45.8% |
-| 2 | Exact hierarchical top-p | 0.251 | 11.3% | 2.032 | 49.4% |
-| 3 | Target-only tree verifier | 0.096 | 4.3% | 0.198 | 4.8% |
+| 1 | Exact hierarchical top-p | 0.251 | 65.2% | 2.032 | 82.3% |
+| 2 | Target-only tree verifier | 0.096 | 24.9% | 0.198 | 8.0% |
+| 3 | Batched full DSA relocation, 78 layers | 0.038 | 9.9% | 0.239 | 9.7% |
 | 4 | Top-p full-sort fallback | 0 | 0.0% | 0 | 0.0% |
