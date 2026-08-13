@@ -4339,6 +4339,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         else:
             assert self.page_size == 64
         self._create_index_buffers()
+        self._init_dsa_move_metadata()
         self._finalize_allocation_log(size)
 
     def _index_buffer_shape(self, num_pages: int) -> tuple[int, int]:
@@ -4373,19 +4374,83 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def _clear_buffers(self):
         super()._clear_buffers()
         del self.index_k_with_scale_buffer
+        del self._dsa_move_kv_ptrs
+        del self._dsa_move_index_ptrs
+        self._dsa_move_kv_scratch = None
+        self._dsa_move_index_scratch = None
+        self._dsa_move_scratch_capacity = 0
+
+    def _init_dsa_move_metadata(self) -> None:
+        active_pairs = [
+            (kv, index)
+            for kv, index in zip(
+                self.kv_buffer, self.index_k_with_scale_buffer, strict=True
+            )
+            if kv.shape[0] > 0 and index.shape[0] > 0
+        ]
+        assert all(
+            (kv.shape[0] > 0) == (index.shape[0] > 0)
+            for kv, index in zip(
+                self.kv_buffer, self.index_k_with_scale_buffer, strict=True
+            )
+        )
+        device = self.kv_buffer[0].device
+        self._dsa_move_kv_ptrs = torch.tensor(
+            [kv.data_ptr() for kv, _ in active_pairs],
+            dtype=torch.uint64,
+            device=device,
+        )
+        self._dsa_move_index_ptrs = torch.tensor(
+            [index.data_ptr() for _, index in active_pairs],
+            dtype=torch.uint64,
+            device=device,
+        )
+        self._dsa_move_kv_row_bytes = (
+            active_pairs[0][0][0].nbytes if active_pairs else 0
+        )
+        self._dsa_move_kv_scratch = None
+        self._dsa_move_index_scratch = None
+        self._dsa_move_scratch_capacity = 0
+
+    def _ensure_dsa_move_scratch(self, num_tokens: int) -> None:
+        if num_tokens <= self._dsa_move_scratch_capacity:
+            return
+        capacity = max(num_tokens, max(1, self._dsa_move_scratch_capacity * 2))
+        num_layers = self._dsa_move_kv_ptrs.numel()
+        self._dsa_move_kv_scratch = torch.empty(
+            (num_layers, capacity, self._dsa_move_kv_row_bytes),
+            dtype=torch.uint8,
+            device=self._dsa_move_kv_ptrs.device,
+        )
+        self._dsa_move_index_scratch = torch.empty(
+            (num_layers, capacity, self.index_head_dim + 4),
+            dtype=torch.uint8,
+            device=self._dsa_move_kv_ptrs.device,
+        )
+        self._dsa_move_scratch_capacity = capacity
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Move latent KV and the DSA indexer cache (key + scale) in lockstep."""
-        super().move_kv_cache(tgt_loc, src_loc)
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
+        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
 
-        if tgt_loc.numel() == 0:
+        if tgt_loc.numel() == 0 or self._dsa_move_kv_ptrs.numel() == 0:
             return
 
-        self._move_index_k_cache(tgt_loc, src_loc)
+        self._ensure_dsa_move_scratch(tgt_loc.numel())
+        index_buf_accessor.MoveDSACache.execute(
+            self,
+            self._dsa_move_kv_ptrs,
+            self._dsa_move_index_ptrs,
+            tgt_loc,
+            src_loc,
+            self._dsa_move_kv_scratch,
+            self._dsa_move_index_scratch,
+            self._dsa_move_scratch_capacity,
+        )
 
-    def _move_index_k_cache(
-        self, tgt_loc: torch.Tensor, src_loc: torch.Tensor
-    ) -> None:
+    def _move_index_k_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
         """Move token-granular indexer K/scale entries in their paged layout."""
         buffers = [buf for buf in self.index_k_with_scale_buffer if buf.shape[0] > 0]
         if not buffers or tgt_loc.numel() == 0:

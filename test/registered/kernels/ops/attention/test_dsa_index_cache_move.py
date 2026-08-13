@@ -83,6 +83,7 @@ def _make_pool(pool_cls=DSATokenToKVPool, *, size=PAGE_SIZE * 7, layers=2):
         .to(torch.uint8)
         for layer in range(layers)
     ]
+    pool._init_dsa_move_metadata()
     return pool
 
 
@@ -115,7 +116,9 @@ class TestDSAIndexCacheMove(CustomTestCase):
         pool = _make_pool()
         src_loc = torch.tensor([70, 141, 260, 333], device="cuda")
         tgt_loc = torch.tensor([195, 260, 141, 333], device="cuda")
-        self.assertGreater(int(src_loc.max()), pool.index_k_with_scale_buffer[0].shape[0])
+        self.assertGreater(
+            int(src_loc.max()), pool.index_k_with_scale_buffer[0].shape[0]
+        )
         self._assert_pool_move(pool, tgt_loc, src_loc)
 
     def test_empty_move(self):
@@ -152,9 +155,9 @@ class TestDSAIndexCacheMove(CustomTestCase):
         tgt_loc = torch.arange(128, 134, dtype=torch.int64, device="cuda")
         expected_kv = kv_before.clone()
         expected_kv[tgt_loc] = kv_before[src_loc]
-        expected_index = _expected_index_move(
-            index_before.cpu(), tgt_loc, src_loc
-        ).to("cuda")
+        expected_index = _expected_index_move(index_before.cpu(), tgt_loc, src_loc).to(
+            "cuda"
+        )
         torch.testing.assert_close(pool.kv_buffer[0], expected_kv, rtol=0, atol=0)
         torch.testing.assert_close(
             pool.index_k_with_scale_buffer[0], expected_index, rtol=0, atol=0
@@ -164,8 +167,27 @@ class TestDSAIndexCacheMove(CustomTestCase):
         pool = _make_pool(LayerSplitDSATokenToKVPool, layers=2)
         pool.kv_buffer[1] = pool.kv_buffer[1][:0]
         pool.index_k_with_scale_buffer[1] = pool.index_k_with_scale_buffer[1][:0]
+        pool._init_dsa_move_metadata()
         src_loc = torch.tensor([77, 202], dtype=torch.int64, device="cuda")
         tgt_loc = torch.tensor([143, 271], dtype=torch.int64, device="cuda")
+        self._assert_pool_move(pool, tgt_loc, src_loc)
+
+    def test_78_layer_overlap_and_scratch_reuse(self):
+        pool = _make_pool(layers=78)
+        src_loc = torch.tensor([70, 141, 260, 333], device="cuda")
+        tgt_loc = torch.tensor([195, 260, 141, 333], device="cuda")
+        self._assert_pool_move(pool, tgt_loc, src_loc)
+
+        kv_scratch_ptr = pool._dsa_move_kv_scratch.data_ptr()
+        index_scratch_ptr = pool._dsa_move_index_scratch.data_ptr()
+        self._assert_pool_move(pool, src_loc, tgt_loc)
+        self.assertEqual(pool._dsa_move_kv_scratch.data_ptr(), kv_scratch_ptr)
+        self.assertEqual(pool._dsa_move_index_scratch.data_ptr(), index_scratch_ptr)
+
+    def test_duplicate_identity_padding(self):
+        pool = _make_pool(layers=2)
+        src_loc = torch.tensor([70, 141, 0, 0], device="cuda")
+        tgt_loc = torch.tensor([195, 260, 0, 0], device="cuda")
         self._assert_pool_move(pool, tgt_loc, src_loc)
 
 
