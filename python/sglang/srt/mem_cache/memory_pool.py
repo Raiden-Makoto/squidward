@@ -4374,7 +4374,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def _clear_buffers(self):
         super()._clear_buffers()
         del self.index_k_with_scale_buffer
-        del self._dsa_move_kv_ptrs
         del self._dsa_move_index_ptrs
 
     def _init_dsa_move_metadata(self) -> None:
@@ -4392,58 +4391,36 @@ class DSATokenToKVPool(MLATokenToKVPool):
             )
         )
         device = self.kv_buffer[0].device
-        self._dsa_move_kv_ptrs = torch.tensor(
-            [kv.data_ptr() for kv, _ in active_pairs],
-            dtype=torch.uint64,
-            device=device,
-        )
         self._dsa_move_index_ptrs = torch.tensor(
             [index.data_ptr() for _, index in active_pairs],
             dtype=torch.uint64,
             device=device,
         )
-        self._dsa_move_kv_row_bytes = (
-            active_pairs[0][0][0].nbytes if active_pairs else 0
-        )
 
-    def _allocate_dsa_move_scratch(
-        self, num_tokens: int
-    ) -> tuple[torch.Tensor, torch.Tensor, int]:
-        num_layers = self._dsa_move_kv_ptrs.numel()
-        kv_scratch = torch.empty(
-            (num_layers, num_tokens, self._dsa_move_kv_row_bytes),
-            dtype=torch.uint8,
-            device=self._dsa_move_kv_ptrs.device,
-        )
+    def _move_index_k_cache_batched(
+        self, tgt_loc: torch.Tensor, src_loc: torch.Tensor
+    ) -> None:
+        if tgt_loc.numel() == 0 or self._dsa_move_index_ptrs.numel() == 0:
+            return
+        num_layers = self._dsa_move_index_ptrs.numel()
+        num_tokens = tgt_loc.numel()
         index_scratch = torch.empty(
             (num_layers, num_tokens, self.index_head_dim + 4),
             dtype=torch.uint8,
-            device=self._dsa_move_kv_ptrs.device,
+            device=self._dsa_move_index_ptrs.device,
         )
-        return kv_scratch, index_scratch, num_tokens
-
-    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        """Move latent KV and the DSA indexer cache (key + scale) in lockstep."""
-        size_limit = self.size + self.page_size
-        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
-        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
-
-        if tgt_loc.numel() == 0 or self._dsa_move_kv_ptrs.numel() == 0:
-            return
-
-        kv_scratch, index_scratch, scratch_capacity = self._allocate_dsa_move_scratch(
-            tgt_loc.numel()
-        )
-        index_buf_accessor.MoveDSACache.execute(
+        index_buf_accessor.MoveKAndS.execute_many(
             self,
-            self._dsa_move_kv_ptrs,
             self._dsa_move_index_ptrs,
             tgt_loc,
             src_loc,
-            kv_scratch,
             index_scratch,
-            scratch_capacity,
         )
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Move latent KV and the DSA indexer cache (key + scale) in lockstep."""
+        super().move_kv_cache(tgt_loc, src_loc)
+        self._move_index_k_cache_batched(tgt_loc, src_loc)
 
     def _move_index_k_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
         """Move token-granular indexer K/scale entries in their paged layout."""
