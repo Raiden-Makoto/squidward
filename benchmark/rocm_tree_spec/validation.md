@@ -176,6 +176,7 @@ Fast-path coverage: 192 / 192 captured rows.
 | Previous tree top-k=2 | 7 / 8 | 87.5% | 8 / 8 | 317649 | 4.463 | 0 |
 | Fused-metadata hierarchical | 4 / 8 | 50.0% | 8 / 8 | 324252 | 4.389 | 0 |
 | Exact-metadata hierarchical | 8 / 8 | 100.0% | 8 / 8 | 332964 | 4.445 | 0 |
+| Batched full DSA relocation | 6 / 8 | 75.0% | 8 / 8 | 298957 | 4.437 | 0 |
 
 ## Optimization ranking
 
