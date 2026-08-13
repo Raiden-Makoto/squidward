@@ -4376,9 +4376,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         del self.index_k_with_scale_buffer
         del self._dsa_move_kv_ptrs
         del self._dsa_move_index_ptrs
-        self._dsa_move_kv_scratch = None
-        self._dsa_move_index_scratch = None
-        self._dsa_move_scratch_capacity = 0
+        self._dsa_move_scratch_by_stream.clear()
 
     def _init_dsa_move_metadata(self) -> None:
         active_pairs = [
@@ -4408,26 +4406,36 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self._dsa_move_kv_row_bytes = (
             active_pairs[0][0][0].nbytes if active_pairs else 0
         )
-        self._dsa_move_kv_scratch = None
-        self._dsa_move_index_scratch = None
-        self._dsa_move_scratch_capacity = 0
+        self._dsa_move_scratch_by_stream = {}
 
-    def _ensure_dsa_move_scratch(self, num_tokens: int) -> None:
-        if num_tokens <= self._dsa_move_scratch_capacity:
-            return
-        capacity = max(num_tokens, max(1, self._dsa_move_scratch_capacity * 2))
+    def _get_dsa_move_scratch(
+        self, num_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        stream = torch.get_device_module(self.device).current_stream()
+        stream_id = stream.cuda_stream
+        cached = self._dsa_move_scratch_by_stream.get(stream_id)
+        if cached is not None and num_tokens <= cached[0]:
+            return cached[1], cached[2], cached[0]
+
+        old_capacity = cached[0] if cached is not None else 0
+        capacity = max(num_tokens, max(1, old_capacity * 2))
         num_layers = self._dsa_move_kv_ptrs.numel()
-        self._dsa_move_kv_scratch = torch.empty(
+        kv_scratch = torch.empty(
             (num_layers, capacity, self._dsa_move_kv_row_bytes),
             dtype=torch.uint8,
             device=self._dsa_move_kv_ptrs.device,
         )
-        self._dsa_move_index_scratch = torch.empty(
+        index_scratch = torch.empty(
             (num_layers, capacity, self.index_head_dim + 4),
             dtype=torch.uint8,
             device=self._dsa_move_kv_ptrs.device,
         )
-        self._dsa_move_scratch_capacity = capacity
+        self._dsa_move_scratch_by_stream[stream_id] = (
+            capacity,
+            kv_scratch,
+            index_scratch,
+        )
+        return kv_scratch, index_scratch, capacity
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Move latent KV and the DSA indexer cache (key + scale) in lockstep."""
@@ -4438,16 +4446,18 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if tgt_loc.numel() == 0 or self._dsa_move_kv_ptrs.numel() == 0:
             return
 
-        self._ensure_dsa_move_scratch(tgt_loc.numel())
+        kv_scratch, index_scratch, scratch_capacity = self._get_dsa_move_scratch(
+            tgt_loc.numel()
+        )
         index_buf_accessor.MoveDSACache.execute(
             self,
             self._dsa_move_kv_ptrs,
             self._dsa_move_index_ptrs,
             tgt_loc,
             src_loc,
-            self._dsa_move_kv_scratch,
-            self._dsa_move_index_scratch,
-            self._dsa_move_scratch_capacity,
+            kv_scratch,
+            index_scratch,
+            scratch_capacity,
         )
 
     def _move_index_k_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:

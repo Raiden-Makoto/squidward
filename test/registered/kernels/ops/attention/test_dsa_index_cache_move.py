@@ -60,6 +60,7 @@ def _make_pool(pool_cls=DSATokenToKVPool, *, size=PAGE_SIZE * 7, layers=2):
     pool.page_size = PAGE_SIZE
     pool.index_head_dim = INDEX_HEAD_DIM
     pool.layer_num = layers
+    pool.device = torch.device("cuda")
     num_pages = (size + PAGE_SIZE + 1) // PAGE_SIZE
     pool.kv_buffer = [
         torch.arange(
@@ -178,17 +179,47 @@ class TestDSAIndexCacheMove(CustomTestCase):
         tgt_loc = torch.tensor([195, 260, 141, 333], device="cuda")
         self._assert_pool_move(pool, tgt_loc, src_loc)
 
-        kv_scratch_ptr = pool._dsa_move_kv_scratch.data_ptr()
-        index_scratch_ptr = pool._dsa_move_index_scratch.data_ptr()
+        cached = next(iter(pool._dsa_move_scratch_by_stream.values()))
+        kv_scratch_ptr = cached[1].data_ptr()
+        index_scratch_ptr = cached[2].data_ptr()
         self._assert_pool_move(pool, src_loc, tgt_loc)
-        self.assertEqual(pool._dsa_move_kv_scratch.data_ptr(), kv_scratch_ptr)
-        self.assertEqual(pool._dsa_move_index_scratch.data_ptr(), index_scratch_ptr)
+        cached = next(iter(pool._dsa_move_scratch_by_stream.values()))
+        self.assertEqual(cached[1].data_ptr(), kv_scratch_ptr)
+        self.assertEqual(cached[2].data_ptr(), index_scratch_ptr)
 
     def test_duplicate_identity_padding(self):
         pool = _make_pool(layers=2)
         src_loc = torch.tensor([70, 141, 0, 0], device="cuda")
         tgt_loc = torch.tensor([195, 260, 0, 0], device="cuda")
         self._assert_pool_move(pool, tgt_loc, src_loc)
+
+    def test_concurrent_streams_use_independent_scratch(self):
+        pool = _make_pool(layers=78)
+        src_1 = torch.tensor([70, 141], device="cuda")
+        tgt_1 = torch.tensor([195, 260], device="cuda")
+        src_2 = torch.tensor([80, 151], device="cuda")
+        tgt_2 = torch.tensor([205, 270], device="cuda")
+        kv_before = [buf.clone() for buf in pool.kv_buffer]
+        index_before = [buf.clone() for buf in pool.index_k_with_scale_buffer]
+
+        stream_1 = torch.cuda.Stream()
+        stream_2 = torch.cuda.Stream()
+        with torch.cuda.stream(stream_1):
+            pool.move_kv_cache(tgt_1, src_1)
+        with torch.cuda.stream(stream_2):
+            pool.move_kv_cache(tgt_2, src_2)
+        torch.cuda.synchronize()
+
+        self.assertEqual(len(pool._dsa_move_scratch_by_stream), 2)
+        for got, before in zip(pool.kv_buffer, kv_before):
+            expected = before.clone()
+            expected[tgt_1] = before[src_1]
+            expected[tgt_2] = before[src_2]
+            torch.testing.assert_close(got, expected, rtol=0, atol=0)
+        for got, before in zip(pool.index_k_with_scale_buffer, index_before):
+            expected = _expected_index_move(before.cpu(), tgt_1, src_1)
+            expected = _expected_index_move(expected, tgt_2, src_2).to("cuda")
+            torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

@@ -234,9 +234,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         del self.index_k_with_scale_buffer
         del self._dsa_move_kv_ptrs
         del self._dsa_move_index_ptrs
-        self._dsa_move_kv_scratch = None
-        self._dsa_move_index_scratch = None
-        self._dsa_move_scratch_capacity = 0
+        self._dsa_move_scratch_by_stream.clear()
 
     # ---- MLA latent KV: owned-only writes, owner-broadcast reads ----------
 
