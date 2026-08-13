@@ -337,7 +337,8 @@ def run_capture_bench(args, aot) -> None:
     )
     print(
         f"{'bs':>5} {'tree_p50':>10} {'tree_p95':>10} {'accept':>8} "
-        f"{'move_slots':>10} {'move/layer':>11} {'move/78L':>10}"
+        f"{'move_slots':>10} {'index/1L':>10} {'old/78L':>10} "
+        f"{'batch/78L':>10} {'speedup':>8}"
     )
 
     for batch_size in args.batches:
@@ -394,11 +395,32 @@ def run_capture_bench(args, aot) -> None:
         full_pool.page_size = pool.page_size
         full_pool.index_head_dim = pool.index_head_dim
         full_pool.quant_block_size = pool.quant_block_size
+        full_pool.size = int(tgt_loc.max().item()) + 1
+        full_pool.kv_buffer = [
+            torch.zeros(
+                (full_pool.size + full_pool.page_size, 1, 656),
+                dtype=torch.uint8,
+                device=DEVICE,
+            )
+            for _ in range(78)
+        ]
         full_pool.index_k_with_scale_buffer = [
             torch.zeros_like(index_buffer) for _ in range(78)
         ]
-        full_move_samples = latency_samples(
-            lambda: full_pool._move_index_k_cache(tgt_loc, src_loc),
+        full_pool._init_dsa_move_metadata()
+
+        def old_full_move():
+            for kv_cache in full_pool.kv_buffer:
+                kv_cache[tgt_loc] = kv_cache[src_loc]
+            full_pool._move_index_k_cache(tgt_loc, src_loc)
+
+        old_full_move_samples = latency_samples(
+            old_full_move,
+            args.iters,
+        )
+        full_pool.move_kv_cache(tgt_loc, src_loc)
+        batched_full_move_samples = latency_samples(
+            lambda: full_pool.move_kv_cache(tgt_loc, src_loc),
             args.iters,
         )
 
@@ -411,9 +433,23 @@ def run_capture_bench(args, aot) -> None:
             "relocation_slots": moved_slots,
             "relocation_p50_ms_per_layer": statistics.median(move_samples),
             "relocation_p95_ms_per_layer": percentile(move_samples, 0.95),
-            "relocation_p50_ms_78_layers": statistics.median(full_move_samples),
-            "relocation_p95_ms_78_layers": percentile(full_move_samples, 0.95),
+            "old_full_relocation_p50_ms_78_layers": statistics.median(
+                old_full_move_samples
+            ),
+            "old_full_relocation_p95_ms_78_layers": percentile(
+                old_full_move_samples, 0.95
+            ),
+            "batched_full_relocation_p50_ms_78_layers": statistics.median(
+                batched_full_move_samples
+            ),
+            "batched_full_relocation_p95_ms_78_layers": percentile(
+                batched_full_move_samples, 0.95
+            ),
         }
+        row["batched_full_relocation_speedup"] = (
+            row["old_full_relocation_p50_ms_78_layers"]
+            / row["batched_full_relocation_p50_ms_78_layers"]
+        )
         if aot is not None:
             aot_samples = latency_samples(
                 lambda: aot(
@@ -431,8 +467,10 @@ def run_capture_bench(args, aot) -> None:
             f"{batch_size:>5} {row['tree_p50_ms']:>10.4f} "
             f"{row['tree_p95_ms']:>10.4f} "
             f"{row['acceptance_length_mean']:>8.2f} "
-            f"{moved_slots:>10} {row['relocation_p50_ms_per_layer']:>11.4f} "
-            f"{row['relocation_p50_ms_78_layers']:>10.3f}"
+            f"{moved_slots:>10} {row['relocation_p50_ms_per_layer']:>10.4f} "
+            f"{row['old_full_relocation_p50_ms_78_layers']:>10.3f} "
+            f"{row['batched_full_relocation_p50_ms_78_layers']:>10.3f} "
+            f"{row['batched_full_relocation_speedup']:>7.2f}x"
         )
 
     if args.output_json:
