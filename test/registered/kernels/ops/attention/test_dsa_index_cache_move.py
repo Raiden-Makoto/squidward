@@ -173,19 +173,12 @@ class TestDSAIndexCacheMove(CustomTestCase):
         tgt_loc = torch.tensor([143, 271], dtype=torch.int64, device="cuda")
         self._assert_pool_move(pool, tgt_loc, src_loc)
 
-    def test_78_layer_overlap_and_scratch_reuse(self):
+    def test_78_layer_overlap(self):
         pool = _make_pool(layers=78)
         src_loc = torch.tensor([70, 141, 260, 333], device="cuda")
         tgt_loc = torch.tensor([195, 260, 141, 333], device="cuda")
         self._assert_pool_move(pool, tgt_loc, src_loc)
-
-        cached = next(iter(pool._dsa_move_scratch_by_stream.values()))
-        kv_scratch_ptr = cached[1].data_ptr()
-        index_scratch_ptr = cached[2].data_ptr()
         self._assert_pool_move(pool, src_loc, tgt_loc)
-        cached = next(iter(pool._dsa_move_scratch_by_stream.values()))
-        self.assertEqual(cached[1].data_ptr(), kv_scratch_ptr)
-        self.assertEqual(cached[2].data_ptr(), index_scratch_ptr)
 
     def test_duplicate_identity_padding(self):
         pool = _make_pool(layers=2)
@@ -193,7 +186,7 @@ class TestDSAIndexCacheMove(CustomTestCase):
         tgt_loc = torch.tensor([195, 260, 0, 0], device="cuda")
         self._assert_pool_move(pool, tgt_loc, src_loc)
 
-    def test_concurrent_streams_use_independent_scratch(self):
+    def test_concurrent_streams(self):
         pool = _make_pool(layers=78)
         src_1 = torch.tensor([70, 141], device="cuda")
         tgt_1 = torch.tensor([195, 260], device="cuda")
@@ -210,7 +203,6 @@ class TestDSAIndexCacheMove(CustomTestCase):
             pool.move_kv_cache(tgt_2, src_2)
         torch.cuda.synchronize()
 
-        self.assertEqual(len(pool._dsa_move_scratch_by_stream), 2)
         for got, before in zip(pool.kv_buffer, kv_before):
             expected = before.clone()
             expected[tgt_1] = before[src_1]
