@@ -170,10 +170,10 @@ def _get_aiter_topk_fuse_shared_max_tokens() -> int:
     (server args are fixed after startup)."""
     global _aiter_topk_fuse_shared_max_tokens_cache
     if _aiter_topk_fuse_shared_max_tokens_cache is None:
-        from sglang.srt.runtime_context import get_server_args
+        from sglang.srt.runtime_context import get_schedule
 
         try:
-            sa = get_server_args()
+            schedule = get_schedule()
         except ValueError:
             # Global server args not published yet (e.g. a unit test or offline
             # init that reaches the aiter grouped-topk path before startup).
@@ -182,8 +182,8 @@ def _get_aiter_topk_fuse_shared_max_tokens() -> int:
             # safety cap WITHOUT caching, so a later call (once args are set)
             # still computes and caches the real value.
             return _AITER_TOPK_FUSE_SHARED_MAX_TOKENS_CAP
-        cps = getattr(sa, "chunked_prefill_size", None) or 0
-        mpt = getattr(sa, "max_prefill_tokens", None) or 0
+        cps = schedule.chunked_prefill_size or 0
+        mpt = schedule.max_prefill_tokens or 0
         m = max(int(cps), int(mpt), 8192)  # 8192 floor for tiny configs
         if int(cps) <= 0 and int(mpt) <= 0:
             # chunked prefill disabled -> use the safety cap
@@ -853,11 +853,24 @@ def fused_topk_cpu(
     if num_token_non_padded is not None:
         raise ValueError("num_token_non_padded is not supported for CPU fused topk")
 
-    # TODO: add c++ kernel for cpu
-    # The topk_softmax_cpu kernel only handles vanilla softmax scoring with no
-    # correction bias. Fall back to the torch-native impl for the rest
-    # (e.g. MiniMax sets both correction_bias and scoring_func).
-    if correction_bias is not None or scoring_func != "softmax":
+    if scoring_func == "softmax":
+        topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
+            hidden_states=hidden_states,
+            gating_output=gating_output,
+            topk=topk,
+            renormalize=renormalize,
+            correction_bias=correction_bias,
+        )
+    elif scoring_func == "sigmoid":
+        topk_weights, topk_ids = torch.ops.sgl_kernel.topk_sigmoid_cpu(
+            hidden_states=hidden_states,
+            gating_output=gating_output,
+            topk=topk,
+            renormalize=renormalize,
+            correction_bias=correction_bias,
+        )
+    else:
+        # Fall back to the torch-native impl for the rest
         return fused_topk_torch_native(
             hidden_states,
             gating_output,
@@ -867,12 +880,6 @@ def fused_topk_cpu(
             scoring_func=scoring_func,
         )
 
-    topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
-        hidden_states=hidden_states,
-        gating_output=gating_output,
-        topk=topk,
-        renormalize=renormalize,
-    )
     return topk_weights, topk_ids
 
 
