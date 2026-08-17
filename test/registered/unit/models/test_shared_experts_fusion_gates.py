@@ -90,6 +90,19 @@ class TestDeepseekV2Gate(_FusionGateCase):
             self._reason(DeepseekV2ForCausalLM, config, _quant("quark")) or "",
         )
 
+    def test_mixed_precision_shared_experts_cannot_fuse(self):
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+        self._seed()
+        quant_config = SimpleNamespace(
+            get_name=lambda: "quark",
+            can_fuse_shared_expert=lambda: False,
+        )
+        self.assertIn(
+            "different precision",
+            self._reason(DeepseekV2ForCausalLM, self._config(), quant_config),
+        )
+
     def test_the_nextn_draft_declares_its_own_architecture(self):
         from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
         from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
