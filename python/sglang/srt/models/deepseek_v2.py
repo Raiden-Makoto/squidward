@@ -3058,15 +3058,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         ):
             return "Config does not support fused shared expert(s)."
         if (
-            quant_config is not None
-            and hasattr(quant_config, "can_fuse_shared_expert")
-            and not quant_config.can_fuse_shared_expert()
-        ):
-            return (
-                "Quantization keeps shared experts in a different precision "
-                "than routed experts."
-            )
-        if (
             (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0))
             and (not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4))
             and (not _is_musa or torch.musa.get_device_capability("musa") < (3, 1))
