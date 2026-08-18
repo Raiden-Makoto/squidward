@@ -1133,6 +1133,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
             q_offset, k_offset, device_index
         )
+        # AITER's gfx950 Gluon BLOCK_M=2 dispatch for query rows above 4096
+        # currently aborts during Triton compilation. Keep each HIP launch in
+        # the validated BLOCK_M=1 range; the chunk path preserves the same
+        # masking and top-k semantics.
+        if _is_hip and q_offset > 4096:
+            need_chunk = True
 
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
@@ -1177,6 +1183,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
         max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
         max_rows = min(max_rows, q_offset)
+        if _is_hip:
+            max_rows = min(max_rows, 4096)
 
         global_topk_offset = metadata.attn_metadata.topk_indices_offset
         cu_seqlens_q_full = None
