@@ -31,6 +31,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
+    input_to_float8,
     inverse_transform_scale_ue8m0,
     normalize_e4m3fn_to_e4m3fnuz,
     quant_weight_ue8m0,
@@ -203,6 +204,9 @@ class DeepseekV2WeightLoaderMixin:
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             params_dict = dict(self.named_parameters())
+            indexer_present_prefixes = {
+                n.rsplit(".indexer.", 1)[0] for n in params_dict if ".indexer." in n
+            }
             weight_names = []
 
             for name, loaded_weight in weights:
@@ -255,6 +259,11 @@ class DeepseekV2WeightLoaderMixin:
                                     continue
 
                 if "rotary_emb.inv_freq" in name:
+                    continue
+
+                if ".indexer." in name and (
+                    name.rsplit(".indexer.", 1)[0] not in indexer_present_prefixes
+                ):
                     continue
 
                 # CUDA fuses wk + weights_proj into one bf16 wk_weights_proj; the

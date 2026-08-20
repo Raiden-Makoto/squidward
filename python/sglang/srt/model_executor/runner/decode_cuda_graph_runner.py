@@ -44,7 +44,10 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import SharedReadBoundary
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -245,7 +248,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             model_runner.server_args.enable_profile_cuda_graph
         )
 
-        # --- DSA dense-decode dual-graph (Design A) --------------------
+        # --- DSA dense-decode dual-graph -------------------------------
         # Capture a "dense" (k-only, skip-indexer) and a "sparse" (full indexer)
         # decode graph per bs bucket, and dispatch on max_kv_len vs index_topk at
         # replay. Auto-enabled for DSA models (index_topk present in the HF
@@ -268,10 +271,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         hf_config = model_runner.model_config.hf_config
         if is_hip() and is_deepseek_dsa(hf_config):
             self.dsa_index_topk = get_dsa_index_topk(hf_config)
-        self.dsa_dual_graph = self.dsa_index_topk is not None
-        if self.dsa_dual_graph:
+            self.dsa_dual_graph = True
             logger.info(
-                "[dense-decode] Design A dual-graph enabled: capturing "
+                "[dense-decode] DSA dual-graph enabled: capturing "
                 "dense (k-only) + sparse (full indexer) decode graphs; "
                 "dispatch on max_kv_len vs index_topk=%d.",
                 self.dsa_index_topk,
@@ -465,41 +467,35 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _record_in_graph_metadata_prep_done(self):
         # Purely a marker at this point in the graph; where the shared reads
         # actually end is the attn backend's call.
-        if not torch.cuda.is_current_stream_capturing():
+        if not self.device_module.is_current_stream_capturing():
             # Warmup shares this body. Breakable capture still plants: it opens
             # segment 1 on context entry and every segment re-arms the node.
+            # Routed through device_module so XPU (torch.xpu) is picked up
+            # instead of hitting torch.cuda dummy stubs on non-CUDA builds.
             return
         if self.in_graph_metadata_prep_done is None:
             self.in_graph_metadata_prep_done = make_external_event(self.device_module)
         event = self.in_graph_metadata_prep_done
         if event is not None:
-            # Stays None without external-event support, so the boundary
+            # Stays None without external-event support, so the read-end
             # resolution below never hands out an unrecorded event.
             event.record()
 
-    def _resolve_shared_read_boundary(
-        self, attn_backend, forward_mode
-    ) -> SharedReadBoundary:
-        """Where this replay records its shared-read-done event: the backend's
-        declaration, demoted when this runner cannot record at that point.
-        UNKNOWN records nothing (scheduler keeps the coarse fence)."""
-        if forward_mode.is_target_verify():
-            if not self.model_runner.spec_algorithm.is_last_shared_read_phase(
-                forward_mode
-            ):
-                return SharedReadBoundary.UNKNOWN
-        elif not forward_mode.is_decode():
-            return SharedReadBoundary.UNKNOWN
-        boundary = attn_backend.shared_read_boundary(forward_mode)
+    def _replay_attn_backend(self) -> AttentionBackend:
+        # Under pdmux each stream replays on its own group member.
+        if self.enable_pdmux:
+            return self.model_runner.decode_attn_backend_group[get_current_stream_idx()]
+        return self.attn_backend
 
+    def _resolve_shared_read_ends(self, attn_backend, forward_mode) -> SharedReadEnds:
+        declared = attn_backend.shared_read_ends(forward_mode)
         if (
-            boundary is SharedReadBoundary.IN_REPLAY
+            declared is SharedReadEnds.IN_REPLAY
             and self.in_graph_metadata_prep_done is None
         ):
-            # TODO: PRE_REPLAY is EARLIER than the declared boundary; POST_REPLAY
-            # is the sound demotion for a backend that really reads in-graph.
-            return SharedReadBoundary.PRE_REPLAY
-        return boundary
+            # TODO: this lands EARLIER than declared; POST_REPLAY is the sound one.
+            return SharedReadEnds.PRE_REPLAY
+        return declared
 
     def _publish_read_done(self, in_graph: bool):
         """Hand the scheduler's WAR barrier the event marking this phase's
@@ -554,8 +550,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return num_tokens if self.ragged_verify_mode else bs
 
     def _resolve_dsa_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
-        """Design A host dispatch: pick which pre-captured DSA decode graph to
-        replay from the batch-max kv_len. If any request has kv_len > index_topk
+        """Host dispatch: pick which pre-captured DSA decode graph to replay
+        from the batch-max kv_len. If any request has kv_len > index_topk
         the dense (k-only) graph would be wrong for it, so the whole batch uses
         the sparse (full indexer) graph. Returns None when dual-graph is off."""
         if not getattr(self, "dsa_dual_graph", False):
@@ -1077,7 +1073,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if getattr(self, "record_nolora_graph", False)
             else [(None, None)]
         )
-        # Design A: capture a dense (k-only) and a sparse (full indexer) graph
+        # DSA: capture a dense (k-only) and a sparse (full indexer) graph
         # per bs bucket. Order: dense first so its (smaller) capture-time peak
         # runs while the shared pool is fresh; sparse's peak subsumes it.
         # getattr default: subclasses like EAGLEDraftCudaGraphRunner reuse this
@@ -1352,11 +1348,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and forward_batch.spec_info is not None
         ):
             forward_batch.spec_info.custom_mask = buffers.custom_mask
-        if self.enable_pdmux:
-            stream_idx = get_current_stream_idx()
-            attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
-        else:
-            attn_backend = self.attn_backend
+
+        attn_backend = self._replay_attn_backend()
         fb_view = build_replay_fb_view(
             forward_batch=forward_batch,
             buffers=buffers,
@@ -1398,8 +1391,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         timer_ctx = device_timer_ctx(
             self.model_runner.device_timer, forward_batch.forward_mode.name.lower()
         )
-        shared_read_boundary = self._resolve_shared_read_boundary(
-            self.attn_backend, forward_batch.forward_mode
+        shared_read_ends = self._resolve_shared_read_ends(
+            self._replay_attn_backend(), forward_batch.forward_mode
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
@@ -1417,15 +1410,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         else ""
                     ),
                 )
-            if shared_read_boundary is SharedReadBoundary.PRE_REPLAY:
+            if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
-            if shared_read_boundary is SharedReadBoundary.IN_REPLAY:
+            if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)
 
-            if shared_read_boundary is SharedReadBoundary.POST_REPLAY:
+            if shared_read_ends is SharedReadEnds.POST_REPLAY:
                 self._publish_read_done(in_graph=False)
 
         if isinstance(output, LogitsProcessorOutput):
