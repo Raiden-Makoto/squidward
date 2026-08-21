@@ -140,7 +140,7 @@ class TestMxfp4KDispatch(CustomTestCase):
         tuned_bmm.assert_not_called()
         self.assertIsNone(result)
 
-    def test_glm_geometry_uses_safe_k_block_without_split_k(self):
+    def test_glm_geometry_uses_native_k_block_without_split_k(self):
         x = torch.randn(2, 3, 192, dtype=torch.bfloat16)
         weight = torch.zeros(2, 512, 96, dtype=torch.uint8)
         scale = torch.zeros(2, 512, 6, dtype=torch.uint8)
@@ -167,7 +167,7 @@ class TestMxfp4KDispatch(CustomTestCase):
         self.assertIs(args[2], scale)
         self.assertIs(args[3], output)
         self.assertEqual(args[4]["NUM_KSPLIT"], 1)
-        self.assertEqual(args[4]["BLOCK_SIZE_K"], 64)
+        self.assertEqual(args[4]["BLOCK_SIZE_K"], 256)
         self.assertEqual(tuned_config["NUM_KSPLIT"], 4)
         self.assertEqual(tuned_config["BLOCK_SIZE_K"], 256)
         self.assertFalse(kwargs["transpose_bm"])

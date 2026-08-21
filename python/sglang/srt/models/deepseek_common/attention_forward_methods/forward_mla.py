@@ -189,8 +189,9 @@ def _get_single_split_mxfp4_bmm_config(x: torch.Tensor, weight: torch.Tensor) ->
 
 def _get_glm_mxfp4_k_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
     config = _get_single_split_mxfp4_bmm_config(x, weight)
-    # GLM's K-up has K=192. Larger blocks over-read its six E8M0 scale groups.
-    config["BLOCK_SIZE_K"] = 64
+    # AITER masks GLM's partial K=192 tile, allowing the native-width gfx950
+    # scaled-FP4 MFMA path without over-reading its six E8M0 scale groups.
+    config["BLOCK_SIZE_K"] = 256
     return config
 
 
