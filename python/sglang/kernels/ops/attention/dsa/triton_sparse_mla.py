@@ -61,7 +61,8 @@ def _quantize_mxfp4_chunk(x):
 
     normal_x = qx
     mant_odd = (normal_x >> 22) & 1
-    normal_x += ((1 - 127) << 23) + (1 << 21) - 1
+    val_to_add: tl.constexpr = ((1 - 127) << 23) + (1 << 21) - 1
+    normal_x += val_to_add
     normal_x += mant_odd
     normal_x = (normal_x >> 22).to(tl.uint8)
 
