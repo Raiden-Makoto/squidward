@@ -30,9 +30,10 @@ SparseMLAOutput: TypeAlias = torch.Tensor | PackedMXFP4
 
 
 @triton.jit
-def _quantize_mxfp4_group(x):
-    """Bit-compatible specialization of AITER's MXFP4 quantizer for x[:, 32]."""
-    amax = tl.max(tl.abs(x), axis=1, keep_dims=True)
+def _quantize_mxfp4_chunk(x):
+    """Bit-compatible AITER MXFP4 quantization for one x[:, 128] chunk."""
+    x = x.reshape([x.shape[0], 4, 32])
+    amax = tl.max(tl.abs(x), axis=2, keep_dims=True)
     amax = amax.to(tl.int32, bitcast=True)
     amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
     amax = amax.to(tl.float32, bitcast=True)
@@ -69,9 +70,11 @@ def _quantize_mxfp4_group(x):
     code = tl.where(denormal_mask, denormal_x, code)
     code |= (sign >> 28).to(tl.uint8)
 
-    code = code.reshape([x.shape[0], 16, 2])
+    code = code.reshape([x.shape[0], 4, 16, 2])
     evens, odds = tl.split(code)
-    return evens | (odds << 4), scale_e8m0[:, 0]
+    return (evens | (odds << 4)).reshape([x.shape[0], 64]), scale_e8m0.reshape(
+        [x.shape[0], 4]
+    )
 
 
 @triton.jit
@@ -86,19 +89,23 @@ def _store_mxfp4_group(
     output_group,
     T,
 ):
-    """Quantize one normalized FP32 group of 32 values and store head-major."""
-    group_values = values[
-        :,
-        group_in_chunk * 32 : (group_in_chunk + 1) * 32,
-    ]
-    packed, scale_e8m0 = _quantize_mxfp4_group(group_values)
-    pair = tl.arange(0, 16)
-
-    value_group = output_group * 16
-    value_base = heads[:, None] * T * 256 + token * 256 + value_group
-    scale_base = heads * T * 16 + token * 16 + output_group
-    tl.store(values_ptr + value_base + pair[None, :], packed, mask=head_mask[:, None])
-    tl.store(scales_ptr + scale_base, scale_e8m0, mask=head_mask)
+    """Store one normalized 128-wide chunk; only the first static call emits."""
+    if group_in_chunk == 0:
+        packed, scale_e8m0 = _quantize_mxfp4_chunk(values)
+        value_offsets = tl.arange(0, 64)
+        scale_offsets = tl.arange(0, 4)
+        value_base = heads[:, None] * T * 256 + token * 256 + output_group * 16
+        scale_base = heads[:, None] * T * 16 + token * 16 + output_group
+        tl.store(
+            values_ptr + value_base + value_offsets[None, :],
+            packed,
+            mask=head_mask[:, None],
+        )
+        tl.store(
+            scales_ptr + scale_base + scale_offsets[None, :],
+            scale_e8m0,
+            mask=head_mask[:, None],
+        )
 
 
 def _allocate_output(
