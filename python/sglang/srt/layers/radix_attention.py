@@ -166,6 +166,13 @@ class RadixAttention(nn.Module):
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
+        if kwargs.get("return_mxfp4_v", False):
+            # Packed sparse-MLA output has a tuple ABI and cannot use the
+            # preallocated BF16 output custom-op path below.
+            return get_attn_backend().forward(
+                q, k, v, self, forward_batch, save_kv_cache, **kwargs
+            )
+
         context = get_tc_piecewise_forward_context()
         if (
             forward_batch.forward_mode.is_extend()
