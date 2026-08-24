@@ -1879,6 +1879,7 @@ class DeepseekSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        return_mxfp4_v: bool = False,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
@@ -2028,6 +2029,7 @@ class DeepseekSparseAttnBackend(
                 indices=page_table_1.unsqueeze(1),
                 sm_scale=layer.scaling,
                 d_v=layer.v_head_dim,
+                return_mxfp4=return_mxfp4_v,
             )
         elif dsa_impl in ("flashmla_sparse", "flashmla_sparse_q8"):
             if topk_transform_method == TopkTransformMethod.RAGGED:

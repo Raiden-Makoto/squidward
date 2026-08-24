@@ -208,6 +208,84 @@ class TestMxfp4KDispatch(CustomTestCase):
 
 
 class TestRocmMxfp4AbsorbedBmmRoute(CustomTestCase):
+    def test_packed_v_gate_requires_supported_eager_triton_surface(self):
+        attn = SimpleNamespace(
+            current_attention_backend="dsa",
+            v_head_dim=512,
+            num_local_heads=16,
+            w_vc=torch.empty(1, dtype=torch.uint8),
+            use_deep_gemm_bmm=False,
+            _skip_rope_for_dsa_tilelang_fused=lambda: False,
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_extend=lambda: True)
+        )
+        exec_config = SimpleNamespace(
+            kernel=SimpleNamespace(dsa_prefill_backend="triton")
+        )
+
+        with (
+            mock.patch.object(forward_mla_rocm, "_use_aiter_gfx95", True),
+            mock.patch.object(forward_mla_rocm, "get_exec", return_value=exec_config),
+            mock.patch.object(
+                forward_mla_rocm, "is_kv_b_lora_active", return_value=False
+            ),
+            mock.patch.object(
+                forward_mla_rocm, "dsa_use_prefill_cp", return_value=False
+            ),
+            mock.patch.object(
+                forward_mla_rocm, "mla_use_prefill_cp", return_value=False
+            ),
+        ):
+            self.assertTrue(
+                forward_mla_rocm.should_request_packed_mxfp4_v(
+                    attn,
+                    forward_batch,
+                    is_capture_mode=False,
+                    llama_4_scaling=None,
+                    consumer_available=True,
+                )
+            )
+            self.assertFalse(
+                forward_mla_rocm.should_request_packed_mxfp4_v(
+                    attn,
+                    forward_batch,
+                    is_capture_mode=True,
+                    llama_4_scaling=None,
+                    consumer_available=True,
+                )
+            )
+            self.assertTrue(
+                forward_mla_rocm.should_request_packed_mxfp4_v(
+                    attn,
+                    forward_batch,
+                    is_capture_mode=False,
+                    llama_4_scaling=None,
+                )
+            )
+
+    def test_packed_v_tuple_dispatches_a4w4_and_flattens_output(self):
+        packed = (
+            torch.empty(2, 3, 256, dtype=torch.uint8),
+            torch.empty(2, 3, 16, dtype=torch.uint8),
+        )
+        attn = SimpleNamespace(
+            w_vc=torch.empty(2, 128, 4, dtype=torch.uint8),
+            w_scale_v=torch.empty(2, 16, 4, dtype=torch.uint8),
+            o_proj=SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16)),
+        )
+        with mock.patch.object(
+            forward_mla_rocm, "batched_gemm_afp4wfp4", create=True
+        ) as a4w4:
+            result = forward_mla_rocm.rocm_absorb_v_bmm(attn, packed)
+
+        args, kwargs = a4w4.call_args
+        self.assertIs(args[0], packed[0])
+        self.assertIs(args[2], packed[1])
+        self.assertEqual(args[5].shape, (2, 3, 4))
+        self.assertEqual(kwargs["config"]["SPLITK_BLOCK_SIZE"], 512)
+        self.assertEqual(result.shape, (3, 8))
+
     def test_q_route_dispatches_transposed_tensors_to_mxfp4_helper(self):
         q_nope = torch.randn(3, 2, 8, dtype=torch.bfloat16)
         w_kc = torch.zeros(2, 4, 5, dtype=torch.uint8)

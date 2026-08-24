@@ -10,7 +10,7 @@ The BMM absorb steps stay module level to keep ROCm kernel selection localized.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple, TypeAlias
 
 import torch
 
@@ -69,6 +69,8 @@ from sglang.srt.utils import BumpAllocator
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+PackedMXFP4: TypeAlias = tuple[torch.Tensor, torch.Tensor]
+_PACKED_MXFP4_V_CONSUMER_AVAILABLE = True
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -118,10 +120,40 @@ if _use_aiter_gfx95:
     )
 
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
+        batched_gemm_afp4wfp4,
         fused_flatten_mxfp4_quant,
         fused_rms_mxfp4_quant,
     )
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
+
+
+def should_request_packed_mxfp4_v(
+    attn: DeepseekV2AttentionMLA,
+    forward_batch: ForwardBatch,
+    *,
+    is_capture_mode: bool,
+    llama_4_scaling: Optional[torch.Tensor],
+    consumer_available: bool = _PACKED_MXFP4_V_CONSUMER_AVAILABLE,
+) -> bool:
+    """Narrow gate for the sparse-attention -> prequantized A4 BMM ABI."""
+    return bool(
+        consumer_available
+        and _use_aiter_gfx95
+        and not is_capture_mode
+        and forward_batch.forward_mode.is_extend()
+        and attn.current_attention_backend in ("dsa", "nsa")
+        and get_exec().kernel.dsa_prefill_backend == "triton"
+        and attn.v_head_dim == 512
+        and attn.num_local_heads >= 16
+        and attn.w_vc.dtype == torch.uint8
+        and not attn.use_deep_gemm_bmm
+        and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+        and not is_kv_b_lora_active(attn)
+        and not dsa_use_prefill_cp(forward_batch)
+        and not mla_use_prefill_cp(forward_batch)
+        and llama_4_scaling is None
+        and not attn._skip_rope_for_dsa_tilelang_fused()
+    )
 
 
 def rocm_absorb_q_bmm(
@@ -175,9 +207,54 @@ def rocm_absorb_q_bmm(
 
 def rocm_absorb_v_bmm(
     attn: DeepseekV2AttentionMLA,
-    attn_output: torch.Tensor,
+    attn_output: torch.Tensor | PackedMXFP4,
 ) -> torch.Tensor:
     """Absorb ``attn_output @ w_vc`` (+ optional fused flatten quant) on HIP."""
+    if isinstance(attn_output, tuple):
+        packed_v, v_scales = attn_output
+        heads, tokens, packed_k = packed_v.shape
+        output = torch.empty(
+            tokens,
+            heads,
+            attn.w_vc.shape[2],
+            device=packed_v.device,
+            dtype=torch.bfloat16,
+        )
+        config = {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 64,
+            "num_warps": 8,
+            "num_stages": 1,
+            "waves_per_eu": 2,
+            "matrix_instr_nonkdim": 16,
+            "cache_modifier": None,
+            "NUM_KSPLIT": 1,
+            "SPLITK_BLOCK_SIZE": 2 * packed_k,
+        }
+        batched_gemm_afp4wfp4(
+            packed_v,
+            attn.w_vc.transpose(-2, -1),
+            v_scales,
+            attn.w_scale_v.transpose(-2, -1),
+            torch.bfloat16,
+            output.transpose(0, 1),
+            config=config,
+        )
+        if attn.o_proj.weight.dtype == torch.uint8:
+            return fused_flatten_mxfp4_quant(output)
+        if _is_block_scale_fp8(attn.o_proj):
+            quantized = fused_flatten_fp8_group_quant(
+                output,
+                group_size=128,
+                dtype_quant=torch.float8_e4m3fn,
+                transpose_scale=False,
+            )
+            if _use_aiter_bpreshuffle_gfx95:
+                quantized = materialize_bpreshuffle_fp8_scale_tuple(quantized)
+            return quantized
+        return output.flatten(1, 2)
     # TODO(haishaw): add bmm_fp8 to ROCm
     if _use_aiter_gfx95 and attn.w_vc.dtype == torch.uint8:
         x = attn_output.transpose(0, 1)
@@ -678,6 +755,15 @@ class DeepseekMLARocmForwardMixin:
                         "is_neox": self.rotary_emb.is_neox_style,
                         "llama_4_scaling": llama_4_scaling,
                     }
+                from sglang.srt.model_executor.runner import get_is_capture_mode
+
+                if should_request_packed_mxfp4_v(
+                    self,
+                    forward_batch,
+                    is_capture_mode=get_is_capture_mode(),
+                    llama_4_scaling=llama_4_scaling,
+                ):
+                    extra_args["return_mxfp4_v"] = True
                 if is_dcp_mla_decode_phase(forward_batch):
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
@@ -774,7 +860,8 @@ class DeepseekMLARocmForwardMixin:
                         is_lse_base_on_e=is_lse_base_on_e,
                     )
                     attn_output = attn_output.transpose(0, 1)
-        attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+        if not isinstance(attn_output, tuple):
+            attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         _kvb_v = None
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
