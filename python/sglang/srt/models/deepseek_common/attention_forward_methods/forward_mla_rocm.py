@@ -151,7 +151,6 @@ def should_request_packed_mxfp4_v(
         and not is_kv_b_lora_active(attn)
         and not dsa_use_prefill_cp(forward_batch)
         and not mla_use_prefill_cp(forward_batch)
-        and llama_4_scaling is None
         and not attn._skip_rope_for_dsa_tilelang_fused()
     )
 
