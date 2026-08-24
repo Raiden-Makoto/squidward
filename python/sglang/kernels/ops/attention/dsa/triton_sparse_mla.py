@@ -1098,6 +1098,7 @@ def triton_sparse_mla_fwd(
     """
     seq = q_nope.shape[0]
     H = q_nope.shape[1]
+    return_mxfp4 = d_v == 512 and H >= 16
     if return_mxfp4 and (d_v != 512 or H < 16):
         return_mxfp4 = False
     num_cu = _cu_count()
