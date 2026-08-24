@@ -1071,16 +1071,10 @@ class DeepseekMLAForwardMixin:
                     and fusion_plan is None
                     and not get_is_capture_mode()
                     and forward_batch.forward_mode.is_extend()
-                    and get_exec().kernel.dsa_prefill_backend == "triton"
+                    and get_attn_backend().dsa_prefill_impl == "triton"
                     and self.v_head_dim == 512
                     and self.num_local_heads >= 16
                     and self.w_vc.dtype == torch.uint8
-                    and not self.use_deep_gemm_bmm
-                    and not _SGLANG_EXPERIMENTAL_LORA_OPTI
-                    and not is_kv_b_lora_active(self)
-                    and not dsa_use_prefill_cp(forward_batch)
-                    and not mla_use_prefill_cp(forward_batch)
-                    and not self._skip_rope_for_dsa_tilelang_fused()
                 ):
                     extra_args["return_mxfp4_v"] = True
                 if fusion_plan is not None:
