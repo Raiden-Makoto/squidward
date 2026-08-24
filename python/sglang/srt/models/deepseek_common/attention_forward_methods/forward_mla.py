@@ -167,6 +167,7 @@ if _use_aiter_gfx95:
     )
 
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
+        batched_gemm_afp4wfp4,
         batched_gemm_afp4wfp4_pre_quant,
         fused_flatten_mxfp4_quant,
         fused_rms_mxfp4_quant,
@@ -1062,6 +1063,27 @@ class DeepseekMLAForwardMixin:
                         "is_neox": self.rotary_emb.is_neox_style,
                         "llama_4_scaling": llama_4_scaling,
                     }
+                from sglang.srt.model_executor.runner import get_is_capture_mode
+
+                if (
+                    _is_hip
+                    and _use_aiter_gfx95
+                    and fusion_plan is None
+                    and not get_is_capture_mode()
+                    and forward_batch.forward_mode.is_extend()
+                    and self.current_attention_backend in ("dsa", "nsa")
+                    and get_exec().kernel.dsa_prefill_backend == "triton"
+                    and self.v_head_dim == 512
+                    and self.num_local_heads >= 16
+                    and self.w_vc.dtype == torch.uint8
+                    and not self.use_deep_gemm_bmm
+                    and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+                    and not is_kv_b_lora_active(self)
+                    and not dsa_use_prefill_cp(forward_batch)
+                    and not mla_use_prefill_cp(forward_batch)
+                    and not self._skip_rope_for_dsa_tilelang_fused()
+                ):
+                    extra_args["return_mxfp4_v"] = True
                 if fusion_plan is not None:
                     bmm_attention_fn = (
                         bcg_mla_bmm_then_unified_attention
@@ -1191,7 +1213,8 @@ class DeepseekMLAForwardMixin:
                         is_lse_base_on_e=is_lse_base_on_e,
                     )
                     attn_output = attn_output.transpose(0, 1)
-        attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+        if not isinstance(attn_output, tuple):
+            attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         _kvb_v = None
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
@@ -1227,7 +1250,40 @@ class DeepseekMLAForwardMixin:
             )
         elif _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
-            if _use_aiter_gfx95 and self.w_vc.dtype == torch.uint8:
+            if isinstance(attn_output, tuple):
+                packed_v, v_scales = attn_output
+                heads, tokens, packed_k = packed_v.shape
+                _bmm_buf = torch.empty(
+                    tokens,
+                    heads,
+                    self.w_vc.shape[2],
+                    device=packed_v.device,
+                    dtype=torch.bfloat16,
+                )
+                config = {
+                    "BLOCK_SIZE_M": 128,
+                    "BLOCK_SIZE_N": 256,
+                    "BLOCK_SIZE_K": 128,
+                    "GROUP_SIZE_M": 64,
+                    "num_warps": 8,
+                    "num_stages": 1,
+                    "waves_per_eu": 2,
+                    "matrix_instr_nonkdim": 16,
+                    "cache_modifier": None,
+                    "NUM_KSPLIT": 1,
+                    "SPLITK_BLOCK_SIZE": 2 * packed_k,
+                }
+                batched_gemm_afp4wfp4(
+                    packed_v,
+                    self.w_vc.transpose(-2, -1),
+                    v_scales,
+                    self.w_scale_v.transpose(-2, -1),
+                    torch.bfloat16,
+                    _bmm_buf.transpose(0, 1),
+                    config=config,
+                )
+                attn_bmm_output = _bmm_buf
+            elif _use_aiter_gfx95 and self.w_vc.dtype == torch.uint8:
                 x = attn_output.transpose(0, 1)
                 _bmm_buf = torch.empty(
                     x.shape[1],
