@@ -70,7 +70,12 @@ from sglang.srt.utils import BumpAllocator
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 PackedMXFP4: TypeAlias = tuple[torch.Tensor, torch.Tensor]
-_PACKED_MXFP4_V_CONSUMER_AVAILABLE = True
+# The packed producer/A4 BMM experiment regresses the end-to-end path because
+# materializing the global packed tensor makes sparse MLA substantially slower.
+# Keep its ABI for explicit kernel tests, but do not select it in production.
+# A direct tl.dot_scaled fusion is blocked because the sparse kernel's 16 rows
+# use 16 distinct per-head w_vc matrices while tl.dot_scaled is strictly 2-D.
+_PACKED_MXFP4_V_CONSUMER_AVAILABLE = False
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA

@@ -255,7 +255,7 @@ class TestRocmMxfp4AbsorbedBmmRoute(CustomTestCase):
                     consumer_available=True,
                 )
             )
-            self.assertTrue(
+            self.assertFalse(
                 forward_mla_rocm.should_request_packed_mxfp4_v(
                     attn,
                     forward_batch,

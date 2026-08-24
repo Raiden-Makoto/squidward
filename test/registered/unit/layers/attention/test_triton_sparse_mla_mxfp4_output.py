@@ -43,6 +43,31 @@ def test_packed_output_abi_is_head_major_contiguous():
     assert formatted[1] is scales
 
 
+def test_direct_v_up_compile_probe_uses_production_chunk_geometry():
+    normalized = torch.empty(2, 16, 128, dtype=torch.float32)
+    weight = torch.empty(16, 64, 256, dtype=torch.uint8)
+    weight_scale = torch.empty(16, 4, 256, dtype=torch.uint8)
+    kernel = _FakeKernel()
+    with mock.patch.object(
+        triton_sparse_mla, "_direct_v_up_dot_scaled_compile_probe_kernel", kernel
+    ):
+        output = triton_sparse_mla.direct_v_up_dot_scaled_compile_probe(
+            normalized, weight, weight_scale
+        )
+
+    grid, launch_args, launch_kwargs = kernel.calls[0]
+    assert grid == (2, 16, 16)
+    assert launch_args[0] is normalized
+    assert launch_args[1] is weight
+    assert launch_args[2] is weight_scale
+    assert launch_args[3] is output
+    assert launch_kwargs["H"] == 16
+    assert launch_kwargs["N"] == 256
+    assert launch_kwargs["BLOCK_N"] == 16
+    assert output.shape == (2, 16, 256)
+    assert output.dtype == torch.bfloat16
+
+
 def test_long_single_pass_requests_direct_packed_store():
     args = _inputs()
     kernel = _FakeKernel()
@@ -113,6 +138,23 @@ def test_public_gate_preserves_bf16_fallback_for_unsupported_geometry():
         result = triton_sparse_mla.triton_sparse_mla_fwd(
             *args, sm_scale=0.125, return_mxfp4=True
         )
+
+    assert result is sentinel
+    assert single.call_args.args[-1] is False
+
+
+def test_public_default_preserves_bf16_fallback_for_supported_geometry():
+    args = _inputs(heads=16)
+    sentinel = torch.empty(1, 3, 16, 512, dtype=torch.bfloat16)
+    with (
+        mock.patch.object(triton_sparse_mla, "_cu_count", return_value=1),
+        mock.patch.object(
+            triton_sparse_mla,
+            "_triton_sparse_mla_fwd_single",
+            return_value=sentinel,
+        ) as single,
+    ):
+        result = triton_sparse_mla.triton_sparse_mla_fwd(*args, sm_scale=0.125)
 
     assert result is sentinel
     assert single.call_args.args[-1] is False

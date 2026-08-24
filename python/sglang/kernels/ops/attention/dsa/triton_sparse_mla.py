@@ -80,6 +80,124 @@ def _quantize_mxfp4_chunk(x):
 
 
 @triton.jit
+def _direct_v_up_dot_scaled_compile_probe_kernel(
+    normalized_ptr,
+    w_ptr,
+    w_scale_ptr,
+    output_ptr,
+    T,
+    STRIDE_W_H: tl.constexpr,
+    STRIDE_W_K: tl.constexpr,
+    STRIDE_W_N: tl.constexpr,
+    STRIDE_WS_H: tl.constexpr,
+    STRIDE_WS_K: tl.constexpr,
+    STRIDE_WS_N: tl.constexpr,
+    H: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Compile probe for one 128-wide direct MXFP4 V-up chunk.
+
+    This deliberately is not dispatched by ``triton_sparse_mla_fwd``. Triton's
+    scaled dot is 2-D, but V-up is batched by head: row h of the sparse-MLA
+    accumulator must use w_vc[h]. This probe demonstrates the smallest native
+    operation available: one CTA selects one head, pads that row to the 16-row
+    MFMA shape, and discards the other 15 result rows. Doing this in the live
+    H=16 kernel would issue 16 A4W4 dots per output tile and waste 15/16 of the
+    matrix work. A block-diagonal RHS avoids multiple calls but creates a
+    16x-wide accumulator and is not register-safe beside acc0..acc3.
+
+    ``normalized_ptr`` is an isolated [T,H,128] probe input, not a proposed
+    intermediate for the production path.
+    """
+    token = tl.program_id(0)
+    selected_head = tl.program_id(1)
+    n = tl.program_id(2) * BLOCK_N + tl.arange(0, BLOCK_N)
+    rows = tl.arange(0, H)
+    k = tl.arange(0, 128)
+    packed_k = tl.arange(0, 64)
+    scale_k = tl.arange(0, 4)
+
+    values = tl.load(
+        normalized_ptr + token * H * 128 + rows[:, None] * 128 + k[None, :]
+    ).to(tl.float32)
+    values = tl.where(rows[:, None] == selected_head, values, 0.0)
+    packed, scales = _quantize_mxfp4_chunk(values)
+
+    weights = tl.load(
+        w_ptr
+        + selected_head * STRIDE_W_H
+        + packed_k[:, None] * STRIDE_W_K
+        + n[None, :] * STRIDE_W_N,
+        mask=n[None, :] < N,
+        other=0,
+    )
+    weight_scales = tl.load(
+        w_scale_ptr
+        + selected_head * STRIDE_WS_H
+        + n[:, None] * STRIDE_WS_N
+        + scale_k[None, :] * STRIDE_WS_K,
+        mask=n[:, None] < N,
+        other=0,
+    )
+    projected = tl.dot_scaled(
+        packed,
+        scales,
+        "e2m1",
+        weights,
+        weight_scales,
+        "e2m1",
+    )
+    tl.store(
+        output_ptr + token * H * N + rows[:, None] * N + n[None, :],
+        projected.to(output_ptr.dtype.element_ty),
+        mask=(rows[:, None] == selected_head) & (n[None, :] < N),
+    )
+
+
+def direct_v_up_dot_scaled_compile_probe(
+    normalized: torch.Tensor,
+    w_vc: torch.Tensor,
+    w_scale_v: torch.Tensor,
+) -> torch.Tensor:
+    """Launch the isolated direct-V-up representability probe.
+
+    Shapes are the production GLM geometry for one K chunk:
+    normalized [T,16,128], w_vc [16,64,256], scales [16,4,256].
+    """
+    assert normalized.ndim == 3 and normalized.shape[1:] == (16, 128)
+    assert w_vc.shape == (16, 64, 256) and w_vc.dtype == torch.uint8
+    assert w_scale_v.shape == (16, 4, 256) and w_scale_v.dtype == torch.uint8
+    output = torch.empty(
+        normalized.shape[0],
+        16,
+        256,
+        dtype=torch.bfloat16,
+        device=normalized.device,
+    )
+    _direct_v_up_dot_scaled_compile_probe_kernel[
+        (normalized.shape[0], 16, triton.cdiv(256, 16))
+    ](
+        normalized,
+        w_vc,
+        w_scale_v,
+        output,
+        normalized.shape[0],
+        STRIDE_W_H=w_vc.stride(0),
+        STRIDE_W_K=w_vc.stride(1),
+        STRIDE_W_N=w_vc.stride(2),
+        STRIDE_WS_H=w_scale_v.stride(0),
+        STRIDE_WS_K=w_scale_v.stride(1),
+        STRIDE_WS_N=w_scale_v.stride(2),
+        H=16,
+        N=256,
+        BLOCK_N=16,
+        num_warps=4,
+    )
+    return output
+
+
+@triton.jit
 def _store_mxfp4_group(
     values_ptr,
     scales_ptr,
@@ -1107,7 +1225,6 @@ def triton_sparse_mla_fwd(
     """
     seq = q_nope.shape[0]
     H = q_nope.shape[1]
-    return_mxfp4 = d_v == 512 and H >= 16
     if return_mxfp4 and (d_v != 512 or H < 16):
         return_mxfp4 = False
     num_cu = _cu_count()
