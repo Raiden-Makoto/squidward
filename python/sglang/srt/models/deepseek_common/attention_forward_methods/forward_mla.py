@@ -1063,19 +1063,7 @@ class DeepseekMLAForwardMixin:
                         "is_neox": self.rotary_emb.is_neox_style,
                         "llama_4_scaling": llama_4_scaling,
                     }
-                from sglang.srt.model_executor.runner import get_is_capture_mode
-
-                if (
-                    _is_hip
-                    and _use_aiter_gfx95
-                    and fusion_plan is None
-                    and not get_is_capture_mode()
-                    and forward_batch.forward_mode.is_extend()
-                    and get_attn_backend().dsa_prefill_impl == "triton"
-                    and self.v_head_dim == 512
-                    and self.num_local_heads >= 16
-                    and self.w_vc.dtype == torch.uint8
-                ):
+                if _is_hip and forward_batch.forward_mode.is_extend():
                     extra_args["return_mxfp4_v"] = True
                 if fusion_plan is not None:
                     bmm_attention_fn = (
