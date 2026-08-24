@@ -89,12 +89,12 @@ def _store_mxfp4_group(
     """Quantize one normalized FP32 group of 32 values and store head-major."""
     group_values = values[
         :,
-        group_in_chunk * _MXFP4_GROUP_SIZE : (group_in_chunk + 1) * _MXFP4_GROUP_SIZE,
+        group_in_chunk * 32 : (group_in_chunk + 1) * 32,
     ]
     packed, scale_e8m0 = _quantize_mxfp4_group(group_values)
-    pair = tl.arange(0, _MXFP4_GROUP_SIZE // _MXFP4_VALUES_PER_BYTE)
+    pair = tl.arange(0, 16)
 
-    value_group = output_group * (_MXFP4_GROUP_SIZE // _MXFP4_VALUES_PER_BYTE)
+    value_group = output_group * 16
     value_base = heads[:, None] * T * 256 + token * 256 + value_group
     scale_base = heads * T * 16 + token * 16 + output_group
     tl.store(values_ptr + value_base + pair[None, :], packed, mask=head_mask[:, None])
