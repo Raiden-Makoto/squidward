@@ -1071,7 +1071,6 @@ class DeepseekMLAForwardMixin:
                     and fusion_plan is None
                     and not get_is_capture_mode()
                     and forward_batch.forward_mode.is_extend()
-                    and self.current_attention_backend in ("dsa", "nsa")
                     and get_exec().kernel.dsa_prefill_backend == "triton"
                     and self.v_head_dim == 512
                     and self.num_local_heads >= 16

@@ -141,7 +141,6 @@ def should_request_packed_mxfp4_v(
         and _use_aiter_gfx95
         and not is_capture_mode
         and forward_batch.forward_mode.is_extend()
-        and attn.current_attention_backend in ("dsa", "nsa")
         and get_exec().kernel.dsa_prefill_backend == "triton"
         and attn.v_head_dim == 512
         and attn.num_local_heads >= 16
