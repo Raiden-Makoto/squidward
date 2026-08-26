@@ -200,6 +200,14 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
+def _unwrap_aiter_bf16_side_output(
+    x: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+) -> torch.Tensor:
+    if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
+        return x[2]
+    return x
+
+
 class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
     _MQA_LOGITS_BYTES_PER_ELEM = 4
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
@@ -352,8 +360,7 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
         # aiter (ROCm gfx95): extract the passthrough bf16 tensor from the
         # 3-tuple (fp8, scale, bf16) produced by fused_rms_fp8_group_quant,
         # avoiding an expensive FP8-to-bf16 dequantization.
-        if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
-            x = x[2]
+        x = _unwrap_aiter_bf16_side_output(x)
         if _is_cuda:
             return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
 
@@ -608,6 +615,7 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
         positions: torch.Tensor,
     ):
         # Non-fusion path only; self.wk does not exist when fusion is on.
+        x = _unwrap_aiter_bf16_side_output(x)
         key, _ = self.wk(x)
         key = self.k_norm(key)
         k_rope, _ = torch.split(

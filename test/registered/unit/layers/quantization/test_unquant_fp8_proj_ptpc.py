@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from sglang.srt.distributed import parallel_state
 from sglang.srt.environ import envs
 from sglang.srt.layers import communicator
+from sglang.srt.layers.attention.dsa import dsa_indexer
 from sglang.srt.layers.quantization import fp8_utils, unquant
 from sglang.srt.models import deepseek_v2
 from sglang.test.test_utils import CustomTestCase
@@ -244,6 +245,20 @@ class TestUnquantFp8ProjPtpc(CustomTestCase):
         self.assertIs(args.args[2], weight)
         self.assertEqual(args.args[3], 1e-6)
         self.assertTrue(args.kwargs["emit_bf16"])
+
+    def test_dsa_indexer_uses_bf16_side_output(self):
+        fp8_input = torch.empty(3, 8, dtype=torch.float8_e4m3fn)
+        input_scale = torch.empty(3, 1, dtype=torch.float32)
+        bf16_input = torch.empty(3, 8, dtype=torch.bfloat16)
+
+        with patch.object(dsa_indexer, "_use_aiter", True), patch.object(
+            dsa_indexer, "_is_gfx95_supported", True
+        ):
+            actual = dsa_indexer._unwrap_aiter_bf16_side_output(
+                (fp8_input, input_scale, bf16_input)
+            )
+
+        self.assertIs(actual, bf16_input)
 
     def test_qkv_a_consumes_prequantized_norm_output(self):
         fp8_input = torch.empty(3, 8, dtype=torch.float8_e4m3fn)
