@@ -4,6 +4,7 @@ ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e
 
 ## Attention
 
+
 | Component              | MI355X kernel                      | MI355X ms | GB300 kernel                         | GB300 ms  | GB300/MI355X |
 | ---------------------- | ---------------------------------- | --------- | ------------------------------------ | --------- | ------------ |
 | Sparse MLA             | Triton sparse MLA                  | 232.3     | `fmhaSm100f` sparse FMHA             | 204.0     | 0.88x        |
@@ -14,7 +15,11 @@ ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e
 | DSA prep/store + misc  | norm/rope/quant/cache + misc       | 12.4      | fused indexer prep/store + misc      | 4.8       | 0.39x        |
 | **Attention subtotal** |                                    | **281.3** |                                      | **237.5** | **0.84x**    |
 
+
+
+
 ## MoE
+
 
 | Component        | MI355X kernel                                  | MI355X ms | GB300 kernel                      | GB300 ms  | GB300/MI355X |
 | ---------------- | ---------------------------------------------- | --------- | --------------------------------- | --------- | ------------ |
@@ -25,7 +30,11 @@ ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e
 | Routing / sort   | `mxfp4_moe_sort` + `p0/p1/p23` + grouped top-k | 7.9       | routing + shared-expert MLP + add | 31.3      | 3.96x        |
 | **MoE subtotal** |                                                | **139.3** |                                   | **152.7** | **1.10x**    |
 
+
+
+
 ## Dense GEMM
+
 
 | Component              | MI355X kernel                    | MI355X ms | GB300 kernel           | GB300 ms | GB300/MI355X |
 | ---------------------- | -------------------------------- | --------- | ---------------------- | -------- | ------------ |
@@ -40,7 +49,11 @@ ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e
 | DenseMLP L0–2          | DenseMLP L0–2                    | 4.4       | `nvjet_sm103`          | 3.1      | 0.70x        |
 | **Dense subtotal**     |                                  | **148.6** |                        | **96.0** | **0.65x**    |
 
+
+
+
 ## Communication and normalization
+
 
 | Component  | MI355X kernel                                   | MI355X ms | GB300 kernel        | GB300 ms  | GB300/MI355X |
 | ---------- | ----------------------------------------------- | --------- | ------------------- | --------- | ------------ |
@@ -49,7 +62,11 @@ ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e
 | Other      | activation + output head + embedding + sampling | 0.2       | same                | 0.5       | 2.50x        |
 | **TOTAL**  |                                                 | **748.0** |                     | **633.8** | **0.85x**    |
 
+
+
+
 ## Lever ranking — excluding all-reduce and parity/faster rows
+
 
 | Rank | Lever                | MI355X ms | GB300 ms | Excess ms | % of MI total | Work class        |
 | ---- | -------------------- | --------- | -------- | --------- | ------------- | ----------------- |
@@ -65,3 +82,5 @@ ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e
 | 10   | o_proj PTPC path     | 39.3      | 35.5     | 3.8       | 0.5%          | Near-parity       |
 | 11   | Router GEMMs         | 7.4       | 3.8      | 3.6       | 0.5%          | Kernel work       |
 | 12   | DenseMLP L0–2        | 4.4       | 3.1      | 1.3       | 0.2%          | Near-parity       |
+
+
