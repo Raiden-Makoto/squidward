@@ -506,6 +506,7 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
         enable_dual_stream: bool,
         forward_batch: ForwardBatch,
     ):
+        x = _unwrap_aiter_bf16_side_output(x)
         weights_raw = None
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
