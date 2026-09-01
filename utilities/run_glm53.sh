@@ -4,6 +4,7 @@
 export PYTHONPATH=/sgl-workspace/squidward/python:${PYTHONPATH}
 MODEL=${MODEL_PATH:-/data2/hf_home/hub/GLM-5.3-Quark-MXFP4-AttnFP8}
 PORT=${PORT:-8553}
+TP=${TP:-4}
 
 export SAFETENSORS_FAST_GPU=1
 export SGLANG_USE_AITER=${SGLANG_USE_AITER:-1}
@@ -17,7 +18,7 @@ export SGLANG_USE_MXFP4_MLA_BMM=${SGLANG_USE_MXFP4_MLA_BMM:-0}
 export SGLANG_DSA_FUSE_HADAMARD_QUANT=${SGLANG_DSA_FUSE_HADAMARD_QUANT:-0}
 export SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD=${SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD:-0}
 
-export HIP_VISIBLE_DEVICES=4,5,6,7
+export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-4,5,6,7}
 export AITER_USE_FLYDSL_MOE_SORTING=1  # match ATOM + the FlyDSL gemm1 kernels stock aiter tunes to
 
 PROFILE_ARGS=""
@@ -51,7 +52,7 @@ exec sglang serve \
   ${PROFILE_ARGS} \
   ${EXTRA_ARGS} \
   ${ALLREDUCE_FUSION} \
-  --tp 4 \
+  --tp "${TP}" \
   --host localhost \
   --port "${PORT}" \
   --trust-remote-code \
