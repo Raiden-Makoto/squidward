@@ -1,10 +1,13 @@
-# GLM-5.3 MXFP4 — i8k/o1k REPS=3
+# GLM-5.3 MXFP4 — REPS=3
 
-Branch: `RM/glm51` (`4c6b53d54d`)  
+Branch: `RM/glm51` (`4c6b53d54d` i8k/o1k; `a8fff099b7` i1k/o1k)
 Image: `rocm/sgl-dev:v0.5.18-rocm720-mi35x-20260830`  
 Model: `/data2/hf_home/hub/GLM-5.3-Quark-MXFP4-AttnFP8`  
 Server: `bash utilities/run_glm53.sh --triton`  
-Benchmark: `REPS=3 PORT=8553 bash utilities/e2e_glm5.sh 8192 1024 0`
+
+## i8k/o1k
+
+`REPS=3 PORT=8553 bash utilities/e2e_glm5.sh 8192 1024 0`
 
 | concurrency | TTFT (ms) | ITL (ms) | interactivity (tok/s/user) | E2EL (ms) | output tok/s |
 |---:|---:|---:|---:|---:|---:|
@@ -13,3 +16,15 @@ Benchmark: `REPS=3 PORT=8553 bash utilities/e2e_glm5.sh 8192 1024 0`
 | 16 | 292.1 | 16.30 | 61.3 | 17871 | 921.3 |
 | 32 | 340.4 | 21.40 | 46.7 | 24068 | 1376.2 |
 | 64 | 509.5 | 25.79 | 38.8 | 30437 | 2206.5 |
+
+## i1k/o1k
+
+`REPS=3 PORT=8553 bash utilities/e2e_glm5.sh 1024 1024 0`
+
+| concurrency | TTFT (ms) | ITL (ms) | interactivity (tok/s/user) | E2EL (ms) | output tok/s |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 178.5 | 10.62 | 94.2 | 11066 | 369.4 |
+| 8 | 234.8 | 12.85 | 77.8 | 13400 | 608.2 |
+| 16 | 239.1 | 15.15 | 66.0 | 15878 | 1032.6 |
+| 32 | 247.3 | 20.33 | 49.2 | 21304 | 1534.8 |
+| 64 | 370.6 | 24.72 | 40.5 | 26042 | 2513.5 |
