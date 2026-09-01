@@ -11,11 +11,11 @@ export SGLANG_USE_AITER=${SGLANG_USE_AITER:-1}
 export SGLANG_ROCM_FUSED_DECODE_MLA=0
 export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4  # ATOM only
-# GLM-5.2 optimization paths are present for controlled bring-up but default off
-# until each path is validated against the GLM-5.3 checkpoint.
+# GLM-5.2 optimization paths are retained for controlled GLM-5.3 bring-up.
+# Hadamard fusion is validated; PTPC projection and MXFP4 MLA BMM remain off.
 export SGLANG_DSA_FP8_PROJ_GEMM=${SGLANG_DSA_FP8_PROJ_GEMM:-0}
 export SGLANG_USE_MXFP4_MLA_BMM=${SGLANG_USE_MXFP4_MLA_BMM:-0}
-export SGLANG_DSA_FUSE_HADAMARD_QUANT=${SGLANG_DSA_FUSE_HADAMARD_QUANT:-0}
+export SGLANG_DSA_FUSE_HADAMARD_QUANT=${SGLANG_DSA_FUSE_HADAMARD_QUANT:-1}
 export SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD=${SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD:-0}
 
 export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-4,5,6,7}
