@@ -110,6 +110,26 @@ if _is_cuda:
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
 
+if _is_hip:
+    import importlib.util
+
+    _aiter_hip_mqa_spec = importlib.util.spec_from_file_location(
+        "aiter.jit.module_fp8_mqa_logits",
+        "/sgl-workspace/aiter-mqa-5046/aiter/jit/module_fp8_mqa_logits.so",
+    )
+    if _aiter_hip_mqa_spec is None or _aiter_hip_mqa_spec.loader is None:
+        raise ImportError("ROCm/aiter#5046 A/B extension is unavailable")
+    _aiter_hip_mqa_module = importlib.util.module_from_spec(_aiter_hip_mqa_spec)
+    _aiter_hip_mqa_spec.loader.exec_module(_aiter_hip_mqa_module)
+    aiter_hip_fp8_mqa_logits = _aiter_hip_mqa_module.fp8_mqa_logits
+
+    def aiter_hip_mqa_supported(num_heads, head_dim):
+        return num_heads == 32 and head_dim == 128
+
+else:
+    aiter_hip_fp8_mqa_logits = None
+    aiter_hip_mqa_supported = None
+
 from sglang.srt.distributed import (
     get_attn_tp_group,
 )
@@ -200,6 +220,42 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
         hidden_size & (hidden_size - 1)
     ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
     return hadamard_transform(x, scale=hidden_size**-0.5)
+
+
+def _aiter_fp8_mqa_logits_for_hip_kernel_ab(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    kv_scales: torch.Tensor,
+    weights: torch.Tensor,
+    cu_starts: torch.Tensor,
+    cu_ends: torch.Tensor,
+    fallback,
+) -> torch.Tensor:
+    """Route supported shapes to ROCm/aiter#5046 for production A/B testing."""
+    if (
+        aiter_hip_fp8_mqa_logits is None
+        or aiter_hip_mqa_supported is None
+        or not aiter_hip_mqa_supported(q.shape[1], q.shape[2])
+    ):
+        return fallback(
+            q,
+            kv,
+            kv_scales,
+            weights,
+            cu_starts,
+            cu_ends,
+            clean_logits=False,
+        )
+
+    return aiter_hip_fp8_mqa_logits(
+        q,
+        kv,
+        kv_scales,
+        weights,
+        cu_starts,
+        cu_ends,
+        clean_logits=False,
+    )
 
 
 class Indexer(DSANPUIndexerMixin, BaseFusedOp):
@@ -1160,14 +1216,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     # transform masks invalid positions via ks/ke/lengths, so the
                     # -inf pre-fill of the [tokens x seq_len_kv] logits buffer is
                     # redundant and grows quadratically with context length.
-                    logits = fp8_mqa_logits(
+                    logits = _aiter_fp8_mqa_logits_for_hip_kernel_ab(
                         q_fp8[:q_offset],
                         kv,
                         scale,
                         weights[:q_offset],
                         ks,
                         ke,
-                        clean_logits=False,
+                        fp8_mqa_logits,
                     )
                 else:
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
@@ -1218,14 +1274,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
                     kv, scale = kv_fp8
                     # clean_logits=False: topk transform handles masking (see above)
-                    logits_chunk = fp8_mqa_logits(
+                    logits_chunk = _aiter_fp8_mqa_logits_for_hip_kernel_ab(
                         q_fp8[start:end],
                         kv,
                         scale,
                         weights[start:end],
                         ks[start:end],
                         ke[start:end],
-                        clean_logits=False,
+                        fp8_mqa_logits,
                     )
                 else:
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
