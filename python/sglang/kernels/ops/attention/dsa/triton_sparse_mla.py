@@ -374,7 +374,7 @@ def _sparse_mla_fwd_split_dim_kernel(
         q3 = tl.load(q_row + (3 * _G + g)[None, :]).to(q_nope_ptr.dtype.element_ty)
     q_tail = tl.load(
         q_rope_ptr + s_i * STRIDE_QR_T + h[:, None] * STRIDE_QR_H + dt[None, :]
-    ).to(q_nope_ptr.dtype.element_ty)
+    ).to(q_nope_ptr.dtype.element_ty)  # [H, D_TAIL]
 
     neg_large = -3.4028234663852886e38
     m_i = tl.full([H], neg_large, tl.float32)
@@ -413,7 +413,7 @@ def _sparse_mla_fwd_split_dim_kernel(
             ).to(q_nope_ptr.dtype.element_ty)
         kv_tail = tl.load(
             kbase + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
-        ).to(q_nope_ptr.dtype.element_ty)
+        ).to(q_nope_ptr.dtype.element_ty)  # [BLOCK_N, D_TAIL]
 
         qk = tl.dot(q0, tl.trans(kv0))
         if NUM_GROUPS >= 2:
