@@ -12,9 +12,9 @@ TP=${TP:-4}
 export SAFETENSORS_FAST_GPU=1
 export SGLANG_USE_AITER=${SGLANG_USE_AITER:-1}
 export SGLANG_ROCM_FUSED_DECODE_MLA=0
-export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
-export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-export AITER_USE_FLYDSL_MOE_SORTING=1
+export ROCM_QUICK_REDUCE_QUANTIZATION=${ROCM_QUICK_REDUCE_QUANTIZATION:-INT4}
+export AITER_QUICK_REDUCE_QUANTIZATION=${AITER_QUICK_REDUCE_QUANTIZATION:-INT4}
+export AITER_USE_FLYDSL_MOE_SORTING=${AITER_USE_FLYDSL_MOE_SORTING:-1}
 export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-4,5,6,7}
 
 PROFILE_ARGS=()
@@ -52,7 +52,6 @@ exec python3 -m sglang.launch_server \
   --dsa-prefill-backend tilelang \
   --dsa-decode-backend tilelang \
   --moe-runner-backend aiter \
-  --enable-aiter-allreduce-fusion \
   --reasoning-parser glm45 \
   --tool-call-parser glm47 \
   --host 0.0.0.0 \
