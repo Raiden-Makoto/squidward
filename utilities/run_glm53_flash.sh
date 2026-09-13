@@ -45,13 +45,21 @@ exec python3 -m sglang.launch_server \
   --model-path "${MODEL}" \
   --tp "${TP}" \
   --trust-remote-code \
+  --attention-backend dsa \
   --kv-cache-dtype bfloat16 \
-  --context-length 131072 \
+  --context-length 65536 \
   --mem-fraction-static 0.85 \
   --disable-radix-cache \
   --dsa-prefill-backend tilelang \
   --dsa-decode-backend tilelang \
+  --linear-attn-backend triton \
   --moe-runner-backend aiter \
+  --disable-shared-experts-fusion \
+  --max-running-requests 64 \
+  --cuda-graph-backend-decode full \
+  --cuda-graph-max-bs-decode 64 \
+  --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":8}' \
+  --watchdog-timeout 1200 \
   --reasoning-parser glm45 \
   --tool-call-parser glm47 \
   --host 0.0.0.0 \
