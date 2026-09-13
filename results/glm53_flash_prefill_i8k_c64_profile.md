@@ -71,7 +71,7 @@ The stage profiler emitted separate EXTEND and DECODE traces. The EXTEND trace c
 
 | Component | MI355X kernel/path | MI355X ms | % of total |
 | --- | --- | ---: | ---: |
-| All-reduce | QuickReduce INT4 plus AITER cross-device reduction | 74.7 | 17.8% |
+| All-reduce | QuickReduce INT8 plus AITER cross-device reduction | 74.7 | 17.8% |
 | mHC pre/post | AITER mHC pre GEMM/square-sum, fused RMSNorm and post | 37.6 | 9.0% |
 | Output head, embedding, sampling and other | mixed | 3.7 | 0.9% |
 | **CORRECTED TOTAL** |  | **418.7** | **100.0%** |
@@ -81,7 +81,7 @@ The stage profiler emitted separate EXTEND and DECODE traces. The EXTEND trace c
 | Rank | Lever | MI355X ms | % of total | Work class | Evidence |
 | ---: | --- | ---: | ---: | --- | --- |
 | 1 | Routed-expert FP8 MoE | 97.2 | 23.2% | Kernel work | AITER fused MoE main kernel |
-| 2 | All-reduce | 74.7 | 17.8% | Communication | QuickReduce plus AITER cross-device reduction |
+| 2 | All-reduce | 74.7 | 17.8% | Communication | QuickReduce INT8 plus AITER cross-device reduction |
 | 3 | TileLang sparse attention | 67.0 | 16.0% | Kernel work | 88 TileLang sparse-attention launches |
 | 4 | Dense / unquantized GEMM family | 54.1 | 12.9% | Kernel work | CK GEMMs attributed mainly to unquantized linears |
 | 5 | mHC pre/post/norm | 36.9 | 8.8% | Kernel work | 360 launches each across pre/post paths |
@@ -90,13 +90,38 @@ The stage profiler emitted separate EXTEND and DECODE traces. The EXTEND trace c
 | 8 | QK/RoPE/KV write family | 11.1 | 2.7% | Fusion candidate | Profiler catalog finds an existing matching fused path |
 | 9 | K-pool plan CPU→GPU handoff | <0.1 | <0.1% | Metadata / transfer | Four apparent long copies are correlation errors |
 
+## AllReduce validation
+
+The profiled server did not use the intended AllReduce configuration. The container environment set `ROCM_QUICK_REDUCE_QUANTIZATION=INT8`, and the effective `enable_aiter_allreduce_fusion` server argument was false. The startup message claiming AITER fusion was enabled is stale: the assignment beside that log statement is commented out.
+
+The graphs-on INT8 trace contains 273 QuickReduce Q8 launches totaling 61.8 ms/forward. Its 91 AITER cross-device reductions contain one impossible 83.5 ms event followed by layernorm on the same stream 4.8 µs later; correcting that event to the normal 0.60 ms launch gives 14.1 ms/forward. The corrected INT8 AllReduce subtotal is therefore 75.9 ms/forward, consistent with the original trace's 74.7 ms/forward.
+
+Setting `ROCM_QUICK_REDUCE_QUANTIZATION=INT4` changes the same 273 launches to the Q4 codec and reduces their total to 39.5 ms/forward. AITER cross-device reduction remains separate at 16.2 ms/forward, for a 55.7 ms AllReduce subtotal: approximately 26.7% below INT8.
+
+Graphs-on TP4 wall-clock results, random 8K input / 16 output, concurrency 64, 256 prompts:
+
+| QuickReduce | AITER fusion | Mean TTFT (ms) | TTFT delta | Input tok/s | Throughput delta |
+| --- | --- | ---: | ---: | ---: | ---: |
+| INT8 | off | 7,609.13 | baseline | 37,009.83 | baseline |
+| INT4 | off | 7,063.59 | -7.17% | 39,815.19 | +7.58% |
+| INT8 | on | 7,607.12 | -0.03% | 37,013.69 | +0.01% |
+| INT4 | on | 7,054.39 | -7.29% | 39,857.82 | +7.70% |
+
+Explicit AITER all-reduce fusion is neutral here. Combined INT4 plus fusion improves TTFT only 0.12% beyond INT4 alone, which is within run variance. The supported recommendation is therefore the simpler configuration:
+
+```bash
+export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
+```
+
+Full GSM8K with INT4 scores 96.59% versus the validated INT8 baseline's 96.82% (-0.23 percentage points), with zero request errors.
+
 The K-pool plan handoff hypothesis is falsified. In the original trace, 24 of 28 HtoD events take 3–60 µs. Four 64–128 KiB events report 140.7–457.8 ms, but later work begins on the same stream only 146–460 µs after each event starts, so those durations are impossible. Replacing the four outliers with the 6.0 µs normal-copy median gives a conservative 0.057 ms/forward upper bound for all HtoD traffic, not 270.8 ms.
 
 A graphs-on formal run on the same TP4 8K/16 concurrency-64 workload reproduces the diagnosis: 23 of 27 HtoD events are normal, while four 64–128 KiB events report 197.3–339.7 ms even though later same-stream work begins 193–615 µs after their starts. Its corrected all-HtoD upper bound is 0.045 ms/forward. The unprofiled graphs-on run completes in 56.66 s with mean TTFT 7,609 ms and 37,010 input tokens/s. There is no defensible wall-clock opportunity in `_kpool_plan_to_gpu`, so no runtime change is warranted.
 
 The KDA aggregate contains a repeatable profiler correlation error: 133 of 136 state-update launches complete in 0.31–0.38 ms, while layer-slot 19 in each of the three multi-request profile waves is reported as 197.7–204.5 ms. Later kernels on the same stream begin only 3–63 µs after those events start, so the reported 200 ms durations cannot be real kernel execution. Replacing them with the normal median gives 12.0 ms/forward for state update and 36.2 ms/forward for the complete KDA path.
 
-The compiled production specialization is `K=128`, `V=128`, `BT=64`, `BV=32`, 4 warps, 2 stages, 84 VGPRs and 76,160 bytes shared memory. A production-grid rocprofv3 harness (`grid=(4,48,1)`, 256-thread workgroups) measures 0.33–0.35 ms kernel duration, 6.20% occupancy, 99.99% VALU utilization, 2.51% LDS bank conflicts, 332,680 KB fetched and 198,144 KB written. The low occupancy is real, but this kernel is only 1.7% of corrected prefill time; K-pool plan transfer, MoE, communication and sparse DSA are higher-value targets.
+The compiled production specialization is `K=128`, `V=128`, `BT=64`, `BV=32`, 4 warps, 2 stages, 84 VGPRs and 76,160 bytes shared memory. A production-grid rocprofv3 harness (`grid=(4,48,1)`, 256-thread workgroups) measures 0.33–0.35 ms kernel duration, 6.20% occupancy, 99.99% VALU utilization, 2.51% LDS bank conflicts, 332,680 KB fetched and 198,144 KB written. The low occupancy is real, but this kernel is only 2.9% of corrected prefill time; MoE, communication, sparse DSA and dense projections are higher-value targets.
 
 ## PTPC projection candidates
 
@@ -127,3 +152,6 @@ The exact module, checkpoint and TP4 runtime shapes are recorded in `results/glm
 - PTPC candidate map: `results/glm53_flash_ptpc_projection_candidates.csv`
 - Graphs-on formal trace: `/data2/hf_home/kpool_investigation/formal/traces/1789318529.6711838/1789318529.6732411-TP-0-EXTEND.trace.json.gz`
 - Graphs-on wall-clock result: `/data2/hf_home/kpool_investigation/formal/bench/wallclock.json`
+- INT4 formal trace: `/data2/hf_home/allreduce_investigation/int4/traces/1789322677.9150856/1789322677.9167795-TP-0-EXTEND.trace.json.gz`
+- AllReduce matrix: `/data2/hf_home/allreduce_investigation/{int4,fusion_int8,fusion_int4}/bench/wallclock.json`
+- INT4 GSM8K: `/data2/hf_home/allreduce_investigation/int4/accuracy/gsm8k`
