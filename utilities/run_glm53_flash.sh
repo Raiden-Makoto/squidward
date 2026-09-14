@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 # GLM-5.3-Flash Quark MXFP4 experts + FP8 attention launcher for MI355X/gfx950.
+#
+# Usage:
+#   bash utilities/run_glm53_flash.sh --mxfp4
+#   bash utilities/run_glm53_flash.sh --fp8
+#   bash utilities/run_glm53_flash.sh --mxfp4 --profile
 
 set -euo pipefail
 
 export PYTHONPATH=/sgl-workspace/squidward/python:${PYTHONPATH:-}
 
-MODEL=${MODEL_PATH:-/data2/hf_home/hub/models--amd--GLM-5.3-Flash-Quark-MXFP4/snapshots/b5688f25491202978c19c4d036eef579f61bbe07}
+MXFP4_MODEL=/data2/hf_home/hub/models--amd--GLM-5.3-Flash-Quark-MXFP4/snapshots/b5688f25491202978c19c4d036eef579f61bbe07
+FP8_MODEL=/data2/hf_home/hub/models--zai-org--GLM-5.3-Flash/snapshots/03eb5366286afd40d2221b1d9c63a6dd1ba4832e
+MODEL=${MODEL_PATH:-${MXFP4_MODEL}}
 PORT=${PORT:-8554}
 TP=${TP:-4}
 
@@ -22,6 +29,12 @@ EXTRA_ARGS=()
 
 for arg in "$@"; do
   case "${arg}" in
+    --mxfp4)
+      MODEL=${MXFP4_MODEL}
+      ;;
+    --fp8)
+      MODEL=${FP8_MODEL}
+      ;;
     --profile)
       PROFILE_ARGS=(--disable-cuda-graph)
       ;;
