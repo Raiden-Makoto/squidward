@@ -66,9 +66,14 @@ The routed-expert kernel was not tuned for GLM-5.3. The production trace contain
 - 288 experts, top-k 8
 - BF16 output, FP8 activations and weights, `[128,128]` block scales
 
-AITER `4ad9983282` contains no tuned row for this signature. The observed `fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256` kernel is the fallback selection.
+AITER `4ad9983282` contains no tuned row for this signature. Both the existing and tuned kernels belong to AITER's one-stage gfx950 ASM blockscale-FP8 G1U1 SiLU fused-MoE family (`run_1stage=1`, `ksplit=0`, `doweight_stage1=0`, BF16 output, per-1x128 FP8 activation/weight scales). No CK-Tile, FlyDSL, OPUS or two-stage kernel is selected.
 
-The compatible one-stage ASM sweep compared every available block-FP8 candidate. `32x256` remains 1.65% faster at 8,175 tokens, so that shape keeps the fallback. The three larger shapes improve with `64x256`:
+- Existing fallback symbol: `_ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256E`
+- Tuned symbol: `_ZN5aiter46fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_64x256E`
+- Existing code object: `fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co`
+- Tuned code object: `fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_64x256.co`
+
+The compatible one-stage ASM sweep compared every available block-FP8 candidate in this family. The `32x256` tile remains 1.65% faster at 8,175 tokens, so that shape keeps the fallback symbol. The three larger shapes improve with the `64x256` tile:
 
 | Tokens | Existing `32x256` (µs) | Tuned `64x256` (µs) | Improvement |
 | ---: | ---: | ---: | ---: |
