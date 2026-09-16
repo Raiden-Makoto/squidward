@@ -73,6 +73,17 @@ AITER `4ad9983282` contains no tuned row for this signature. Both the existing a
 - Existing code object: `fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co`
 - Tuned code object: `fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_64x256.co`
 
+Each symbol implements the complete routed-expert operation in one kernel launch:
+
+| Fused operation | TP4 local tensors |
+| --- | --- |
+| Gate/up GEMM | FP8 activation `[M,4096]` × block-FP8 packed weight `[288,1024,4096]`, producing 512 gate and 512 up channels per selected expert |
+| Activation | `SiLU(gate) * up` |
+| Down GEMM | activated local intermediate width 512 × block-FP8 packed weight `[288,4096,512]` |
+| Routed reduction | top-8 expert weights accumulated into BF16 output `[M,4096]` |
+
+The tuned CSV records `run_1stage=1`, `kernelName2=""` and `us2=0`, so `64x256` replaces the single fused kernel responsible for both GEMMs and the intervening activation/reduction. It is not a stage-1-only gate/up change, and there is no separate down-GEMM kernel to tune in this path.
+
 The compatible one-stage ASM sweep compared every available block-FP8 candidate in this family. The `32x256` tile remains 1.65% faster at 8,175 tokens, so that shape keeps the fallback symbol. The three larger shapes improve with the `64x256` tile:
 
 | Tokens | Existing `32x256` (µs) | Tuned `64x256` (µs) | Improvement |
