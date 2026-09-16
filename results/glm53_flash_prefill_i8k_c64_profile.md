@@ -57,6 +57,37 @@ The stage profiler emitted separate EXTEND and DECODE traces. The EXTEND trace c
 | Output add / copies | BF16 add and DtoD copy kernels | 2.4 | 0.6% |
 | **MoE subtotal** |  | **114.3** | **27.3%** |
 
+### Routed MoE tuning validation
+
+The routed-expert kernel was not tuned for GLM-5.3. The production trace contains 42 launches at each of four token counts: 8,175, 16,336, 16,364 and 16,384. Their AITER signature is:
+
+- model dimension 4,096
+- packed block-FP8 intermediate dimension 512
+- 288 experts, top-k 8
+- BF16 output, FP8 activations and weights, `[128,128]` block scales
+
+AITER `4ad9983282` contains no tuned row for this signature. The observed `fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256` kernel is the fallback selection.
+
+The compatible one-stage ASM sweep compared every available block-FP8 candidate. `32x256` remains 1.65% faster at 8,175 tokens, so that shape keeps the fallback. The three larger shapes improve with `64x256`:
+
+| Tokens | Existing `32x256` (µs) | Tuned `64x256` (µs) | Improvement |
+| ---: | ---: | ---: | ---: |
+| 16,336 | 2,845.98 | 2,199.56 | 22.71% |
+| 16,364 | 2,853.32 | 2,233.07 | 21.74% |
+| 16,384 | 2,868.22 | 2,250.11 | 21.55% |
+
+The original trace contains one impossible 104.5 ms MoE event; replacing it with the normal same-shape median gives 96.77 ms/forward for routed experts, consistent with the table's rounded 97.2 ms.
+
+Full-server TP4 validation uses INT4 QuickReduce in both arms and differs only by the three AITER MoE rows:
+
+| Configuration | Mean TTFT (ms) | Input tok/s | Output tok/s |
+| --- | ---: | ---: | ---: |
+| Existing MoE selection | 7,063.59 | 39,815.19 | 77.76 |
+| Three tuned MoE rows | 6,771.69 | 41,495.17 | 81.05 |
+| Delta | -4.13% | +4.22% | +4.22% |
+
+Full GSM8K scores 96.74% with the tuned rows versus 96.59% with the existing selection, with zero request errors. No existing open or merged AITER PR contains these GLM-5.3 shapes; the three-row tuned CSV is suitable for a focused AITER PR.
+
 ## Dense projections and dense MLP
 
 | Component | MI355X kernel/path | MI355X ms | % of total |
@@ -155,3 +186,7 @@ The exact module, checkpoint and TP4 runtime shapes are recorded in `results/glm
 - INT4 formal trace: `/data2/hf_home/allreduce_investigation/int4/traces/1789322677.9150856/1789322677.9167795-TP-0-EXTEND.trace.json.gz`
 - AllReduce matrix: `/data2/hf_home/allreduce_investigation/{int4,fusion_int8,fusion_int4}/bench/wallclock.json`
 - INT4 GSM8K: `/data2/hf_home/allreduce_investigation/int4/accuracy/gsm8k`
+- MoE untuned shapes: `/data2/hf_home/glm53_fmoe_tuning/glm53_untuned.csv`
+- MoE tuned rows: `/data2/hf_home/glm53_fmoe_tuning/glm53_tuned_fp8.csv`
+- MoE full-server result: `/data2/hf_home/glm53_fmoe_tuning/server/bench/wallclock.json`
+- MoE GSM8K: `/data2/hf_home/glm53_fmoe_tuning/server/accuracy/gsm8k`
