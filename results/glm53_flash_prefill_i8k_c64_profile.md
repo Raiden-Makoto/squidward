@@ -84,25 +84,35 @@ Each symbol implements the complete routed-expert operation in one kernel launch
 
 The tuned CSV records `run_1stage=1`, `kernelName2=""` and `us2=0`, so `64x256` replaces the single fused kernel responsible for both GEMMs and the intervening activation/reduction. It is not a stage-1-only gate/up change, and there is no separate down-GEMM kernel to tune in this path.
 
-The compatible one-stage ASM sweep compared every available block-FP8 candidate in this family. The `32x256` tile remains 1.65% faster at 8,175 tokens, so that shape keeps the fallback symbol. The three larger shapes improve with the `64x256` tile:
+The compatible one-stage ASM sweep compared every available block-FP8 candidate in this family. Runtime dispatch does not key directly on the raw token count: `get_padded_M` rounds powers-of-two below 32,768. The 8,175-token launch maps to 8,192 and keeps the existing fallback because no 8,192 row is added. The observed 16,336, 16,364 and 16,384 launches all map to one `token=16384` tuning row. Only that single runtime row is required; the raw-token 16,336 and 16,364 tuner rows are unreachable and must not be submitted.
 
-| Tokens | Existing `32x256` (µs) | Tuned `64x256` (µs) | Improvement |
+The complete affected runtime bucket was benchmarked with only the `token=16384` row installed:
+
+| Actual tokens | Existing `32x256` (µs) | Tuned `64x256` (µs) | Improvement |
 | ---: | ---: | ---: | ---: |
-| 16,336 | 2,845.98 | 2,199.56 | 22.71% |
-| 16,364 | 2,853.32 | 2,233.07 | 21.74% |
+| 8,193 | 1,798.57 | 1,229.46 | 31.64% |
+| 9,216 | 1,852.14 | 1,340.76 | 27.61% |
+| 10,240 | 2,003.78 | 1,448.90 | 27.69% |
+| 12,288 | 2,249.87 | 1,742.83 | 22.54% |
+| 14,336 | 2,574.06 | 2,000.06 | 22.30% |
+| 16,336 | 2,855.57 | 2,205.12 | 22.78% |
 | 16,384 | 2,868.22 | 2,250.11 | 21.55% |
+
+All seven points improve. Token counts at or below 8,192 and above 16,384 use different padded-token keys and remain unchanged.
 
 The original trace contains one impossible 104.5 ms MoE event; replacing it with the normal same-shape median gives 96.77 ms/forward for routed experts, consistent with the table's rounded 97.2 ms.
 
-Full-server TP4 validation uses INT4 QuickReduce in both arms and differs only by the three AITER MoE rows:
+Full-server TP4 validation uses INT4 QuickReduce in both arms and differs only by the single `token=16384` AITER MoE row:
 
 | Configuration | Mean TTFT (ms) | Input tok/s | Output tok/s |
 | --- | ---: | ---: | ---: |
 | Existing MoE selection | 7,063.59 | 39,815.19 | 77.76 |
-| Three tuned MoE rows | 6,771.69 | 41,495.17 | 81.05 |
+| One tuned MoE row | 6,771.69 | 41,495.17 | 81.05 |
 | Delta | -4.13% | +4.22% | +4.22% |
 
-Full GSM8K scores 96.74% with the tuned rows versus 96.59% with the existing selection, with zero request errors. No existing open or merged AITER PR contains these GLM-5.3 shapes; the three-row tuned CSV is suitable for a focused AITER PR.
+Full GSM8K scores 96.74% with the tuned row versus 96.59% with the existing selection, with zero request errors.
+
+The full dispatch key includes gfx architecture, CU count, padded token count, model dimension, packed intermediate dimension, expert count, top-k, activation, output dtype, activation and weight dtypes, quantization type, G1U1 mode and stage-1 routed-weight mode. No shipped AITER row or open/merged AITER PR collides with this complete key. Other current models and all neighboring signatures retain their existing dispatch. The single `token=16384` row is suitable for a focused AITER PR.
 
 ## Dense projections and dense MLP
 
@@ -203,6 +213,6 @@ The exact module, checkpoint and TP4 runtime shapes are recorded in `results/glm
 - AllReduce matrix: `/data2/hf_home/allreduce_investigation/{int4,fusion_int8,fusion_int4}/bench/wallclock.json`
 - INT4 GSM8K: `/data2/hf_home/allreduce_investigation/int4/accuracy/gsm8k`
 - MoE untuned shapes: `/data2/hf_home/glm53_fmoe_tuning/glm53_untuned.csv`
-- MoE tuned rows: `/data2/hf_home/glm53_fmoe_tuning/glm53_tuned_fp8.csv`
+- MoE final runtime row: `/data2/hf_home/glm53_fmoe_tuning/glm53_tuned_runtime.csv`
 - MoE full-server result: `/data2/hf_home/glm53_fmoe_tuning/server/bench/wallclock.json`
 - MoE GSM8K: `/data2/hf_home/glm53_fmoe_tuning/server/accuracy/gsm8k`
