@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# GLM-5.2-MXFP4 launcher (gfx950).
+#
+export PYTHONPATH=/sgl-workspace/squidward/python:${PYTHONPATH}
+MODEL=${HF_HOME:-/root/hf_home}/hub/models--amd--GLM-5.2-MXFP4/snapshots/386bd0e4ec821f7b07975701cec3c3b953a5576a
+
+export SAFETENSORS_FAST_GPU=1
+# Master aiter switch (env-only, upstream default off); whole GLM-5.2 gfx950 path needs it.
+export SGLANG_USE_AITER=${SGLANG_USE_AITER:-1}
+export SGLANG_ROCM_FUSED_DECODE_MLA=0
+export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4  # ATOM only
+# PTPC FP8 q_b/o projections and packed-MXFP4 MLA absorbed K/V BMMs.
+export SGLANG_DSA_FP8_PROJ_GEMM=${SGLANG_DSA_FP8_PROJ_GEMM:-1}
+export SGLANG_USE_MXFP4_MLA_BMM=${SGLANG_USE_MXFP4_MLA_BMM:-1}
+# Fuse the DSA indexer query Hadamard transform with FP8 activation quantization.
+export SGLANG_DSA_FUSE_HADAMARD_QUANT=${SGLANG_DSA_FUSE_HADAMARD_QUANT:-1}
+# Dense-MHA prefill below index_topk; sparse Triton MLA above it.
+export SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD=${SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD:-2048}
+# Shared-expert append (#31323) and dense-regime decode indexer skip (#31324)
+# auto-enable for this non-EP GLM DSA configuration.
+# Tuned MoE (fmoe) config: left unset so aiter merges its own configs/tuned_fmoe.csv
+# with configs/model_configs/*tuned_fmoe*.csv, i.e. the stock glm5_fp4 rows.
+
+export HIP_VISIBLE_DEVICES=4,5,6,7
+export AITER_USE_FLYDSL_MOE_SORTING=1  # match ATOM + the FlyDSL gemm1 kernels stock aiter tunes to
+
+PROFILE_ARGS=""
+SPEC_ARGS=""
+EXTRA_ARGS=""
+BACKEND_ARGS="--dsa-prefill-backend triton --dsa-decode-backend triton"
+# aiter TP allreduce+RMSNorm fusion, on by default (self-disables under deterministic
+# inference). Set ALLREDUCE_FUSION="" to drop it.
+ALLREDUCE_FUSION=${ALLREDUCE_FUSION-"--enable-aiter-allreduce-fusion"}
+for arg in "$@"; do
+  case "$arg" in
+    --profile)
+      PROFILE_ARGS="--disable-cuda-graph"
+      ;;
+    --speculative|--spec)
+      export SGLANG_ENABLE_SPEC_V2=1
+      SPEC_ARGS="--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --attention-backend triton"
+      ;;
+    --use-aiter|--aiter)
+      # No-op: SGLANG_USE_AITER + allreduce fusion are already on by default above.
+      # Kept for backwards compat so old launch commands still parse.
+      export SGLANG_USE_AITER=1
+      ALLREDUCE_FUSION="--enable-aiter-allreduce-fusion"
+      ;;
+    --use-triton|--triton)
+      BACKEND_ARGS="--dsa-prefill-backend triton --dsa-decode-backend triton"
+      ;;
+    --use-tilelang|--tilelang)
+      BACKEND_ARGS="--dsa-prefill-backend tilelang --dsa-decode-backend tilelang"
+      ;;
+    *)
+      # forward any other flag straight to `sglang serve`
+      EXTRA_ARGS="${EXTRA_ARGS} ${arg}"
+      ;;
+  esac
+done
+
+set -x
+exec sglang serve \
+  --model-path "${MODEL}" \
+  ${PROFILE_ARGS} \
+  ${SPEC_ARGS} \
+  ${EXTRA_ARGS} \
+  ${ALLREDUCE_FUSION} \
+  --tp 4 \
+  --host localhost \
+  --port 8552 \
+  --trust-remote-code \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  ${BACKEND_ARGS} \
+  --watchdog-timeout 1200 \
+  --mem-fraction-static 0.85 \
+  --disable-radix-cache \
+  --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' \
+  --kv-cache-dtype fp8_e4m3 \
+  --tokenizer-worker-num 8 \
+  --chunked-prefill-size ${CHUNKED_PREFILL_SIZE:-131072}
