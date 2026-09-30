@@ -41,6 +41,17 @@ def _use_aiter_mhc() -> bool:
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _get_aiter_mhc_pre_quant():
+    try:
+        from aiter.ops.mhc import mhc_pre_quant
+
+        return mhc_pre_quant
+    except Exception as err:
+        logger.warning("AITER fused mHC quant is unavailable, falling back: %s", err)
+        return None
+
+
 def _try_aiter_mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -2076,6 +2087,83 @@ def hc_pre(
         comb_mix.reshape(s, hc_mult * hc_mult),
         post_mix.reshape(s, hc_mult),
         norm_fused,
+    )
+
+
+@torch._dynamo.disable
+def hc_pre_quant(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    post_mult_value: float = 2.0,
+    hc_norm_weight: torch.Tensor | None = None,
+    out_norm_weight: torch.Tensor | None = None,
+    out_norm_eps: float | None = None,
+) -> (
+    Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        bool,
+        tuple[torch.Tensor, torch.Tensor],
+    ]
+    | None
+):
+    s, total = x.shape
+    hidden_size = total // hc_mult
+    if (
+        not _use_aiter_mhc()
+        or out_norm_weight is None
+        or out_norm_eps is None
+        or x.dtype != torch.bfloat16
+        or hc_mult != 4
+        or hidden_size != 4096
+        or s not in (8192, 16384)
+    ):
+        return None
+
+    aiter_mhc_pre_quant = _get_aiter_mhc_pre_quant()
+    if aiter_mhc_pre_quant is None:
+        return None
+
+    fn = hc_fn if hc_norm_weight is None else hc_fn * hc_norm_weight
+    norm_weight_bf = (
+        out_norm_weight.bfloat16()
+        if out_norm_weight.dtype != torch.bfloat16
+        else out_norm_weight
+    )
+    if not norm_weight_bf.is_contiguous():
+        norm_weight_bf = norm_weight_bf.contiguous()
+
+    try:
+        post_mix, comb_mix, layer_input, quant_out, quant_scale = aiter_mhc_pre_quant(
+            x.view(s, hc_mult, hidden_size),
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight_bf,
+            rms_eps,
+            hc_eps,
+            hc_eps,
+            post_mult_value,
+            sinkhorn_iters,
+            out_norm_eps,
+        )
+    except Exception as err:
+        logger.warning("AITER fused mHC quant failed, falling back: %s", err)
+        return None
+
+    return (
+        layer_input,
+        comb_mix.reshape(s, hc_mult * hc_mult),
+        post_mix.reshape(s, hc_mult),
+        True,
+        (quant_out, quant_scale),
     )
 
 

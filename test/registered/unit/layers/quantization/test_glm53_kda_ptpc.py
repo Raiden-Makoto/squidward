@@ -19,6 +19,7 @@ from sglang.srt.layers.quantization.unquant import (
 from sglang.srt.models.glm5_next import (
     GLM53_KDA_FUSED_O_NORM_MIN_M,
     GLM53_KDA_PTPC_BF16_MAX_M,
+    Glm5NextDecoderLayer,
     Glm5NextLinearAttention,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -514,6 +515,131 @@ class TestGLM53KDAPTPC(CustomTestCase):
         self.assertIs(attention.f_a_proj.inputs[0], quantized)
         self.assertIs(attention.g_a_proj.inputs[0], quantized)
         self.assertIs(attention.b_proj.inputs[0], hidden_states)
+
+    def test_forward_consumes_fused_mhc_prequantized_input(self):
+        attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+        torch.nn.Module.__init__(attention)
+        attention.fuse_bfg = False
+        hidden_states = torch.randn(3, 8)
+        quantized = (torch.empty(3, 8), torch.ones(3, 1))
+        attention.qkv_proj = _RecordingLinear(torch.empty(3, 12))
+        attention.b_proj = _RecordingLinear(torch.empty(3, 2))
+        attention.f_a_proj = _RecordingLinear(torch.empty(3, 4))
+        attention.f_b_proj = _RecordingLinear(torch.empty(3, 6))
+        attention.g_a_proj = _RecordingLinear(torch.empty(3, 4))
+        attention.g_b_proj = _RecordingLinear(torch.empty(3, 6))
+        with (
+            patch.object(
+                Glm5NextLinearAttention,
+                "_maybe_quantize_ptpc_input",
+            ) as quantize,
+            patch.object(
+                Glm5NextLinearAttention,
+                "_ptpc_linear_active",
+                return_value=True,
+            ),
+        ):
+            attention.forward_qkvbfg(
+                hidden_states,
+                forward_batch=None,
+                prequantized_input=quantized,
+            )
+        quantize.assert_not_called()
+        self.assertIs(attention.qkv_proj.inputs[0], quantized)
+        self.assertIs(attention.f_a_proj.inputs[0], quantized)
+        self.assertIs(attention.g_a_proj.inputs[0], quantized)
+        self.assertIs(attention.b_proj.inputs[0], hidden_states)
+
+    def test_shared_ptpc_input_gate_requires_all_three_modules(self):
+        attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+        torch.nn.Module.__init__(attention)
+        attention.do_fuse_qkvbfg = False
+        attention.fuse_bfg = False
+        attention.qkv_proj = object()
+        attention.f_a_proj = object()
+        attention.g_a_proj = object()
+        with patch.object(
+            Glm5NextLinearAttention,
+            "_ptpc_linear_active",
+            side_effect=[True, True, True, True, False],
+        ):
+            self.assertTrue(attention.uses_shared_ptpc_input(8192))
+            self.assertFalse(attention.uses_shared_ptpc_input(8192))
+
+    def test_decoder_attn_pre_stashes_fused_quant_once(self):
+        model_module = sys.modules[Glm5NextDecoderLayer.__module__]
+        layer = Glm5NextDecoderLayer.__new__(Glm5NextDecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer.is_linear_attn = True
+        layer.self_attn = MagicMock()
+        layer.self_attn.uses_shared_ptpc_input.return_value = True
+        layer.config = SimpleNamespace(
+            hc_mult=4,
+            rms_norm_eps=1e-6,
+            hc_eps=1e-6,
+            hc_sinkhorn_iters=20,
+        )
+        layer.hc_attn_fn = torch.empty(24, 16384, device="meta")
+        layer.hc_attn_scale = torch.empty(3, device="meta")
+        layer.hc_attn_base = torch.empty(24, device="meta")
+        hidden = torch.empty(8192, 16384, device="meta")
+        quantized = (
+            torch.empty(8192, 4096, device="meta"),
+            torch.empty(8192, 1, device="meta"),
+        )
+        fused = (
+            torch.empty(8192, 4096, device="meta"),
+            torch.empty(8192, 16, device="meta"),
+            torch.empty(8192, 4, device="meta"),
+            True,
+            quantized,
+        )
+        with patch.object(model_module, "_hc_pre_quant_fn", return_value=fused):
+            actual = layer.hc_attn_pre(
+                hidden,
+                torch.empty(4096, device="meta"),
+                1e-6,
+            )
+        for got, expected in zip(actual[:3], fused[:3]):
+            self.assertIs(got, expected)
+        self.assertTrue(actual[3])
+        self.assertIs(layer._pending_attn_ptpc_input, quantized)
+
+    def test_decoder_attn_pre_clears_stale_quant_on_fallback(self):
+        model_module = sys.modules[Glm5NextDecoderLayer.__module__]
+        layer = Glm5NextDecoderLayer.__new__(Glm5NextDecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer.is_linear_attn = True
+        layer.self_attn = MagicMock()
+        layer.self_attn.uses_shared_ptpc_input.return_value = True
+        layer.config = SimpleNamespace(
+            hc_mult=4,
+            rms_norm_eps=1e-6,
+            hc_eps=1e-6,
+            hc_sinkhorn_iters=20,
+        )
+        layer.hc_attn_fn = torch.empty(24, 16384, device="meta")
+        layer.hc_attn_scale = torch.empty(3, device="meta")
+        layer.hc_attn_base = torch.empty(24, device="meta")
+        layer._pending_attn_ptpc_input = (object(), object())
+        fallback = (
+            torch.empty(7, 4096, device="meta"),
+            torch.empty(7, 16, device="meta"),
+            torch.empty(7, 4, device="meta"),
+            False,
+        )
+        with (
+            patch.object(model_module, "_hc_pre_quant_fn", return_value=None),
+            patch.object(layer, "_hc_pre", return_value=fallback) as hc_pre,
+        ):
+            actual = layer.hc_attn_pre(
+                torch.empty(7, 16384, device="meta"),
+                torch.empty(4096, device="meta"),
+                1e-6,
+            )
+        self.assertIs(actual, fallback)
+        self.assertIsNone(layer._pending_attn_ptpc_input)
+        hc_pre.assert_called_once()
 
     def test_model_quantization_boundary_and_zero_tokens(self):
         threshold = GLM53_KDA_PTPC_BF16_MAX_M["qkv_proj"]

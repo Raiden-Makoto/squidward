@@ -16,6 +16,7 @@ from sglang.kernels.ops.attention.fla.fused_norm_gate import (
 from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
+from sglang.kernels.ops.layernorm.mhc import hc_pre_quant as _hc_pre_quant_fn
 from sglang.srt.batch_overlap.two_batch_overlap import (
     model_forward_stages,
 )
@@ -706,8 +707,26 @@ class Glm5NextLinearAttention(nn.Module):
             num_tokens
         )
 
-    def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
-        shared_input = self._maybe_quantize_ptpc_input(self.qkv_proj, hidden_states)
+    def uses_shared_ptpc_input(self, num_tokens: int) -> bool:
+        return (
+            not self.do_fuse_qkvbfg
+            and not self.fuse_bfg
+            and self._ptpc_linear_active(self.qkv_proj, num_tokens)
+            and self._ptpc_linear_active(self.f_a_proj, num_tokens)
+            and self._ptpc_linear_active(self.g_a_proj, num_tokens)
+        )
+
+    def forward_qkvbfg(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        prequantized_input: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ):
+        shared_input = (
+            prequantized_input
+            if prequantized_input is not None
+            else self._maybe_quantize_ptpc_input(self.qkv_proj, hidden_states)
+        )
         qkv, _ = self.qkv_proj(shared_input)
 
         if self.fuse_bfg:
@@ -815,6 +834,7 @@ class Glm5NextLinearAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        prequantized_input: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
         if forward_batch.forward_mode.is_idle():
@@ -826,7 +846,7 @@ class Glm5NextLinearAttention(nn.Module):
             )
         else:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg(
-                hidden_states, forward_batch
+                hidden_states, forward_batch, prequantized_input
             )
 
         if not forward_batch.forward_mode.is_decode():
@@ -910,6 +930,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 is_nextn=is_nextn,
                 skip_rope=True,
             )
+        self._pending_attn_ptpc_input = None
 
         if config.q_lora_rank is None and envs.SGLANG_USE_AG_AFTER_QLORA.get():
             raise ValueError(
@@ -1034,6 +1055,32 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
     def hc_attn_pre(self, hidden_states, out_norm_weight, out_norm_eps):
+        self._pending_attn_ptpc_input = None
+        num_tokens = hidden_states.shape[0]
+        if self.is_linear_attn and self.self_attn.uses_shared_ptpc_input(num_tokens):
+            fused = _hc_pre_quant_fn(
+                x=hidden_states,
+                hc_fn=self.hc_attn_fn,
+                hc_scale=self.hc_attn_scale,
+                hc_base=self.hc_attn_base,
+                hc_mult=self.config.hc_mult,
+                rms_eps=self.config.rms_norm_eps,
+                hc_eps=self.config.hc_eps,
+                sinkhorn_iters=self.config.hc_sinkhorn_iters,
+                post_mult_value=_MHC_POST_MULT_VALUE,
+                hc_norm_weight=None,
+                out_norm_weight=out_norm_weight,
+                out_norm_eps=out_norm_eps,
+            )
+            if fused is not None:
+                (
+                    layer_input,
+                    h_res,
+                    h_post,
+                    norm_fused,
+                    self._pending_attn_ptpc_input,
+                ) = fused
+                return layer_input, h_res, h_post, norm_fused
         return self._hc_pre(
             self.hc_attn_fn,
             self.hc_attn_scale,
@@ -1126,6 +1173,10 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states, forward_batch, capture_output=capture_output
         )
 
+        attn_kwargs = {}
+        if self.is_linear_attn:
+            attn_kwargs["prequantized_input"] = self._pending_attn_ptpc_input
+            self._pending_attn_ptpc_input = None
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -1135,6 +1186,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 self.attn_boundary.input_on_attention_tp_slices
             ),
             prev_topk_indices=prev_topk_indices,
+            **attn_kwargs,
         )
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
