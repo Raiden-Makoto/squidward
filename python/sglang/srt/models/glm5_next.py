@@ -142,6 +142,7 @@ _MHC_POST_MULT_VALUE = 2.0
 # hidden_size=4096 the fusion wins to 16 tokens and reaches parity at 24, with
 # 17-23 unmeasured. Past it the pre-norm GEMM drops mhc_pre's split-K kernel.
 _MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
+_MHC_FUSED_BOUNDARY_LARGE_TOKENS = (8192, 16384)
 
 
 @torch.compile
@@ -779,6 +780,8 @@ class Glm5NextDecoderLayer(nn.Module):
             self.hc_ffn_fn = nn.Parameter(
                 torch.empty(mix_hc, hc_dim, dtype=torch.float32)
             )
+            self.register_buffer("_hc_ffn_fn_packed", None, persistent=False)
+            self._hc_ffn_fn_packed_source = None
 
         terminal = layer_id == (1 if is_nextn else config.num_hidden_layers) - 1
         residual = PLAIN_RESIDUAL_OPS
@@ -862,6 +865,26 @@ class Glm5NextDecoderLayer(nn.Module):
             out_norm_eps,
         )
 
+    def _get_hc_ffn_fn_packed(self):
+        version = None if self.hc_ffn_fn.is_inference() else self.hc_ffn_fn._version
+        source = self._hc_ffn_fn_packed_source
+        source_is_valid = (
+            source is not None
+            and self.hc_ffn_fn is source[0]
+            and self.hc_ffn_fn.data_ptr() == source[1]
+            and (source[2] is None or version == source[2])
+        )
+        if self._hc_ffn_fn_packed is None or not source_is_valid:
+            from aiter.ops.mhc import mhc_shuffle_fn
+
+            self._hc_ffn_fn_packed = mhc_shuffle_fn(self.hc_ffn_fn)
+            self._hc_ffn_fn_packed_source = (
+                self.hc_ffn_fn,
+                self.hc_ffn_fn.data_ptr(),
+                version,
+            )
+        return self._hc_ffn_fn_packed
+
     def hc_ffn_post_pre(
         self, hidden_states, residual, h_res, h_post, out_norm_weight, out_norm_eps
     ):
@@ -869,15 +892,22 @@ class Glm5NextDecoderLayer(nn.Module):
         # still launches separately, so this is two launches instead of three.
         assert self.config.mhc, "hc_ffn_post_pre is only valid when config.mhc=True"
         num_tokens, hidden_size = hidden_states.shape
-        if num_tokens > _MHC_FUSED_BOUNDARY_MAX_TOKENS:
-            return None
         hc_mult = self.config.hc_mult
+        use_large_m_fused = (
+            _use_aiter_gfx95
+            and hidden_size == 4096
+            and hc_mult == 4
+            and num_tokens in _MHC_FUSED_BOUNDARY_LARGE_TOKENS
+        )
+        if num_tokens > _MHC_FUSED_BOUNDARY_MAX_TOKENS and not use_large_m_fused:
+            return None
+        hc_fn = self._get_hc_ffn_fn_packed() if use_large_m_fused else self.hc_ffn_fn
         fused = apply_mhc_post_pre_boundary(
             layer_input=hidden_states,
             residual=residual.view(num_tokens, hc_mult, hidden_size),
             post=h_post.view(num_tokens, hc_mult),
             comb=h_res.view(num_tokens, hc_mult, hc_mult),
-            hc_fn=self.hc_ffn_fn,
+            hc_fn=hc_fn,
             hc_scale=self.hc_ffn_scale,
             hc_base=self.hc_ffn_base,
             hc_mult=hc_mult,
@@ -890,6 +920,8 @@ class Glm5NextDecoderLayer(nn.Module):
             # Matches DeepSeek-V4's two hc_ffn_fn boundaries; the Triton tier's
             # parameter is hc_fn_t and this fn has the same [mix_hc, hc_dim] layout.
             fn_transpose=True,
+            force_fused=use_large_m_fused,
+            w_preshuffle_bf16=use_large_m_fused,
         )
         if fused is None:
             return None
