@@ -69,7 +69,7 @@ kill_port() {
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_HOME="${BENCH_HOME:-$(dirname "$HERE")}"
-IX="${IX:-${INFMAX_CONTAINER_WORKSPACE:-/home/macui/InferenceX}}"
+IX="${IX:-${INFMAX_CONTAINER_WORKSPACE:-/home/macui/InferenceX/inferencex-e2e}}"
 
 PLATFORM=""
 DOCKER="${DOCKER:-}"

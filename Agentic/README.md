@@ -22,7 +22,7 @@ An explicitly empty `SGLANG_OPT_GLM53_KDA_PTPC_MODULES` keeps the selector off f
 
 ```bash
 cd Agentic
-IX=/path/to/InferenceX \
+IX=/path/to/InferenceX/inferencex-e2e \
   ./ix_agentx_glm53flash.sh --platform mi355x --gpus 4,5,6,7 --dry-run
 ```
 
