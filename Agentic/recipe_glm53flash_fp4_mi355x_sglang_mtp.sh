@@ -159,8 +159,10 @@ export SGLANG_USE_AITER="${SGLANG_USE_AITER:-1}"
 # explicitly set empty value is retained for selector-off A/B runs.
 export SGLANG_OPT_GLM53_KDA_PTPC_MODULES="${SGLANG_OPT_GLM53_KDA_PTPC_MODULES-qkv_proj,f_a_proj,g_a_proj,o_proj}"
 # Keep the communication tuple aligned with the validated TP4 GLM-5.3 launch.
-export ROCM_QUICK_REDUCE_QUANTIZATION="${ROCM_QUICK_REDUCE_QUANTIZATION-INT4}"
-export AITER_QUICK_REDUCE_QUANTIZATION="${AITER_QUICK_REDUCE_QUANTIZATION-INT4}"
+# The image exports ROCM_QUICK_REDUCE_QUANTIZATION=INT8, so the inherited value
+# is ignored; override with GLM53_<VAR> or the driver's --env <VAR>=...
+export ROCM_QUICK_REDUCE_QUANTIZATION="${GLM53_ROCM_QUICK_REDUCE_QUANTIZATION:-INT4}"
+export AITER_QUICK_REDUCE_QUANTIZATION="${GLM53_AITER_QUICK_REDUCE_QUANTIZATION:-INT4}"
 # Agentic warmup dispatches hundreds of long prompts at once; allow up to 15
 # minutes of TCP progress before AIPerf calls a connection dead, and keep
 # uvicorn's keep-alive longer than an inter-turn idle gap (its 5s default lets

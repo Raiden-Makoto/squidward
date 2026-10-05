@@ -270,6 +270,21 @@ for required in "$IX/benchmarks/benchmark_lib.sh" "$IX/benchmarks/runtime_settin
     }
 done
 
+# The images ship an editable SGLang install of their own, so without this the
+# server silently runs the image's tree instead of the branch under test.
+SGLANG_SRC="$(cd "$HERE/.." && pwd -P)"
+export SGLANG_SRC
+export PYTHONPATH="$SGLANG_SRC/python:${PYTHONPATH:-}"
+SGLANG_FILE="$(python3 -c 'import os, sglang; print(os.path.realpath(sglang.__file__))' 2>&1)" || {
+    echo "ERROR: importing sglang failed with PYTHONPATH=$PYTHONPATH:" >&2
+    echo "$SGLANG_FILE" >&2
+    exit 1
+}
+if [ "$SGLANG_FILE" != "$SGLANG_SRC/python/sglang/__init__.py" ]; then
+    echo "ERROR: sglang resolves to $SGLANG_FILE, not the checkout at $SGLANG_SRC." >&2
+    exit 1
+fi
+
 [ -n "$GPUS" ] && export "$VISIBLE_VAR=$GPUS"
 NGPU=$(gpu_count)
 if [ "$NGPU" -lt "$TP" ]; then
@@ -400,7 +415,15 @@ export AIPERF_RUNTIME_DIR="${AIPERF_RUNTIME_DIR:-/data2/hf_home/ix-agentic-runti
 export HF_HUB_CACHE="${HF_HUB_CACHE:-/data2/hf_home/hub}"
 mkdir -p "$AIPERF_RUNTIME_DIR" "$HF_HUB_CACHE"
 
-for kv in "${EXTRA_ENV[@]:-}"; do [ -n "$kv" ] && export "${kv?}"; done
+for kv in "${EXTRA_ENV[@]:-}"; do
+    [ -n "$kv" ] || continue
+    export "${kv?}"
+    # The ROCm image exports ROCM_QUICK_REDUCE_QUANTIZATION=INT8, so the recipe
+    # cannot tell an inherited value from a requested one; --env marks it requested.
+    case "$kv" in
+        ROCM_QUICK_REDUCE_QUANTIZATION=*|AITER_QUICK_REDUCE_QUANTIZATION=*) export "GLM53_$kv" ;;
+    esac
+done
 
 # ---- run-length modes ----------------------------------------------------
 [ -n "$TAG" ] || TAG="TP${TP}_EP${EP}-mtp${MTP_STEPS}"
@@ -443,6 +466,7 @@ SWEEP_LOG="$ROOT/sweep.log"
     echo "hicache_size=${USER_HICACHE:-per-conc} mamba_ratio=${USER_MAMBA_RATIO:-per-conc}"
     echo "duration=$DURATION conc=($CONC_LIST) gpus=${!VISIBLE_VAR:-all}"
     echo "ix=$IX@$(git -C "$IX" rev-parse --short HEAD 2>/dev/null) image=$DOCKER"
+    echo "sglang=$SGLANG_SRC@$(git -C "$SGLANG_SRC" rev-parse --short HEAD 2>/dev/null) file=$SGLANG_FILE"
     echo "root=$ROOT"
 } | tee -a "$SWEEP_LOG"
 
@@ -462,11 +486,12 @@ if [ "$DRY_RUN" = "1" ]; then
     done
     echo
     echo "--- recipe env (dry run, last concurrency) ---"
-    env | grep -E '^(MODEL|TP|EP_SIZE|PP_SIZE|DCP_SIZE|PCP_SIZE|DP_ATTENTION|SPEC_|ACC_MODE|GOLDEN_AL|KV_|HICACHE|TOTAL_CPU_DRAM_GB|MAX_MODEL_LEN|CONTEXT_LENGTH|MAMBA_|MAX_MAMBA|CUDA_GRAPH|MEM_FRACTION|CHUNKED_|AIPERF_|AGENTIC_|INFMAX_|RUNNER_TYPE|PRECISION|FRAMEWORK|SCENARIO_|DURATION|ENABLE_AGENTX_POWER|REQUIRE_POWER|IS_MULTINODE|DISAGG|EVAL_ONLY|IMAGE|HF_HUB_CACHE)' | sort
+    env | grep -E '^(MODEL|TP|EP_SIZE|PP_SIZE|DCP_SIZE|PCP_SIZE|DP_ATTENTION|SPEC_|ACC_MODE|GOLDEN_AL|KV_|HICACHE|TOTAL_CPU_DRAM_GB|MAX_MODEL_LEN|CONTEXT_LENGTH|MAMBA_|MAX_MAMBA|CUDA_GRAPH|MEM_FRACTION|CHUNKED_|AIPERF_|AGENTIC_|INFMAX_|RUNNER_TYPE|PRECISION|FRAMEWORK|SCENARIO_|DURATION|ENABLE_AGENTX_POWER|REQUIRE_POWER|IS_MULTINODE|DISAGG|EVAL_ONLY|IMAGE|HF_HUB_CACHE|SGLANG_SRC|PYTHONPATH|GLM53_)' | sort
     exit 0
 fi
 
 # ---- sweep ---------------------------------------------------------------
+FAILED_CONCS=""
 for CONC in $CONC_LIST; do
     export CONC
     conc_defaults "$CONC"
@@ -502,6 +527,7 @@ for CONC in $CONC_LIST; do
     bash "$RECIPE" > "$RESULT_DIR/recipe.log" 2>&1
     rc=$?
     echo ">>> $(date -Is) conc=$CONC exit=$rc" | tee -a "$SWEEP_LOG"
+    [ "$rc" -ne 0 ] && FAILED_CONCS="${FAILED_CONCS:+$FAILED_CONCS }$CONC"
 
     # The two numbers that decide whether the hybrid memory split is sane: the
     # full-attention token pool and the KDA state slot count. Both move with
@@ -514,4 +540,8 @@ for CONC in $CONC_LIST; do
     sleep 30
 done
 
+if [ -n "$FAILED_CONCS" ]; then
+    echo "=== $(date -Is) sweep FAILED at conc ($FAILED_CONCS): $ROOT ===" | tee -a "$SWEEP_LOG"
+    exit 1
+fi
 echo "=== $(date -Is) sweep done: $ROOT ===" | tee -a "$SWEEP_LOG"
