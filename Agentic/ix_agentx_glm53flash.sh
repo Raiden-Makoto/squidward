@@ -261,7 +261,7 @@ done
 # benchmark_lib.sh's agentic half and the infx result package both moved in the
 # 2026-09 tree; an older checkout fails deep inside install_agentic_deps.
 for required in "$IX/benchmarks/benchmark_lib.sh" "$IX/benchmarks/runtime_settings.sh" \
-                "$IX/utils/agentic-benchmark/requirements.txt" "$IX/utils/aiperf/pyproject.toml" \
+                "$IX/utils/aiperf/pyproject.toml" \
                 "$IX/infx/results/agentic/process_agentic_result.py"; do
     [ -e "$required" ] || {
         echo "ERROR: $required is missing. Update the InferenceX checkout at $IX" >&2
