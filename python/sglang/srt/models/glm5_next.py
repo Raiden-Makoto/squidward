@@ -95,6 +95,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     apply_mhc_post_pre_boundary,
     is_cross_layer_mhc_fusion_enabled,
+    try_aiter_mhc_pre_quant,
 )
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
@@ -152,6 +153,16 @@ _MHC_POST_MULT_VALUE = 2.0
 # 17-23 unmeasured. Past it the pre-norm GEMM drops mhc_pre's split-K kernel.
 _MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
 _MHC_FUSED_BOUNDARY_LARGE_TOKENS = (4096, 8192, 16384, 131072)
+_MHC_QUANT_BOUNDARY_TOKENS = (
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+    65536,
+    131072,
+)
 
 
 @torch.compile
@@ -706,8 +717,30 @@ class Glm5NextLinearAttention(nn.Module):
             num_tokens
         )
 
-    def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
-        shared_input = self._maybe_quantize_ptpc_input(self.qkv_proj, hidden_states)
+    def can_consume_mhc_prequant(self, num_tokens: int) -> bool:
+        if self.do_fuse_qkvbfg:
+            return self._ptpc_linear_active(self.fused_qkvbfg_a_proj, num_tokens)
+        modules = (
+            (self.qkv_proj, self.fused_bfg_a_proj)
+            if self.fuse_bfg
+            else (self.qkv_proj, self.f_a_proj, self.g_a_proj)
+        )
+        return all(self._ptpc_linear_active(module, num_tokens) for module in modules)
+
+    @staticmethod
+    def _split_mhc_prequant(hidden_states):
+        if isinstance(hidden_states, tuple) and len(hidden_states) == 3:
+            bf16, fp8, scale = hidden_states
+            return bf16, (fp8, scale)
+        return hidden_states, None
+
+    def forward_qkvbfg(self, hidden_states, forward_batch: ForwardBatch):
+        hidden_states, prequant = self._split_mhc_prequant(hidden_states)
+        shared_input = (
+            prequant
+            if prequant is not None
+            else self._maybe_quantize_ptpc_input(self.qkv_proj, hidden_states)
+        )
         qkv, _ = self.qkv_proj(shared_input)
 
         if self.fuse_bfg:
@@ -784,9 +817,8 @@ class Glm5NextLinearAttention(nn.Module):
             self.o_norm.weight,
         )
 
-    def forward_qkvbfg_fused(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
-    ):
+    def forward_qkvbfg_fused(self, hidden_states, forward_batch: ForwardBatch):
+        hidden_states, prequant = self._split_mhc_prequant(hidden_states)
         method = self.fused_qkvbfg_a_proj.quant_method
         num_tokens = hidden_states.numel() // hidden_states.shape[-1]
         if isinstance(method, Glm53KdaPackedPtpcLinearMethod) and method.is_active(
@@ -795,6 +827,7 @@ class Glm5NextLinearAttention(nn.Module):
             qkv, beta, fg_a_states = method.apply_ptpc_prefill(
                 self.fused_qkvbfg_a_proj,
                 hidden_states,
+                q_input=prequant,
             )
             fg_a_states = fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
         else:
@@ -987,6 +1020,9 @@ class Glm5NextDecoderLayer(nn.Module):
                 hc_attn_post_pre=(
                     self.hc_attn_post_pre if fuse_mhc_boundaries else None
                 ),
+                hc_attn_pre_quant=(
+                    self.hc_attn_pre_quant if fuse_mhc_boundaries else None
+                ),
                 defer_ffn_update=fuse_mhc_boundaries and not terminal,
                 is_last_layer=terminal,
             ).residual_ops()
@@ -1078,6 +1114,14 @@ class Glm5NextDecoderLayer(nn.Module):
             )
         return packed
 
+    def _can_use_hc_attn_prequant(self, num_tokens: int) -> bool:
+        return (
+            self.is_linear_attn
+            and _use_aiter_gfx95
+            and num_tokens in _MHC_QUANT_BOUNDARY_TOKENS
+            and self.self_attn.can_consume_mhc_prequant(num_tokens)
+        )
+
     def _hc_post_pre(
         self,
         stage,
@@ -1106,6 +1150,11 @@ class Glm5NextDecoderLayer(nn.Module):
             if use_large_m_fused
             else getattr(self, f"hc_{stage}_fn")
         )
+        return_quant = (
+            stage == "attn"
+            and use_large_m_fused
+            and self._can_use_hc_attn_prequant(num_tokens)
+        )
         fused = apply_mhc_post_pre_boundary(
             layer_input=hidden_states,
             residual=residual.view(num_tokens, hc_mult, hidden_size),
@@ -1124,16 +1173,54 @@ class Glm5NextDecoderLayer(nn.Module):
             fn_transpose=True,
             force_fused=use_large_m_fused,
             w_preshuffle_bf16=use_large_m_fused,
+            return_quant=return_quant,
         )
         if fused is None:
             return None
-        next_residual, layer_input, post, comb, norm_fused = fused
-        return (
+        if len(fused) == 6:
+            next_residual, layer_input, post, comb, norm_fused, prequant = fused
+        else:
+            next_residual, layer_input, post, comb, norm_fused = fused
+            prequant = None
+        result = (
             layer_input,
             next_residual.reshape(num_tokens, -1),
             comb.reshape(num_tokens, hc_mult * hc_mult),
             post.reshape(num_tokens, hc_mult),
             norm_fused,
+        )
+        return result if prequant is None else (*result, prequant)
+
+    def hc_attn_pre_quant(self, hidden_states, out_norm_weight, out_norm_eps):
+        num_tokens, hc_hidden_size = hidden_states.shape
+        hidden_size = hc_hidden_size // self.config.hc_mult
+        if (
+            hidden_size != 4096
+            or out_norm_weight is None
+            or not self._can_use_hc_attn_prequant(num_tokens)
+        ):
+            return None
+        quantized = try_aiter_mhc_pre_quant(
+            residual=hidden_states.view(num_tokens, self.config.hc_mult, hidden_size),
+            hc_fn=self.hc_attn_fn,
+            hc_scale=self.hc_attn_scale,
+            hc_base=self.hc_attn_base,
+            norm_weight=out_norm_weight,
+            rms_eps=self.config.rms_norm_eps,
+            hc_eps=self.config.hc_eps,
+            hc_post_mult=_MHC_POST_MULT_VALUE,
+            sinkhorn_iters=self.config.hc_sinkhorn_iters,
+            norm_eps=out_norm_eps,
+        )
+        if quantized is None:
+            return None
+        layer_input, post, comb, norm_fused, prequant = quantized
+        return (
+            layer_input,
+            comb.reshape(num_tokens, self.config.hc_mult**2),
+            post.reshape(num_tokens, self.config.hc_mult),
+            norm_fused,
+            prequant,
         )
 
     def hc_attn_post_pre(
