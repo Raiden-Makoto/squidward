@@ -18,9 +18,14 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
-# backend-specific: the zero-tail specialization only exists in the HIP TileLang kernels
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+
+_GLM53_GFX950_ONLY = unittest.skipUnless(
+    torch.cuda.is_available() and is_hip() and is_gfx95_supported(),
+    "the GLM-5.3 TileLang geometry is validated on gfx950",
+)
 
 
 class TestPackedRowInference(CustomTestCase):
@@ -214,8 +219,12 @@ def _torch_sparse_attention(q, kv, indices, scale, d_v):
 
 
 @unittest.skipUnless(
-    torch.cuda.is_available() and is_hip() and is_gfx95_supported(),
-    "the zero-tail TileLang specialization is compiled for gfx950",
+    torch.cuda.is_available()
+    and (
+        (is_hip() and is_gfx95_supported())
+        or (not is_hip() and torch.cuda.get_device_capability() >= (8, 9))
+    ),
+    "TileLang DSA requires gfx950 or SM89+ for these tests",
 )
 class TestTileLangDSAZeroRope(CustomTestCase):
     @staticmethod
@@ -241,6 +250,9 @@ class TestTileLangDSAZeroRope(CustomTestCase):
 
         torch.manual_seed(7)
         tokens, heads, topk = 17, 64, 2112
+        if not is_hip() and not use_fp8 and d_tail:
+            # The existing CUDA BF16 tail kernel processes pairs of 128 rows.
+            topk = 2304
         dim = d_v + d_tail
         q = torch.randn(tokens, heads, dim, device="cuda", dtype=torch.bfloat16)
         kv = torch.randn(topk, 1, dim, device="cuda", dtype=torch.bfloat16)
@@ -248,12 +260,12 @@ class TestTileLangDSAZeroRope(CustomTestCase):
         indices = indices.view(1, 1, topk).expand(tokens, -1, -1).clone()
         indices[..., 2051:] = -1  # padded rows must be masked, not gathered from slot 0
         if use_fp8:
-            q = q.to(FP8_DTYPE)
             kv = kv.to(FP8_DTYPE)
+        reference_q = q.to(FP8_DTYPE) if use_fp8 else q
 
         scale = 1.0 / math.sqrt(dim)
-        expected = _torch_sparse_attention(q, kv, indices, scale, d_v)
-        # the HIP combine kernel returns [batch=1, tokens, heads, d_v]
+        expected = _torch_sparse_attention(reference_q, kv, indices, scale, d_v)
+        # the partial/combine path returns [batch=1, tokens, heads, d_v]
         actual = tilelang_sparse_fwd(q, kv, indices, scale, d_v=d_v).squeeze(0)
         torch.testing.assert_close(
             actual,
@@ -261,6 +273,13 @@ class TestTileLangDSAZeroRope(CustomTestCase):
             atol=0.20 if use_fp8 else 0.04,
             rtol=0.12 if use_fp8 else 0.04,
         )
+        if use_fp8:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = tilelang_sparse_fwd(q, kv, indices, scale, d_v=d_v)
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(captured.squeeze(0), actual, atol=0, rtol=0)
 
     def test_bf16_zero_rope_matches_torch(self):
         """Before the fix the BF16 partial kernel emitted zero-extent tail copies and failed to compile."""
@@ -276,6 +295,7 @@ class TestTileLangDSAZeroRope(CustomTestCase):
             with self.subTest(use_fp8=use_fp8):
                 self._assert_matches_torch(use_fp8=use_fp8, d_v=512, d_tail=64)
 
+    @_GLM53_GFX950_ONLY
     def test_glm53_h16_d512_zero_rope_matches_torch(self):
         """Pin the GLM-5.3 TP4 sparse-attention head geometry and padded top-k."""
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
@@ -290,6 +310,7 @@ class TestTileLangDSAZeroRope(CustomTestCase):
         repeated = tilelang_sparse_fwd(q, kv, indices, scale, d_v=512).squeeze(0)
         torch.testing.assert_close(repeated, actual, atol=0, rtol=0)
 
+    @_GLM53_GFX950_ONLY
     def test_glm53_all_masked_rows_are_finite_zeros(self):
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
             tilelang_sparse_fwd,
@@ -300,6 +321,7 @@ class TestTileLangDSAZeroRope(CustomTestCase):
         self.assertTrue(torch.isfinite(actual).all())
         self.assertTrue(torch.equal(actual, torch.zeros_like(actual)))
 
+    @_GLM53_GFX950_ONLY
     def test_glm53_zero_rope_cuda_graph_replay(self):
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
             tilelang_sparse_fwd,
@@ -316,6 +338,7 @@ class TestTileLangDSAZeroRope(CustomTestCase):
         torch.cuda.synchronize()
         torch.testing.assert_close(captured, eager, atol=0, rtol=0)
 
+    @_GLM53_GFX950_ONLY
     def test_glm53_production_grids_are_finite(self):
         """M=8192/16384 must retain the traced one-group partial dispatch."""
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
