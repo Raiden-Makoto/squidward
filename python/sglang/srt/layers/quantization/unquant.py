@@ -818,6 +818,7 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
+        q_input: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert self.is_active(x.numel() // x.shape[-1]), (
             "GLM-5.3 KDA packed PTPC prefill requires an active token shape"
@@ -826,7 +827,8 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
 
         from sglang.srt.layers.quantization.fp8_utils import apply_fp8_ptpc_linear
 
-        q_input = aiter.per_token_quant_hip(x, quant_dtype=aiter.dtypes.fp8)
+        if q_input is None:
+            q_input = aiter.per_token_quant_hip(x, quant_dtype=aiter.dtypes.fp8)
         packed_output = apply_fp8_ptpc_linear(
             q_input,
             layer._fp8_ptpc_weight,
@@ -976,6 +978,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             and hasattr(layer, "dispatcher")
         ):
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+
+        if get_moe_a2a_backend().is_mori() and hasattr(layer, "dispatcher"):
+            # Resolve MORI dtype overrides and build the EPv2 op before KV cache sizing.
+            layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
 
         if self.use_flashinfer_cutlass:
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
@@ -1455,8 +1461,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 b1=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
                 activation=moe_runner_config.activation,
+                routed_scaling_factor=moe_runner_config.routed_scaling_factor,
                 gemm1_alpha=moe_runner_config.gemm1_alpha,
                 gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+                swiglu_limit=moe_runner_config.swiglu_limit,
             )
             return StandardCombineInput(hidden_states=output)
         else:
