@@ -867,8 +867,14 @@ class Glm5NextLinearAttention(nn.Module):
             cp_sequence_to_interleave_order,
         )
 
-        gathered_rows = hidden_states.shape[0]
-        hidden_states = cp_interleave_to_sequence_order(hidden_states, forward_batch)
+        bf16, prequant = self._split_mhc_prequant(hidden_states)
+        gathered_rows = bf16.shape[0]
+        hidden_states = cp_interleave_to_sequence_order(bf16, forward_batch)
+        if prequant is not None:
+            hidden_states = (
+                hidden_states,
+                *(cp_interleave_to_sequence_order(t, forward_batch) for t in prequant),
+            )
 
         if self.do_fuse_qkvbfg:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
