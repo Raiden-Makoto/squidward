@@ -22,6 +22,12 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-l
 register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
+_GLM53_GFX950_ONLY = unittest.skipUnless(
+    torch.cuda.is_available() and is_hip() and is_gfx95_supported(),
+    "the GLM-5.3 TileLang geometry is validated on gfx950",
+)
+
+
 class TestPackedRowInference(CustomTestCase):
     def test_packed_width_maps_to_one_layout(self):
         """A 64-wide RoPE tail adds 128 bytes and a NoPE tile adds 132, so no width is ambiguous."""
@@ -137,6 +143,47 @@ class TestPackedRowInference(CustomTestCase):
                 unsupported, topk_indices, "triton", "prefill"
             )
 
+    def test_glm53_aiter_sparse_mla_dispatch_bounds(self):
+        from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
+            DeepseekSparseAttnBackendKPoolMixin,
+        )
+        from sglang.srt.layers.attention.dsa_backend import _use_aiter_sparse_mla
+
+        for tokens in (1, 64, 4096):
+            self.assertFalse(_use_aiter_sparse_mla("triton", tokens, is_decode=True))
+            self.assertFalse(_use_aiter_sparse_mla("triton", tokens, is_decode=False))
+        for tokens in (1, 2, 4, 8, 12, 15):
+            self.assertFalse(
+                _use_aiter_sparse_mla("aiter_sparse_mla", tokens, is_decode=True)
+            )
+        for tokens in (16, 64, 512, 4096):
+            self.assertTrue(
+                _use_aiter_sparse_mla("aiter_sparse_mla", tokens, is_decode=True)
+            )
+        for tokens in (1, 64, 256):
+            self.assertTrue(
+                _use_aiter_sparse_mla("aiter_sparse_mla", tokens, is_decode=False)
+            )
+        for tokens in (257, 1024, 65536):
+            self.assertFalse(
+                _use_aiter_sparse_mla("aiter_sparse_mla", tokens, is_decode=False)
+            )
+
+        topk_indices = torch.empty(1, 2051, device="meta", dtype=torch.int32)
+        DeepseekSparseAttnBackendKPoolMixin._check_kpool_tail_backend(
+            SimpleNamespace(dsa_index_kpool=4, _triton_kpool_tail_supported=True),
+            topk_indices,
+            "aiter_sparse_mla",
+            "decode",
+        )
+        with self.assertRaises(NotImplementedError):
+            DeepseekSparseAttnBackendKPoolMixin._check_kpool_tail_backend(
+                SimpleNamespace(dsa_index_kpool=4, _triton_kpool_tail_supported=False),
+                topk_indices,
+                "aiter_sparse_mla",
+                "decode",
+            )
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "GPU required")
 class TestScaledCacheLayouts(CustomTestCase):
@@ -248,6 +295,7 @@ class TestTileLangDSAZeroRope(CustomTestCase):
             with self.subTest(use_fp8=use_fp8):
                 self._assert_matches_torch(use_fp8=use_fp8, d_v=512, d_tail=64)
 
+    @_GLM53_GFX950_ONLY
     def test_glm53_h16_d512_zero_rope_matches_torch(self):
         """Pin the GLM-5.3 TP4 sparse-attention head geometry and padded top-k."""
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
@@ -262,6 +310,7 @@ class TestTileLangDSAZeroRope(CustomTestCase):
         repeated = tilelang_sparse_fwd(q, kv, indices, scale, d_v=512).squeeze(0)
         torch.testing.assert_close(repeated, actual, atol=0, rtol=0)
 
+    @_GLM53_GFX950_ONLY
     def test_glm53_all_masked_rows_are_finite_zeros(self):
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
             tilelang_sparse_fwd,
@@ -272,6 +321,7 @@ class TestTileLangDSAZeroRope(CustomTestCase):
         self.assertTrue(torch.isfinite(actual).all())
         self.assertTrue(torch.equal(actual, torch.zeros_like(actual)))
 
+    @_GLM53_GFX950_ONLY
     def test_glm53_zero_rope_cuda_graph_replay(self):
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
             tilelang_sparse_fwd,
@@ -288,6 +338,7 @@ class TestTileLangDSAZeroRope(CustomTestCase):
         torch.cuda.synchronize()
         torch.testing.assert_close(captured, eager, atol=0, rtol=0)
 
+    @_GLM53_GFX950_ONLY
     def test_glm53_production_grids_are_finite(self):
         """M=8192/16384 must retain the traced one-group partial dispatch."""
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
@@ -494,6 +545,76 @@ class TestTritonDSAZeroRope(CustomTestCase):
                 self.assertTrue(torch.equal(actual, torch.zeros_like(actual)))
                 del q, indices, actual
                 empty_gpu_cache()
+
+
+def _aiter_sparse_mla_available():
+    try:
+        from aiter.ops.triton.attention.sparse_mla import sparse_mla_fwd  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available()
+    and is_hip()
+    and is_gfx95_supported()
+    and _aiter_sparse_mla_available(),
+    "AITER sparse_mla_fwd dispatch is gfx950-only",
+)
+class TestAiterSparseMlaDispatch(CustomTestCase):
+    @staticmethod
+    def _aiter(q, kv, indices):
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+        return DeepseekSparseAttnBackend._forward_aiter_sparse_mla(
+            None,
+            q_nope=q,
+            kv_cache=kv,
+            v_head_dim=512,
+            page_table_1=indices,
+            sm_scale=1.0 / math.sqrt(256),
+        )
+
+    @staticmethod
+    def _inputs(tokens, heads):
+        q, kv, indices = TestTileLangDSAZeroRope._bf16_inputs(
+            tokens=tokens, heads=heads
+        )
+        indices = indices[:, 0, :2051].contiguous()
+        indices[0, 100:] = -1
+        return q, kv, indices
+
+    def test_glm53_decode_and_prefill_match_triton(self):
+        for heads in (8, 16):
+            for tokens in (16, 64, 256):
+                with self.subTest(heads=heads, tokens=tokens):
+                    q, kv, indices = self._inputs(tokens, heads)
+                    actual = self._aiter(q, kv, indices)
+                    decode = TestTritonDSAZeroRope._run_decode(
+                        q, kv, indices.unsqueeze(1), []
+                    )
+                    prefill = TestTritonDSAZeroRope._run(q, kv, indices.unsqueeze(1))
+                    self.assertEqual(actual.shape, decode.shape)
+                    self.assertTrue(torch.isfinite(actual).all())
+                    torch.testing.assert_close(actual, decode, atol=0.04, rtol=0.04)
+                    torch.testing.assert_close(actual, prefill, atol=0.04, rtol=0.04)
+
+    def test_glm53_cuda_graph_replay(self):
+        for heads, tokens in ((16, 64), (8, 512)):
+            with self.subTest(heads=heads, tokens=tokens):
+                q, kv, indices = self._inputs(tokens, heads)
+                eager = self._aiter(q, kv, indices)
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = self._aiter(q, kv, indices)
+                q.copy_(torch.randn_like(q))
+                graph.replay()
+                torch.cuda.synchronize()
+                expected = self._aiter(q, kv, indices)
+                torch.testing.assert_close(captured, expected, atol=0, rtol=0)
+                self.assertFalse(torch.equal(captured, eager))
 
 
 if __name__ == "__main__":
