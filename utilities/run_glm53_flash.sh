@@ -62,7 +62,6 @@ case "${TP}" in
       --attention-backend dsa
       --context-length 65536
       --linear-attn-backend triton
-      --disable-shared-experts-fusion
       --max-running-requests 64
       --cuda-graph-backend-decode full
       --cuda-graph-max-bs-decode 64
