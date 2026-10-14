@@ -132,6 +132,7 @@ class ResidualReadout(Protocol):
         norm,
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
+        forward_batch=None,
     ) -> Tuple:
         """Read input from a residual that already includes the producer update.
 
@@ -168,6 +169,7 @@ class ResidualReadout(Protocol):
                 Each read documents where it applies, rejects or does not
                 apply it. A stream that arrives already written is read with
                 ``read``, which is not given it.
+            forward_batch: Active batch, when the readout needs phase-specific dispatch.
 
         Returns:
             (compute_input, residual). A fused implementation can preserve FP32
