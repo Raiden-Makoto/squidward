@@ -54,7 +54,18 @@ GB300 KDA projections are a BF16 `nvjet` GEMM; MI355X KDA projections are the AI
 
 Other KDA / dense kernels:
 
-- GB300 (9.7 ms): FlashInfer KDA prep, `o_proj` and `fused_fg_b_proj` GEMMs, gated RMSNorm, misc.
+- GB300 (9.7 ms):
+
+| GB300 kernels | ms |
+| --- | ---: |
+| `o_proj` BF16 GEMM (`nvjet`) | 4.0 |
+| KDA chunked-prefill FlashInfer `kernel_cutlass_kernel_prep`, elementwise, DtoH copy | 2.7 |
+| `o_proj` input gated RMSNorm (`layer_norm_gated_fwd_kernel`) | 1.0 |
+| `fused_fg_b_proj` BF16 GEMM (`nvjet`) | 1.0 |
+| Logits, embedding, final norm, sampler | 0.5 |
+| Decoder-layer mean reduce | 0.2 |
+| Unattributed | 0.3 |
+
 - MI355X (26.6 ms):
 
 | MI355X kernels | ms |
