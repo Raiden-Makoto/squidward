@@ -635,6 +635,227 @@ class TestGLM53KDAPTPC(CustomTestCase):
         self.assertEqual(call.args[0].shape, x_large.shape)
         self.assertIs(call.kwargs["quant_dtype"], fake_aiter.dtypes.fp8)
 
+    def test_w8a16_config_rows(self):
+        self.assertFalse(envs.SGLANG_OPT_GLM53_KDA_W8A16_DECODE.default)
+        small, large = {"cfg": "small"}, {"cfg": "large"}
+        method = Glm53KdaPtpcLinearMethod(
+            "o_proj", bf16_max_m=5631, w8a16_configs=((4, small), (16, large))
+        )
+        self.assertIsNone(method.w8a16_config(1))
+        method._fp8_ptpc_ready = True
+        expected = {0: None, 1: small, 4: small, 5: large, 16: large, 17: None}
+        for num_tokens, config in expected.items():
+            with self.subTest(num_tokens=num_tokens):
+                self.assertIs(method.w8a16_config(num_tokens), config)
+        no_table = Glm53KdaPtpcLinearMethod("o_proj", bf16_max_m=5631)
+        no_table._fp8_ptpc_ready = True
+        self.assertIsNone(no_table.w8a16_config(1))
+
+    def test_w8a16_dispatch_covers_table_rows_only(self):
+        config = {"cfg": 1}
+        method = Glm53KdaPtpcLinearMethod(
+            "o_proj", bf16_max_m=8, w8a16_configs=((4, config),)
+        )
+        method._fp8_ptpc_ready = True
+        method.output_size = 6
+        layer = _Linear(method)
+        layer.register_parameter(
+            "weight",
+            torch.nn.Parameter(torch.zeros(6, 8, dtype=torch.bfloat16)),
+        )
+        decode = torch.zeros(4, 8, dtype=torch.bfloat16)
+        padded = torch.arange(32, dtype=torch.bfloat16).view(4, 8)
+        bias = torch.ones(6, dtype=torch.bfloat16)
+        with patch.object(
+            Glm53KdaPtpcLinearMethod, "apply_w8a16", return_value=padded
+        ) as apply_w8a16:
+            output = method.apply(layer, decode, bias)
+            apply_w8a16.assert_called_once_with(layer, decode, config)
+            torch.testing.assert_close(output, padded[:, :6] + bias)
+            with (
+                patch.object(unquant, "_use_aiter", False),
+                patch.object(
+                    unquant.F, "linear", return_value=torch.zeros(5, 6)
+                ) as linear,
+            ):
+                method.apply(layer, torch.zeros(5, 8, dtype=torch.bfloat16))
+            linear.assert_called_once()
+            self.assertEqual(apply_w8a16.call_count, 1)
+
+    def _repack_with_fake_aiter(self, method, weight):
+        layer = _Linear(method)
+        layer.register_parameter(
+            "weight", torch.nn.Parameter(weight.clone(), requires_grad=False)
+        )
+        n = weight.shape[0]
+        fake_aiter = types.ModuleType("aiter")
+        fake_aiter.dtypes = SimpleNamespace(fp8=object())
+        scale = torch.arange(1, n + 1, dtype=torch.float32).view(n, 1)
+        fake_aiter.pertoken_quant = MagicMock(
+            side_effect=lambda w, quant_dtype: (w.float(), scale)
+        )
+        fake_ops = types.ModuleType("aiter.ops")
+        fake_shuffle = types.ModuleType("aiter.ops.shuffle")
+        fake_shuffle.shuffle_weight = MagicMock(side_effect=lambda w, layout: w)
+        with patch.dict(
+            sys.modules,
+            {
+                "aiter": fake_aiter,
+                "aiter.ops": fake_ops,
+                "aiter.ops.shuffle": fake_shuffle,
+            },
+        ):
+            method.process_weights_after_loading(layer)
+        return layer, scale
+
+    def test_w8a16_tile_counters_are_registered_only_when_enabled(self):
+        from sglang.kernels.ops.gemm import gfx95_a16w8_preshuffle
+
+        def config(block_m, block_n, num_ksplit):
+            return {
+                "BLOCK_SIZE_M": block_m,
+                "BLOCK_SIZE_N": block_n,
+                "BLOCK_SIZE_K": 128,
+                "NUM_KSPLIT": num_ksplit,
+            }
+
+        weight = torch.zeros(48, 512, dtype=torch.bfloat16)
+        layer, _ = self._repack_with_fake_aiter(
+            Glm53KdaPtpcLinearMethod("o_proj", bf16_max_m=0), weight
+        )
+        self.assertNotIn("_w8a16_tile_counters", dict(layer.named_buffers()))
+
+        table = ((4, config(8, 16, 4)), (64, config(64, 32, 2)))
+        with patch.object(gfx95_a16w8_preshuffle, "_is_gfx95", True):
+            layer, _ = self._repack_with_fake_aiter(
+                Glm53KdaPtpcLinearMethod("o_proj", bf16_max_m=0, w8a16_configs=table),
+                weight,
+            )
+            # The largest row tiling (M=4 -> 1 x 3 tiles; M=64 -> 1 x 2) wins.
+            torch.testing.assert_close(
+                layer._w8a16_tile_counters, torch.zeros(3, dtype=torch.int32)
+            )
+            self.assertNotIn("_w8a16_tile_counters", layer.state_dict())
+
+            with self.assertRaisesRegex(ValueError, "does not support"):
+                self._repack_with_fake_aiter(
+                    Glm53KdaPtpcLinearMethod(
+                        "o_proj", bf16_max_m=0, w8a16_configs=((4, config(8, 16, 8)),)
+                    ),
+                    torch.zeros(48, 512, dtype=torch.bfloat16),
+                )
+
+    def test_fused_first_stage_uses_w8a16_for_decode_rows(self):
+        attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+        torch.nn.Module.__init__(attention)
+        attention.head_dim = 4
+        attention.split_sizes = [12, 2, 8]
+        attention.fused_qkvbfg_a_proj = _RecordingFusedLinear(22)
+        attention.fused_fg_b_proj = _RecordingBatchedLinear()
+        config = {"cfg": 1}
+        method = Glm53KdaPackedPtpcLinearMethod(
+            bf16_max_m=8,
+            fp8_max_m=16,
+            qkv_size=12,
+            beta_size=2,
+            fg_size=8,
+            w8a16_configs=((2, config),),
+        )
+        method._fp8_ptpc_ready = True
+        attention.fused_qkvbfg_a_proj.quant_method = method
+        decode = torch.empty(2, 8)
+        outputs = (torch.empty(2, 12), torch.empty(2, 2), torch.empty(2, 8))
+        with patch.object(
+            method, "apply_w8a16_decode", return_value=outputs
+        ) as apply_decode:
+            attention.forward_qkvbfg_fused(decode, forward_batch=None)
+            apply_decode.assert_called_once_with(
+                attention.fused_qkvbfg_a_proj, decode, config
+            )
+            self.assertEqual(attention.fused_qkvbfg_a_proj.inputs, [])
+            bf16_input = torch.empty(3, 8)
+            attention.forward_qkvbfg_fused(bf16_input, forward_batch=None)
+            self.assertIs(attention.fused_qkvbfg_a_proj.inputs[-1], bf16_input)
+            self.assertEqual(apply_decode.call_count, 1)
+
+    def test_w8a16_decode_reads_beta_from_packed_fp8_output(self):
+        method = Glm53KdaPackedPtpcLinearMethod(
+            bf16_max_m=8,
+            fp8_max_m=16,
+            qkv_size=12,
+            beta_size=2,
+            fg_size=8,
+            w8a16_configs=((2, {}),),
+        )
+        self.assertTrue(method.fp8_beta)
+        self.assertFalse(
+            Glm53KdaPackedPtpcLinearMethod(
+                bf16_max_m=8, fp8_max_m=16, qkv_size=12, beta_size=2, fg_size=8
+            ).fp8_beta
+        )
+        packed_output = torch.arange(3 * 32, dtype=torch.float32).view(3, 32)
+        mm = MagicMock()
+        with (
+            patch.object(method, "apply_w8a16", return_value=packed_output),
+            patch.object(unquant, "tgemm", SimpleNamespace(mm=mm), create=True),
+        ):
+            qkv, beta, fg = method.apply_w8a16_decode(
+                torch.nn.Module(), torch.empty(3, 8), {}
+            )
+        torch.testing.assert_close(qkv, packed_output[:, :12])
+        torch.testing.assert_close(fg, packed_output[:, 12:20])
+        torch.testing.assert_close(beta, packed_output[:, 20:22])
+        mm.assert_not_called()
+
+    def test_model_selector_wires_w8a16_tables(self):
+        model_module = sys.modules[Glm5NextLinearAttention.__module__]
+        attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+        torch.nn.Module.__init__(attention)
+        with (
+            envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(""),
+            envs.SGLANG_OPT_GLM53_KDA_W8A16_DECODE.override(True),
+            self.assertRaisesRegex(ValueError, "requires SGLANG_OPT_GLM53_KDA_PTPC"),
+        ):
+            attention._configure_ptpc_modules()
+
+        attention.do_fuse_qkvbfg = True
+        attention.fuse_bfg = False
+        attention.split_sizes = [6144, 16, 256]
+        attention.fused_qkvbfg_a_proj = _Linear()
+        attention.fused_qkvbfg_a_proj.register_parameter(
+            "weight",
+            torch.nn.Parameter(torch.empty(6416, 4096, device="meta")),
+        )
+        attention.o_proj = _Linear()
+        attention.o_proj.register_parameter(
+            "weight",
+            torch.nn.Parameter(torch.empty(4096, 2048, device="meta")),
+        )
+        tables = {(6416, 4096): ((16, {"a": 1}),), (4096, 2048): ((64, {"b": 2}),)}
+        selector = "qkv_proj,f_a_proj,g_a_proj,o_proj"
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(selector),
+                envs.SGLANG_OPT_GLM53_KDA_W8A16_DECODE.override(enabled),
+                patch.object(model_module, "_use_aiter_gfx95", True),
+                patch.object(model_module, "GLM53_KDA_W8A16_DECODE_CONFIGS", tables),
+            ):
+                attention.fused_qkvbfg_a_proj.quant_method = UnquantizedLinearMethod()
+                attention.o_proj.quant_method = UnquantizedLinearMethod()
+                attention._configure_ptpc_modules()
+                self.assertEqual(
+                    attention.fused_qkvbfg_a_proj.quant_method.w8a16_configs,
+                    tables[(6416, 4096)] if enabled else None,
+                )
+                self.assertEqual(
+                    attention.fused_qkvbfg_a_proj.quant_method.fp8_beta, enabled
+                )
+                self.assertEqual(
+                    attention.o_proj.quant_method.w8a16_configs,
+                    tables[(4096, 2048)] if enabled else None,
+                )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)
