@@ -250,6 +250,12 @@ class IndexerKPool(MultiPlatformOp):
             )
         self.block_size = block_size
         self.scale_fmt = scale_fmt
+        self.fuse_hadamard_quant = (
+            envs.SGLANG_DSA_FUSE_HADAMARD_QUANT.get()
+            and is_gfx95_supported()
+            and self.head_dim == self.block_size
+            and (self.head_dim & (self.head_dim - 1)) == 0
+        )
         self.softmax_scale = self.head_dim**-0.5
 
     @torch.compile(dynamic=True)
@@ -337,6 +343,31 @@ class IndexerKPool(MultiPlatformOp):
         query, _ = self.wq_b(q_lora)
         query = rotate_activation(rearrange(query, "l (h d) -> l h d", d=d))
         return query, key, proj[:, d : 2 * d], proj[:, 2 * d :]
+
+    def _quant_query(self, query, act_quant, x, head_weights=None):
+        if not self.fuse_hadamard_quant:
+            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
+            return q_fp8, q_scale, weights
+
+        from sglang.kernels.ops.attention.dsa.triton_hadamard_quant import (
+            fused_hadamard_act_quant,
+        )
+
+        if head_weights is not None:
+            # head_weights is the unscaled weights_proj output.
+            return fused_hadamard_act_quant(
+                query,
+                self.block_size,
+                self.scale_fmt,
+                weights=head_weights,
+                softmax_scale=self.softmax_scale * self.n_heads**-0.5,
+            )
+        q_fp8, q_scale = fused_hadamard_act_quant(
+            query, self.block_size, self.scale_fmt
+        )
+        weights = self._get_logits_head_gate(x, q_scale)
+        return q_fp8, q_scale, weights
 
     def _can_overlap_prefill(
         self,
@@ -756,7 +787,7 @@ class IndexerKPool(MultiPlatformOp):
                 )
             if precompute_head_gate:
                 head_weights = self._project_head_gates(x)
-            if not apply_rope:
+            if not apply_rope and not self.fuse_hadamard_quant:
                 query = rotate_activation(query)
             with torch.cuda.stream(self.alt_stream):
                 key, _ = self.wk(x)
@@ -791,7 +822,7 @@ class IndexerKPool(MultiPlatformOp):
             query[..., : self.rope_head_dim] = q_rope
             key[..., : self.rope_head_dim] = k_rope
 
-        if apply_rope or not enable_dual_stream:
+        if (apply_rope or not enable_dual_stream) and not self.fuse_hadamard_quant:
             query = rotate_activation(query)
 
         return query, key, gate_score, head_weights
@@ -1724,16 +1755,18 @@ class IndexerKPool(MultiPlatformOp):
                 assert self.compress_gate_stream is not None
                 self.alt_stream.wait_stream(self.compress_gate_stream)
             if return_indices:
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
+                q_fp8, q_scale, weights = self._quant_query(
+                    query, act_quant, x, head_weights
+                )
             with torch.cuda.stream(self.alt_stream):
                 _compress_write()
             current_stream.wait_stream(self.alt_stream)
         else:
             _compress_write()
             if return_indices:
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
+                q_fp8, q_scale, weights = self._quant_query(
+                    query, act_quant, x, head_weights
+                )
 
         if not return_indices:
             return None
@@ -1902,15 +1935,16 @@ class IndexerKPool(MultiPlatformOp):
             with torch.cuda.stream(self.alt_stream):
                 kpool_extend_cache = compress_write()
             if return_indices:
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
+                q_fp8, q_scale, weights = self._quant_query(
+                    query, act_quant, x, head_weights
+                )
             current_stream.wait_stream(self.alt_stream)
         else:
             if return_indices:
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                q_fp8, q_scale, weights = self._quant_query(
+                    query, act_quant, x, head_weights
+                )
             kpool_extend_cache = compress_write()
-            if return_indices:
-                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
 
         if not return_indices:
             return None
