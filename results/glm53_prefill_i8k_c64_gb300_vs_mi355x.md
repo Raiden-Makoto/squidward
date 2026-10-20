@@ -34,9 +34,13 @@ The ratio column is MI355X ms divided by GB300 ms; values above 1.00× mean MI35
 
 | Component | GB300 ms | MI355X ms | MI355X / GB300 |
 | --- | ---: | ---: | ---: |
-| Routed experts | 29.7 | 50.5 | 1.70× |
-| Routing / sort / quant | 11.0 | 9.1 | 0.83× |
+| Routed experts gate-up | 11.9 | 15.8 | 1.33× |
+| Routed experts down + combine | 17.8 | 34.6 | 1.95× |
+| Shared-expert MLP + add | 7.3 | fused into routed experts | — |
+| Routing / sort / quant | 3.7 | 9.1 | 2.46× |
 | **MoE subtotal** | **40.7** | **59.6** | **1.46×** |
+
+GB300 gate-up is TRT-LLM NVFP4 `bmm_E2m1`; down + combine is `bmm_Bfloat16_E2m1` plus `finalizeKernelVecLoad`. MI355X gate-up is AITER `mfma_moe1_silu_mul_afp4_wfp4`; down + combine is `mfma_moe2_afp4_wfp4_…_cshuffle`, which writes the combined output itself. MI355X fuses the shared expert into these kernels as a ninth expert per token; GB300 runs it as separate BF16 `nvjet` GEMMs, SiLU, and a residual add. With shared-expert work included on both sides, GB300 spends 37.0 ms and MI355X 50.5 ms (1.36×).
 
 ## Dense GEMM
 
