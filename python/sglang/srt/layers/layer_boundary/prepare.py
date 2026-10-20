@@ -151,7 +151,6 @@ def _reduce_update_read(
         norm,
         quant_format=quant_format,
         post_residual_addition=post_residual_addition,
-        forward_batch=forward_batch,
     )
 
 
@@ -187,11 +186,11 @@ def _reduce_update_read_dp_gather(
             disabled=not is_allocation_symmetric(),
         ):
             hidden_states, residual = read.update_and_read(
-                update, hidden_states, residual, norm, forward_batch=forward_batch
+                update, hidden_states, residual, norm
             )
     else:
         hidden_states, residual = read.update_and_read(
-            update, hidden_states, residual, norm, forward_batch=forward_batch
+            update, hidden_states, residual, norm
         )
     cp_shard_counts = _cp_shard_token_rows(forward_batch) if places_cp_shards else None
     return (
@@ -366,7 +365,6 @@ def _update_read(
         norm,
         quant_format=quant_format,
         post_residual_addition=post_residual_addition,
-        forward_batch=forward_batch,
     )
 
 
@@ -394,9 +392,7 @@ def _attn_tp_reduce_scatter_update_read(
     hidden_states = attn_tp_reduce_scatter(hidden_states)
     if scatters_residual and residual is not None:
         residual = update.slice_residual_attn_tp(residual)
-    return read.update_and_read(
-        update, hidden_states, residual, norm, forward_batch=forward_batch
-    )
+    return read.update_and_read(update, hidden_states, residual, norm)
 
 
 def _attn_tp_slice_update_read(
@@ -413,9 +409,7 @@ def _attn_tp_slice_update_read(
     hidden_states = attn_tp_slice(hidden_states).clone()
     if scatters_residual and residual is not None:
         residual = update.slice_residual_attn_tp(residual)
-    return read.update_and_read(
-        update, hidden_states, residual, norm, forward_batch=forward_batch
-    )
+    return read.update_and_read(update, hidden_states, residual, norm)
 
 
 def _tp_reduce_scatter_update_read_gather(
@@ -441,9 +435,7 @@ def _tp_reduce_scatter_update_read_gather(
         parallel.tp_group.reduce_scatter_tensor(shard, hidden_states)
     else:
         shard = shard.clone()
-    shard, residual = read.update_and_read(
-        update, shard, residual, norm, forward_batch=forward_batch
-    )
+    shard, residual = read.update_and_read(update, shard, residual, norm)
     attn_tp_all_gather_into_tensor(hidden_states, shard)
     return hidden_states, residual
 

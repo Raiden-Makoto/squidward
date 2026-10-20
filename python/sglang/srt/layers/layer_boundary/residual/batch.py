@@ -129,10 +129,7 @@ def to_pp(hidden_states, forward_batch):
     and is sent as hidden_states alone; the receiver's from_pp reconstructs it
     as written.
     """
-    stream = stream_of(forward_batch)
-    if stream.pending is not None and not stream.pending.update.is_plain_add:
-        hidden_states = stream.flush_update(hidden_states)
-    hidden_states, residual = stream.export(hidden_states)
+    hidden_states, residual = stream_of(forward_batch).export(hidden_states)
     forward_batch.residual_stream = None
     tensors = {"hidden_states": hidden_states}
     if residual is not None:

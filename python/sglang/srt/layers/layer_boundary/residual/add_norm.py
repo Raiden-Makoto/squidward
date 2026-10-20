@@ -353,7 +353,6 @@ class NormQuantReadout:
         norm,
         quant_format="",
         post_residual_addition=None,
-        forward_batch=None,
     ):
         if not update.is_plain_add:
             return self.read(update.update(hidden_states, residual), norm, quant_format)
@@ -397,7 +396,6 @@ class NormReadout:
         norm,
         quant_format="",
         post_residual_addition=None,
-        forward_batch=None,
     ):
         if residual is None:
             # The layer stack starts at this stage: its input is the residual.
@@ -431,7 +429,6 @@ class UnfusedNormReadout(NormReadout):
         norm,
         quant_format="",
         post_residual_addition=None,
-        forward_batch=None,
     ):
         if residual is not None:
             hidden_states = update.update(hidden_states, residual)
