@@ -52,6 +52,22 @@ The ratio column is MI355X ms divided by GB300 ms; values above 1.00× mean MI35
 
 GB300 KDA projections are a BF16 `nvjet` GEMM; MI355X KDA projections are the AITER per-token/per-channel FP8 GEMM.
 
+Other KDA / dense kernels:
+
+- GB300 (9.7 ms): FlashInfer KDA prep, `o_proj` and `fused_fg_b_proj` GEMMs, gated RMSNorm, misc.
+- MI355X (26.6 ms):
+
+| MI355X kernels | ms |
+| --- | ---: |
+| KDA chunked-prefill Triton kernels (`chunk_gla_fwd_kernel_o`, `_recompute_w_u_fwd_kernel`, `chunk_kda_fwd_kernel_intra_sub_chunk`, `chunk_kda_fwd_kernel_inter_solve_fused`, `kda_gate_chunk_cumsum_vector_kernel`, `l2norm_fwd_kernel`, elementwise) | 16.0 |
+| `o_proj` FP8 GEMM (FlyDSL) | 3.7 |
+| `o_proj` input gated RMSNorm to FP8 | 1.8 |
+| KDA per-token FP8 quant and two hipBLASLt GEMMs | 1.8 |
+| `fused_fg_b_proj` BF16 GEMM (hipBLASLt) | 1.5 |
+| Decoder-layer DtoD copy, elementwise, mean reduce | 0.9 |
+| Logits, embedding, final norm, sampler | 0.2 |
+| Unattributed | 0.7 |
+
 ## Communication and normalization
 
 | Component | GB300 ms | MI355X ms | MI355X / GB300 |
