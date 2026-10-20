@@ -51,23 +51,7 @@ The 68 HtoD events total 0.09 ms across the four forwards, so the K-pool plan tr
 
 The all-reduce value is not a production timing claim. The same 364 NCCL calls total 42.2 ms/forward in the warmed graphs-on formal trace, so the 73.6 ms graphs-off value includes cross-rank waiting.
 
-## Lever ranking — excluding all-reduce and parity/faster rows
-
-The ranking uses the same rows as the MI355X ranking. mHC pre RMSNorm is added because the graphs-on cross-check reproduces it as standalone kernel work.
-
-| Rank | Lever | GB300 ms | % of total | Work class |
-| ---: | --- | ---: | ---: | --- |
-| 1 | Routed MoE expert kernel | 29.7 | 12.4% | Kernel work |
-| 2 | Sparse MLA | 28.5 | 12.0% | Kernel work |
-| 3 | mHC post | 13.7 | 5.7% | Kernel work |
-| 4 | KDA projections | 12.5 | 5.2% | Kernel work |
-| 5 | mHC pre RMSNorm | 9.3 | 3.9% | Kernel work |
-| 6 | mHC pre sqrsum | 8.4 | 3.5% | Kernel work |
-| 7 | KDA state/output | 7.9 | 3.3% | Kernel work |
-| 8 | KDA tensor materialization | 7.3 | 3.1% | Memory / launch work |
-| 9 | Causal convolution | 3.9 | 1.6% | Kernel work |
-
-### Graphs-on formal cross-check
+## Graphs-on formal cross-check
 
 The formal capture uses the same source, model, image, TP, workload, and warmup, with the cookbook command's CUDA graphs enabled (no `--disable-cuda-graph`). It also scored 100% on GSM8K-20 with zero errors. Both captures ran the same four EXTEND batches (8,192, 16,309, and 2× 16,384 tokens), which exceed the captured prefill graph shapes, so the EXTEND trace records no graph launches.
 
