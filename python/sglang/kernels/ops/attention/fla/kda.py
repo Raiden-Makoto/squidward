@@ -19,6 +19,10 @@ from sglang.kernels.ops.attention.fla.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_o_128,
 )
 from sglang.kernels.ops.attention.fla.chunk_intra import chunk_kda_fwd_intra
+from sglang.kernels.ops.attention.fla.chunk_kda_chain_gfx950 import (
+    can_use_kda_chain_prefill,
+    chunk_kda_chain_fwd,
+)
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.fused_norm_gate import layer_norm_gated_fwd
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
@@ -1285,6 +1289,35 @@ def chunk_kda_fwd(
         fuse_diagonal=_fuse_intra,
         fuse_recompute=_fuse_intra,
     )
+
+    if can_use_kda_chain_prefill(
+        q=q,
+        k=kg,
+        v=u,
+        w=w,
+        gk=g,
+        A=Aqk,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens,
+        output_intermediate_states=output_intermediate_states,
+        track_state=track_state,
+    ):
+        o = chunk_kda_chain_fwd(
+            q=q,
+            k=kg,
+            v=u,
+            w=w,
+            gk=g,
+            A=Aqk,
+            scale=scale,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=cu_seqlens,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
+        )
+        del w, u, kg, Aqk
+        return (o, None) if output_intermediate_states else o
 
     use_fused_state_output = (
         not output_intermediate_states
