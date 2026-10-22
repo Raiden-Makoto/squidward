@@ -127,6 +127,55 @@ def test_aiter_chunk_kda_invalid_state_index():
     assert torch.equal(actual_args["initial_state"][1], before[1])
 
 
+def test_aiter_chunk_kda_deterministic():
+    inputs = _inputs([65, 127, 192], heads=8, seed=23)
+    first_args = _clone(inputs)
+    first_output = aiter_chunk_kda_fwd(
+        **first_args,
+        lower_bound=-5.0,
+        scale=128**-0.5,
+    )
+    second_args = _clone(inputs)
+    second_output = aiter_chunk_kda_fwd(
+        **second_args,
+        lower_bound=-5.0,
+        scale=128**-0.5,
+    )
+    assert torch.equal(first_output, second_output)
+    assert torch.equal(first_args["initial_state"], second_args["initial_state"])
+
+
+def test_aiter_chunk_kda_graph_replay():
+    args = _inputs([65, 127], heads=8, seed=29)
+    value_seed = args["v"].clone()
+    state_seed = args["initial_state"].clone()
+    for _ in range(3):
+        args["v"].copy_(value_seed)
+        args["initial_state"].copy_(state_seed)
+        aiter_chunk_kda_fwd(
+            **args,
+            lower_bound=-5.0,
+            scale=128**-0.5,
+        )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        args["v"].copy_(value_seed)
+        args["initial_state"].copy_(state_seed)
+        output = aiter_chunk_kda_fwd(
+            **args,
+            lower_bound=-5.0,
+            scale=128**-0.5,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    first_output = output.clone()
+    first_state = args["initial_state"].clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(output, first_output)
+    assert torch.equal(args["initial_state"], first_state)
+
+
 def _dispatch_args(heads, sequences):
     q = torch.empty((1, 16384, heads, 128), device="meta", dtype=torch.bfloat16)
     return {
