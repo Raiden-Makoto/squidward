@@ -88,3 +88,31 @@ The formal capture uses the same source, model, image, TP, workload, selectors, 
 A stalled launch is one longer than 1 ms and more than 20 times its kernel's median duration. Both traces contain 102 fused `chunk_kda_prepare` and 102 `chunk_kda_walk` launches, covering three of the four forwards. The remaining forward, a single 8,192-token sequence, falls outside #45913's dispatch cells and runs the separate path, including 34 `_recompute_w_u_fwd_kernel` launches (1.6 ms across four forwards).
 
 Raw artifacts are under `/data2/hf_home/glm53_mxfp4_prefill_profile_1023_tunedmoe_45913` on `smci355-ccs-aus-m15-21`. The graphs-off TP0 EXTEND trace is `mapping/traces/1792779655.9427779/1792779655.9446695-TP-0-EXTEND.trace.json.gz`; the graphs-on cross-check is `formal/traces/1792780709.9467244/1792780709.9485676-TP-0-EXTEND.trace.json.gz`.
+
+## Decode — i1k/o1k conc64, TP4
+
+ms per decode step, TP0 DECODE trace, batch 64, `utilities/e2e_glm53_flash.sh 1024 1024 1`, conc64 num256, `--profile-num-steps 4 --profile-by-stage`, same source, image, AITER, model, and selectors as the prefill tables above. Timings come from the graphs-on formal capture; the ROCm tracer recorded kernels for one of its four decode-graph replays (the last), so the table is that single step. Median ITL for the run is 12.1 ms (TPOT 12.5 ms); GSM8K-20 scored 95% (formal) and 100% (mapping) with zero errors.
+
+| Component | MI355X kernel | MI355X ms/step | % of step | Launches |
+| --- | --- | ---: | ---: | ---: |
+| MoE gate-up | AITER FlyDSL A4W4 `gemm1_a4w4_port` | 2.97 | 22.3% | 42 |
+| MoE down + combine | AITER FlyDSL A4W4 `gemm2_a4w4_port` | 1.55 | 11.6% | 42 |
+| MoE routing / sort / quant / gate | OPUS sorting, grouped top-k, shared-expert append, FP4 activation quant | 1.02 | 7.7% | 222 |
+| **MoE subtotal** | | **5.54** | **41.6%** | |
+| Dense GEMMs | W8A16, PTPC FP8, block-FP8 and BF16 projection GEMMs | 2.39 | 17.9% | 239 |
+| KDA recurrent state update | `kda_packed_decode_rowstream_kernel` | 0.98 | 7.4% | 34 |
+| KDA causal conv update | `_causal_conv1d_update_kernel` | 0.17 | 1.3% | 34 |
+| KDA gated RMSNorm | `layer_norm_gated_fwd_kernel` | 0.15 | 1.1% | 34 |
+| Sparse MLA decode | Triton `_sparse_mla` decode | 0.36 | 2.7% | 22 |
+| DSA indexer | top-k, MQA logits, Hadamard, cache | 0.38 | 2.9% | 75 |
+| All-reduce | AITER `cross_device_reduce_2stage` | 1.10 | 8.2% | 91 |
+| mHC pre RMSNorm | `mhc_pre_big_fuse_rmsnorm_kernel` | 0.51 | 3.8% | 90 |
+| mHC post | `mhc_post_kernel` | 0.42 | 3.2% | 90 |
+| mHC pre sqrsum | `mhc_pre_gemm_sqrsum_kernel` | 0.42 | 3.1% | 90 |
+| FP8 activation quant | AITER `dynamic_per_group_scaled_quant` | 0.15 | 1.1% | 36 |
+| Other | allgather, elementwise, RMSNorm/RoPE, sampler, misc | 0.75 | 5.6% | 141 |
+| **TOTAL** | | **13.34** | **100.0%** | **1282** |
+
+The graphs-off mapping capture (`--profile --cuda-graph-backend-decode disabled`, so decode runs without graphs) recorded all four steps with module attribution. Its kernel work excluding all-reduce is 13.1 ms/step, consistent with the table; its all-reduce row (34.5 ms/step) is cross-rank waiting caused by eager launch overhead and is not a timing claim.
+
+Raw artifacts are under `/data2/hf_home/glm53_mxfp4_decode_profile_1023_i1k_o1k_45913` on `smci355-ccs-aus-m15-21`. The graphs-on trace is `formal/traces/1792789147.3445837/1792789147.3463824-TP-0-DECODE.trace.json.gz`; the graphs-off trace is `mapping/traces/1792787765.026541/1792787765.0284014-TP-0-DECODE.trace.json.gz`.
