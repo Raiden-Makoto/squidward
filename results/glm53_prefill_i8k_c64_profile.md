@@ -1,6 +1,6 @@
 # GLM-5.3-Flash prefill — i8k/o16 conc64, TP4 — MI355X (MXFP4 integrated base, tuned MoE, fused KDA prefill)
 
-ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e_glm53_flash.sh 8192 16 1`, conc64 num256, `--profile-num-steps 4 --profile-by-stage`, `RM/glm53` `bb1a9c3718` (includes [#45913](https://github.com/sgl-project/sglang/pull/45913)) run from `/sgl-workspace/squidward` in `macui-glm53-new` on `smci355-ccs-aus-m15-21` with `utilities/run_glm53_flash.sh --mxfp4`, script snapshot `6aef5d5fc2`, AITER `313f86a7d` (includes ROCm/aiter#5866 and #6672) with the [#6435](https://github.com/ROCm/aiter/pull/6435) MXFP4 MoE configs and the four 16384-token rows posted there; `SGLANG_OPT_KDA_FUSED_PREFILL=1`, `SGLANG_OPT_GLM53_KDA_PTPC_MODULES=qkv_proj,f_a_proj,g_a_proj,o_proj`, `SGLANG_OPT_GLM53_KDA_W8A16_DECODE=1`, `SGLANG_DSA_FUSE_HADAMARD_QUANT=1`, `aiter_sparse_mla` DSA prefill/decode backends, shared-expert fusion enabled, INT4 QuickReduce. MI355X image `rocm/sgl-dev:v0.5.22-rocm724-mi35x-20261019`; model snapshot `amd/GLM-5.3-Flash-Quark-MXFP4@b5688f25491202978c19c4d036eef579f61bbe07`. GSM8K-20 scored 95% with zero errors and zero truncation.
+ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e_glm53_flash.sh 8192 16 1`, conc64 num256, `--profile-num-steps 4 --profile-by-stage`, `RM/glm53` `bb1a9c3718` (includes [#45913](https://github.com/sgl-project/sglang/pull/45913)) run from `/sgl-workspace/squidward` in `macui-glm53-new` on `smci355-ccs-aus-m15-21` with `utilities/run_glm53_flash.sh --mxfp4`, script snapshot `6aef5d5fc2`, AITER `313f86a7d` (head of the ROCm/aiter#6672 branch, which includes #5866) with the [#6435](https://github.com/ROCm/aiter/pull/6435) MXFP4 MoE configs and the four 16384-token rows posted there; `SGLANG_OPT_KDA_FUSED_PREFILL=1`, `SGLANG_OPT_GLM53_KDA_PTPC_MODULES=qkv_proj,f_a_proj,g_a_proj,o_proj`, `SGLANG_OPT_GLM53_KDA_W8A16_DECODE=1`, `SGLANG_DSA_FUSE_HADAMARD_QUANT=1`, `aiter_sparse_mla` DSA prefill/decode backends, shared-expert fusion enabled, INT4 QuickReduce. MI355X image `rocm/sgl-dev:v0.5.22-rocm724-mi35x-20261019`; model snapshot `amd/GLM-5.3-Flash-Quark-MXFP4@b5688f25491202978c19c4d036eef579f61bbe07`. GSM8K-20 scored 95% with zero errors.
 
 The table values are summed profiler-event durations divided by four EXTEND forwards. They are not GPU-busy time: overlapping events can double-count, and the K-pool HtoD spans and the stalled launches noted below overlap other GPU work for their whole duration.
 
@@ -77,7 +77,7 @@ The formal capture uses the same source, model, image, TP, workload, selectors, 
 | Component | Graphs-off ms/fwd | Graphs-on ms/fwd | Interpretation |
 | --- | ---: | ---: | --- |
 | K-pool HtoD spans | 192.6 | 199.0 | Spans that overlap other kernels, not copy bandwidth |
-| Other stalled launches | 120.9 | 116.8 | Spans land on different kernels: MoE sorting graphs-off; MLA `add_rmsnorm_quant` and `moe_reduction` graphs-on |
+| Other stalled launches | 120.9 | 116.8 | Spans land on different kernels: MoE sorting graphs-off; MLA `add_rmsnorm_quant`, `moe_reduction`, and `alloc_extend_kernel` graphs-on |
 | mHC pre RMSNorm | 8.9 | 8.9 | Same in both traces |
 | Routed MoE | 37.1 | 37.3 | Same in both traces (graphs-on excludes its `moe_reduction` span) |
 | Sparse MLA | 37.6 | 38.1 | Stable on the Triton path |
@@ -85,13 +85,13 @@ The formal capture uses the same source, model, image, TP, workload, selectors, 
 | **Summed event duration** | **549.4** | **551.8** | Diagnostic only; overlapping events are not GPU-busy time |
 | **Summed event duration excluding stalls** | **235.9** | **236.1** | Same work in both traces |
 
-A stalled launch is one longer than 1 ms and more than 20 times its kernel's median duration. Both traces contain 102 fused `chunk_kda_prepare` and 102 `chunk_kda_walk` launches, covering three of the four forwards. The remaining forward, a single 8,192-token sequence, falls outside #45913's dispatch cells and runs the separate path, including 34 `_recompute_w_u_fwd_kernel` launches (1.6 ms across four forwards).
+A stalled launch is one longer than 1 ms and more than 20 times its kernel's median duration. Both traces contain 102 fused `chunk_kda_prepare` and 102 `chunk_kda_walk` launches, covering three of the four forwards. The remaining forward falls outside #45913's dispatch cells and runs the separate path, including 34 `_recompute_w_u_fwd_kernel` launches (1.6 ms across four forwards).
 
 Raw artifacts are under `/data2/hf_home/glm53_mxfp4_prefill_profile_1023_tunedmoe_45913` on `smci355-ccs-aus-m15-21`. The graphs-off TP0 EXTEND trace is `mapping/traces/1792779655.9427779/1792779655.9446695-TP-0-EXTEND.trace.json.gz`; the graphs-on cross-check is `formal/traces/1792780709.9467244/1792780709.9485676-TP-0-EXTEND.trace.json.gz`.
 
 ## Decode — i1k/o1k conc64, TP4
 
-ms per decode step, TP0 DECODE trace, batch 64, `utilities/e2e_glm53_flash.sh 1024 1024 1`, conc64 num256, `--profile-num-steps 4 --profile-by-stage`, same source, image, AITER, model, and selectors as the prefill tables above. Timings come from the graphs-on formal capture; the ROCm tracer recorded kernels for one of its four decode-graph replays (the last), so the table is that single step. Median ITL for the run is 12.1 ms (TPOT 12.5 ms); GSM8K-20 scored 95% (formal) and 100% (mapping) with zero errors.
+ms per decode step, TP0 DECODE trace, batch 64, `utilities/e2e_glm53_flash.sh 1024 1024 1`, conc64 num256, `--profile-num-steps 4 --profile-by-stage`, same source, image, AITER, model, and selectors as the prefill tables above. Timings come from the graphs-on formal capture; the ROCm tracer recorded kernels for one of its four decode-graph replays (the last), so the table is that single step. Median ITL for the run is 12.1 ms (TPOT 12.5 ms); GSM8K-20 scored 95% (formal) and 100% (mapping).
 
 | Component | MI355X kernel | MI355X ms/step | % of step | Launches |
 | --- | --- | ---: | ---: | ---: |
@@ -105,7 +105,7 @@ ms per decode step, TP0 DECODE trace, batch 64, `utilities/e2e_glm53_flash.sh 10
 | KDA gated RMSNorm | `layer_norm_gated_fwd_kernel` | 0.15 | 1.1% | 34 |
 | Sparse MLA decode | Triton `_sparse_mla` decode | 0.36 | 2.7% | 22 |
 | DSA indexer | top-k, MQA logits, Hadamard, cache | 0.38 | 2.9% | 75 |
-| All-reduce | AITER `cross_device_reduce_2stage` | 1.10 | 8.2% | 91 |
+| All-reduce | AITER custom all-reduce | 1.10 | 8.2% | 91 |
 | mHC pre RMSNorm | `mhc_pre_big_fuse_rmsnorm_kernel` | 0.51 | 3.8% | 90 |
 | mHC post | `mhc_post_kernel` | 0.42 | 3.2% | 90 |
 | mHC pre sqrsum | `mhc_pre_gemm_sqrsum_kernel` | 0.42 | 3.1% | 90 |
@@ -113,6 +113,6 @@ ms per decode step, TP0 DECODE trace, batch 64, `utilities/e2e_glm53_flash.sh 10
 | Other | allgather, elementwise, RMSNorm/RoPE, sampler, misc | 0.75 | 5.6% | 141 |
 | **TOTAL** | | **13.34** | **100.0%** | **1282** |
 
-The graphs-off mapping capture (`--profile --cuda-graph-backend-decode disabled`, so decode runs without graphs) recorded all four steps with module attribution. Its kernel work excluding all-reduce is 13.1 ms/step, consistent with the table; its all-reduce row (34.5 ms/step) is cross-rank waiting caused by eager launch overhead and is not a timing claim.
+The graphs-off mapping capture (`--profile --cuda-graph-backend-decode disabled`, so decode runs without graphs) recorded all four steps with module attribution. Excluding all-reduce, its kernel work is 13.1 ms/step versus 12.2 ms/step for the graphs-on step above; its all-reduce row (34.5 ms/step) is cross-rank waiting caused by eager launch overhead and is not a timing claim.
 
 Raw artifacts are under `/data2/hf_home/glm53_mxfp4_decode_profile_1023_i1k_o1k_45913` on `smci355-ccs-aus-m15-21`. The graphs-on trace is `formal/traces/1792789147.3445837/1792789147.3463824-TP-0-DECODE.trace.json.gz`; the graphs-off trace is `mapping/traces/1792787765.026541/1792787765.0284014-TP-0-DECODE.trace.json.gz`.

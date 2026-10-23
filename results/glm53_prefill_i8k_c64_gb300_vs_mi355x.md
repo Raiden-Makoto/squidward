@@ -8,7 +8,7 @@ ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e
 | Source | `RM/glm53` `84bd7ab188` | `RM/glm53` `bb1a9c3718` with [#45913](https://github.com/sgl-project/sglang/pull/45913) fused KDA prefill (`SGLANG_OPT_KDA_FUSED_PREFILL=1`) |
 | Model | `nvidia/GLM-5.3-Flash-NVFP4@da920bb0b9f4a06727223a349e55468e38352348` | `amd/GLM-5.3-Flash-Quark-MXFP4@b5688f25491202978c19c4d036eef579f61bbe07` |
 | Image | `lmsysorg/sglang:latest@sha256:e3a4f06001a29542fc4a8638536d9ffc5eb9c9942b08603c09b19a56eae4a1ae` | `rocm/sgl-dev:v0.5.22-rocm724-mi35x-20261019` |
-| AITER | — | `313f86a7d` (includes ROCm/aiter#5866 and #6672) with [#6435](https://github.com/ROCm/aiter/pull/6435) MXFP4 MoE configs and the four 16384-token rows posted there |
+| AITER | — | `313f86a7d` (head of the ROCm/aiter#6672 branch, which includes #5866) with [#6435](https://github.com/ROCm/aiter/pull/6435) MXFP4 MoE configs and the four 16384-token rows posted there |
 | DSA backend | TRT-LLM prefill/decode | `aiter_sparse_mla` prefill/decode (Triton sparse MLA at this batch) |
 | KV cache | `fp8_e4m3` | `bfloat16` |
 | MoE runner | `flashinfer_trtllm` | `aiter` |
