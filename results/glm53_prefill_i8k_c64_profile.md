@@ -2,73 +2,83 @@
 
 ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e_glm53_flash.sh 8192 16 1`, conc64 num256, `--profile-num-steps 4 --profile-by-stage`, `RM/glm53` `bb1a9c3718` (includes [#45913](https://github.com/sgl-project/sglang/pull/45913)) run from `/sgl-workspace/squidward` in `macui-glm53-new` on `smci355-ccs-aus-m15-21` with `utilities/run_glm53_flash.sh --mxfp4`, script snapshot `6aef5d5fc2`, AITER `313f86a7d` (head of the ROCm/aiter#6672 branch, which includes #5866) with the [#6435](https://github.com/ROCm/aiter/pull/6435) MXFP4 MoE configs and the four 16384-token rows posted there; `SGLANG_OPT_KDA_FUSED_PREFILL=1`, `SGLANG_OPT_GLM53_KDA_PTPC_MODULES=qkv_proj,f_a_proj,g_a_proj,o_proj`, `SGLANG_OPT_GLM53_KDA_W8A16_DECODE=1`, `SGLANG_DSA_FUSE_HADAMARD_QUANT=1`, `aiter_sparse_mla` DSA prefill/decode backends, shared-expert fusion enabled, INT4 QuickReduce. MI355X image `rocm/sgl-dev:v0.5.22-rocm724-mi35x-20261019`; model snapshot `amd/GLM-5.3-Flash-Quark-MXFP4@b5688f25491202978c19c4d036eef579f61bbe07`. GSM8K-20 scored 95% with zero errors.
 
-The table values are summed profiler-event durations divided by four EXTEND forwards. They are not GPU-busy time: overlapping events can double-count, and the K-pool HtoD spans and the stalled launches noted below overlap other GPU work for their whole duration.
+The table values are summed profiler-event durations divided by four EXTEND forwards. They exclude eight trace spans that overlap other GPU work for their whole duration; those spans are listed under [Overlapping trace spans](#overlapping-trace-spans) and are not counted in any row or total.
 
 ## Attention
 
 | Component | MI355X kernel | MI355X ms | % of total |
 | --- | --- | ---: | ---: |
-| K-pool plan transfer/wait | pinned HtoD from `_kpool_plan_to_gpu` | 192.7 | 35.1% |
-| MLA FP8 activation quant | AITER `dynamic_per_group_scaled_quant` from `aiter_w8a8_block_fp8_linear` | 0.9 | 0.2% |
-| Sparse MLA | Triton `_sparse_mla_fwd_split_dim_kernel` | 37.6 | 6.8% |
-| DSA top-k | `kpool_topk_transform_kernel<512>` | 2.4 | 0.4% |
-| DSA MQA logits | Gluon FP8 MQA logits | 0.8 | 0.2% |
-| DSA prep/store + misc | MLA and indexer projection GEMMs, fused Hadamard quant, norm/cache assembly, remaining attention kernels | 13.6 | 2.5% |
-| **Attention subtotal** | | **248.0** | **45.1%** |
-
-The four large HtoD events move only 64–128 KiB each but span 127–215 ms in the eager trace, while 1,421–1,460 other kernels run during each one. Their computed bandwidth is approximately 0.0005–0.0006 GB/s, so the recorded duration is a span, not transfer work.
+| K-pool plan transfer/wait | pinned HtoD from `_kpool_plan_to_gpu` | 0.0 | 0.0% |
+| MLA FP8 activation quant | AITER `dynamic_per_group_scaled_quant` from `aiter_w8a8_block_fp8_linear` | 0.9 | 0.4% |
+| Sparse MLA | Triton `_sparse_mla_fwd_split_dim_kernel` | 37.6 | 15.9% |
+| DSA top-k | `kpool_topk_transform_kernel<512>` | 2.4 | 1.0% |
+| DSA MQA logits | Gluon FP8 MQA logits | 0.8 | 0.4% |
+| DSA prep/store + misc | MLA and indexer projection GEMMs, fused Hadamard quant, norm/cache assembly, remaining attention kernels | 13.6 | 5.8% |
+| **Attention subtotal** | | **55.3** | **23.5%** |
 
 ## MoE
 
 | Component | MI355X kernel | MI355X ms | % of total |
 | --- | --- | ---: | ---: |
-| Routed experts | AITER FlyDSL A4W4 `gemm1_a4w4_port` and `gemm2_a4w4_port`, plus `scatter_reduce` / `moe_reduction` | 37.1 | 6.8% |
-| Routing / sort / quant | OPUS sorting, MXFP4 MoE sort, gate GEMM, grouped top-k, shared-expert append, FP4 activation quant | 129.0 | 23.5% |
-| **MoE subtotal** | | **166.1** | **30.2%** |
+| Routed experts | AITER FlyDSL A4W4 `gemm1_a4w4_port` and `gemm2_a4w4_port`, plus `scatter_reduce` / `moe_reduction` | 37.1 | 15.7% |
+| Routing / sort / quant | OPUS sorting, MXFP4 MoE sort, gate GEMM, grouped top-k, shared-expert append, FP4 activation quant | 8.0 | 3.4% |
+| **MoE subtotal** | | **45.1** | **19.1%** |
 
-Every MoE token bucket dispatches a tuned row; the 16384-token bucket uses `flydsl_mxmoe_g1_a4w4_128x256x256_xcd4` with `flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x256_scatter_sbm128`. The routing row is span-dominated: 3 of 168 OPUS P23 sorting launches span 417.5 ms (104.4 ms/forward) against a 55.9 µs median, and one `mxfp4_moe_sort_kernel` launch spans 66.2 ms (16.6 ms/forward) against a 25.0 µs median, so 8.0 ms/forward of the routing row is kernel work.
+Every MoE token bucket dispatches a tuned row; the 16384-token bucket uses `flydsl_mxmoe_g1_a4w4_128x256x256_xcd4` with `flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x256_scatter_sbm128`.
 
 ## Dense GEMM
 
 | Component | MI355X kernel | MI355X ms | % of total |
 | --- | --- | ---: | ---: |
-| KDA tensor materialization | BF16 direct-copy kernels in `chunk_kda` | 0.4 | 0.1% |
-| KDA PTPC projections | AITER per-token/per-channel FP8 GEMM | 11.4 | 2.1% |
-| KDA state/output | AITER fused `chunk_kda_walk` and `chunk_gated_delta_rule_fwd_kernel_h_blockdim64` | 10.7 | 2.0% |
-| Causal convolution | `_causal_conv1d_fwd_kernel` | 5.0 | 0.9% |
-| DenseMLP L0–2 | dense block-FP8 MLP | 2.0 | 0.4% |
-| Other KDA / dense kernels | AITER `chunk_kda_prepare`, remaining Triton chunk kernels, output GEMMs, gated RMSNorm, logits/embedding/sampler, misc | 18.2 | 3.3% |
-| **Dense/KDA subtotal** | | **47.7** | **8.7%** |
+| KDA tensor materialization | BF16 direct-copy kernels in `chunk_kda` | 0.4 | 0.2% |
+| KDA PTPC projections | AITER per-token/per-channel FP8 GEMM | 11.4 | 4.8% |
+| KDA state/output | AITER fused `chunk_kda_walk` and `chunk_gated_delta_rule_fwd_kernel_h_blockdim64` | 10.7 | 4.5% |
+| Causal convolution | `_causal_conv1d_fwd_kernel` | 5.0 | 2.1% |
+| DenseMLP L0–2 | dense block-FP8 MLP | 2.0 | 0.8% |
+| Other KDA / dense kernels | AITER `chunk_kda_prepare`, remaining Triton chunk kernels, output GEMMs, gated RMSNorm, logits/embedding/sampler, misc | 18.2 | 7.7% |
+| **Dense/KDA subtotal** | | **47.7** | **20.2%** |
 
 ## Communication and normalization
 
 | Component | MI355X kernel | MI355X ms | % of total |
 | --- | --- | ---: | ---: |
-| All-reduce | QuickReduce INT4 | 38.0 | 6.9% |
-| Additional reduction | AITER `cross_device_reduce_2stage` | 13.9 | 2.5% |
-| mHC pre RMSNorm | `mhc_pre_big_fuse_rmsnorm_kernel` | 8.9 | 1.6% |
-| mHC post | `mhc_post_kernel` | 14.2 | 2.6% |
-| mHC pre sqrsum | `mhc_pre_gemm_sqrsum_kernel` | 12.8 | 2.3% |
-| **Communication/norm subtotal** | | **87.8** | **16.0%** |
-| **TOTAL** | | **549.4** | **100.0%** |
+| All-reduce | QuickReduce INT4 | 38.0 | 16.1% |
+| Additional reduction | AITER `cross_device_reduce_2stage` | 13.9 | 5.9% |
+| mHC pre RMSNorm | `mhc_pre_big_fuse_rmsnorm_kernel` | 8.9 | 3.8% |
+| mHC post | `mhc_post_kernel` | 14.2 | 6.0% |
+| mHC pre sqrsum | `mhc_pre_gemm_sqrsum_kernel` | 12.8 | 5.4% |
+| **Communication/norm subtotal** | | **87.8** | **37.2%** |
+| **TOTAL** | | **235.9** | **100.0%** |
+| GPU-busy time (union of all GPU events) | | 242.7 | |
 
 The mHC pre RMSNorm value matches the graphs-on formal trace (8.9 ms/forward in both).
 
-## Lever ranking — excluding all-reduce and parity/faster rows
+## Overlapping trace spans
 
-The HtoD spans and the MoE routing row are also excluded because their totals are dominated by stalled launches rather than standalone kernel work.
+These events are recorded with long durations while the GPU keeps executing other kernels throughout, so their recorded time is a span, not GPU time. Including them gives the 549.4 ms/forward summed-event total.
+
+| Span | Events | Recorded ms/fwd | Overlapping kernels per span | Overlapping kernel time per span |
+| --- | ---: | ---: | ---: | ---: |
+| K-pool plan HtoD from `_kpool_plan_to_gpu` (64–128 KiB each) | 4 | 192.6 | 1,421–1,460 | 133–304 ms |
+| MoE sorting (`opus_moe_sorting_entry` P23) | 3 | 104.4 | 926–998 | 224–226 ms |
+| MoE sorting (`mxfp4_moe_sort_kernel`) | 1 | 16.6 | 797 | 73 ms |
+
+The four HtoD events move only 64–128 KiB each but span 127–215 ms, an apparent bandwidth of 0.0005–0.0006 GB/s. The P23 sorting launches have a 55.9 µs median and the MXFP4 sort launches a 25.0 µs median outside these spans.
+
+## Lever ranking — excluding all-reduce and parity/faster rows
 
 | Rank | Lever | MI355X ms | % of total | Work class |
 | ---: | --- | ---: | ---: | --- |
-| 1 | Sparse MLA | 37.6 | 6.8% | Kernel work |
-| 2 | Routed MoE expert kernels | 37.1 | 6.8% | Kernel work |
-| 3 | mHC post | 14.2 | 2.6% | Kernel work |
-| 4 | mHC pre sqrsum | 12.8 | 2.3% | Kernel work |
-| 5 | KDA PTPC projections | 11.4 | 2.1% | Kernel work |
-| 6 | KDA state/output | 10.7 | 2.0% | Kernel work |
-| 7 | mHC pre RMSNorm | 8.9 | 1.6% | Kernel work |
-| 8 | Causal convolution | 5.0 | 0.9% | Kernel work |
-| 9 | KDA tensor materialization | 0.4 | 0.1% | Memory / launch work |
+| 1 | Sparse MLA | 37.6 | 15.9% | Kernel work |
+| 2 | Routed MoE expert kernels | 37.1 | 15.7% | Kernel work |
+| 3 | mHC post | 14.2 | 6.0% | Kernel work |
+| 4 | mHC pre sqrsum | 12.8 | 5.4% | Kernel work |
+| 5 | KDA PTPC projections | 11.4 | 4.8% | Kernel work |
+| 6 | KDA state/output | 10.7 | 4.5% | Kernel work |
+| 7 | mHC pre RMSNorm | 8.9 | 3.8% | Kernel work |
+| 8 | MoE routing / sort / quant | 8.0 | 3.4% | Kernel work |
+| 9 | Causal convolution | 5.0 | 2.1% | Kernel work |
+| 10 | KDA tensor materialization | 0.4 | 0.2% | Memory / launch work |
 
 ### Graphs-on formal cross-check
 
