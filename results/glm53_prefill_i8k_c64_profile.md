@@ -97,7 +97,7 @@ The formal capture uses the same source, model, image, TP, workload, selectors, 
 
 A stalled launch is one longer than 1 ms and more than 20 times its kernel's median duration. Both traces contain 102 fused `chunk_kda_prepare` and 102 `chunk_kda_walk` launches, covering three of the four forwards. The remaining forward falls outside #45913's dispatch cells and runs the separate path, including 34 `_recompute_w_u_fwd_kernel` launches (1.6 ms across four forwards).
 
-Raw artifacts are under `/data2/hf_home/glm53_mxfp4_prefill_profile_1023_tunedmoe_45913` on `smci355-ccs-aus-m15-21`. The graphs-off TP0 EXTEND trace is `mapping/traces/1792779655.9427779/1792779655.9446695-TP-0-EXTEND.trace.json.gz`; the graphs-on cross-check is `formal/traces/1792780709.9467244/1792780709.9485676-TP-0-EXTEND.trace.json.gz`.
+Raw artifacts are under `/data2/macui/glm53/glm53_mxfp4_prefill_profile_1023_tunedmoe_45913` on `smci355-ccs-aus-m15-21`. The graphs-off TP0 EXTEND trace is `mapping/traces/1792779655.9427779/1792779655.9446695-TP-0-EXTEND.trace.json.gz`; the graphs-on cross-check is `formal/traces/1792780709.9467244/1792780709.9485676-TP-0-EXTEND.trace.json.gz`.
 
 ## Decode — i1k/o1k conc64, TP4
 
@@ -125,4 +125,4 @@ ms per decode step, TP0 DECODE trace, batch 64, `utilities/e2e_glm53_flash.sh 10
 
 The graphs-off mapping capture (`--profile --cuda-graph-backend-decode disabled`, so decode runs without graphs) recorded all four steps with module attribution. Excluding all-reduce, its kernel work is 13.1 ms/step versus 12.2 ms/step for the graphs-on step above; its all-reduce row (34.5 ms/step) is cross-rank waiting caused by eager launch overhead and is not a timing claim.
 
-Raw artifacts are under `/data2/hf_home/glm53_mxfp4_decode_profile_1023_i1k_o1k_45913` on `smci355-ccs-aus-m15-21`. The graphs-on trace is `formal/traces/1792789147.3445837/1792789147.3463824-TP-0-DECODE.trace.json.gz`; the graphs-off trace is `mapping/traces/1792787765.026541/1792787765.0284014-TP-0-DECODE.trace.json.gz`.
+Raw artifacts are under `/data2/macui/glm53/glm53_mxfp4_decode_profile_1023_i1k_o1k_45913` on `smci355-ccs-aus-m15-21`. The graphs-on trace is `formal/traces/1792789147.3445837/1792789147.3463824-TP-0-DECODE.trace.json.gz`; the graphs-off trace is `mapping/traces/1792787765.026541/1792787765.0284014-TP-0-DECODE.trace.json.gz`.

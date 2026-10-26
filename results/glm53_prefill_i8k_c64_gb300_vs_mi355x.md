@@ -1,6 +1,6 @@
 # GLM-5.3-Flash prefill — i8k/o16 conc64, TP4 — GB300 vs MI355X
 
-ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e_glm53_flash.sh 8192 16 1`, conc64 num256, `--profile-num-steps 4 --profile-by-stage`, script snapshot `6aef5d5fc2` on both platforms. GB300 values come from the graphs-off tables in [`glm53_prefill_i8k_c64_gb300_profile.md`](glm53_prefill_i8k_c64_gb300_profile.md). MI355X values come from a re-profile with tuned MXFP4 MoE configs and #45913 fused KDA prefill; raw artifacts are under `/data2/hf_home/glm53_mxfp4_prefill_profile_1023_tunedmoe_45913` on `smci355-ccs-aus-m15-21`.
+ms/prefill forward, TP0 EXTEND trace (n_fwd=4), graphs-off eager, `utilities/e2e_glm53_flash.sh 8192 16 1`, conc64 num256, `--profile-num-steps 4 --profile-by-stage`, script snapshot `6aef5d5fc2` on both platforms. GB300 values come from the graphs-off tables in [`glm53_prefill_i8k_c64_gb300_profile.md`](glm53_prefill_i8k_c64_gb300_profile.md). MI355X values come from a re-profile with tuned MXFP4 MoE configs and #45913 fused KDA prefill; raw artifacts are under `/data2/macui/glm53/glm53_mxfp4_prefill_profile_1023_tunedmoe_45913` on `smci355-ccs-aus-m15-21`.
 
 | | GB300 | MI355X |
 | --- | --- | --- |
