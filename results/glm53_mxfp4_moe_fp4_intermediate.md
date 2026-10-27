@@ -64,3 +64,68 @@ AITER `gemm_moe_tune.py --run_config` on the six GLM-5.3-Flash 16384-token `scat
 | 512 / 289 / 9 (TP4, shared-expert fused) | 1083 | 966 | −10.8% |
 | 256 / 288 / 8 (TP8) | 787 | 648 | −17.7% |
 | 256 / 289 / 9 (TP8, shared-expert fused) | 878 | 760 | −13.5% |
+
+## FP8 reduce intermediate (not enabled)
+
+`AITER_FLYDSL_STAGE2_FP8=1` makes the stage-2 `reduce` epilogue write FP8 per-expert partials (`_fp8out` GEMM2) and sum them with `moe_reduction_fp8_bf16`, instead of BF16 partials and `moe_reduction_bf16_bf16`. For GLM-5.3-Flash it covers the `reduce` rows: 2048–8192 tokens at TP4 and 512/1024–8192 tokens at TP8. It speeds up every `reduce` kernel row but does not change serving throughput beyond run-to-run noise, so it is not enabled.
+
+| Field | Value |
+| --- | --- |
+| Hardware | MI355X/gfx950, `smci355-ccs-aus-m15-21`; TP4 on GPUs 4–7, TP8 on GPUs 0–7 |
+| Image | `rocm/sgl-dev:v0.5.22-rocm724-mi35x-20261019`, container `macui-glm53-new` |
+| Source | `RM/glm53` `bb1a9c3718` (python/ and utilities/ identical to `origin/RM/glm53` `8e3a6a1c01`), clean |
+| AITER | `/sgl-workspace/aiter` branch `validation/glm53-mxfp4-moe-6672` `9135a3d3a` (AITER `313f86a7d`, the #6672 head, plus the [#6435](https://github.com/ROCm/aiter/pull/6435) GLM-5.3-Flash MXFP4 MoE configs, aux-kernel shapes and 16384-token rows; tuned CSV identical to `27b274d332`), clean |
+| Launcher and scripts | As above; snapshot `6aef5d5fc2` |
+| A/B | `AITER_MXFP4_INTERMEDIATE=1` in both arms; baseline `AITER_FLYDSL_STAGE2_FP8=0`, candidate `AITER_FLYDSL_STAGE2_FP8=1`; fresh AITER JIT, Triton and TileLang caches per arm |
+
+### Kernel-level effect
+
+AITER `gemm_moe_tune.py --run_config` on the 15 GLM-5.3-Flash `reduce` rows (hidden 4096), GPU 4 on m15-21, two rounds in alternating order. Times are the MoE stage total in µs. A kernel trace of the 8192-token 512/289/9 row confirms the candidate runs `gemm2_a4w4_port_..._fp8out_...` and `moe_reduction_fp8_bf16`.
+
+| Inter dim / experts / tokens | BF16 | FP8 | Δ |
+| --- | ---: | ---: | ---: |
+| 512 / 288 / 2048 (TP4) | 255.6 | 229.2 | −10.3% |
+| 512 / 288 / 4096 (TP4) | 349.1 | 292.3 | −16.3% |
+| 512 / 288 / 8192 (TP4) | 602.0 | 471.4 | −21.7% |
+| 512 / 289 / 2048 (TP4) | 276.4 | 254.2 | −8.1% |
+| 512 / 289 / 4096 (TP4) | 394.4 | 336.1 | −14.8% |
+| 512 / 289 / 8192 (TP4) | 657.5 | 531.2 | −19.2% |
+| 256 / 288 / 1024 (TP8) | 131.1 | 117.9 | −10.1% |
+| 256 / 288 / 2048 (TP8) | 171.0 | 151.7 | −11.3% |
+| 256 / 288 / 4096 (TP8) | 257.8 | 206.2 | −20.0% |
+| 256 / 288 / 8192 (TP8) | 450.1 | 321.3 | −28.6% |
+| 256 / 289 / 512 (TP8) | 115.9 | 110.5 | −4.8% |
+| 256 / 289 / 1024 (TP8) | 133.7 | 121.9 | −8.9% |
+| 256 / 289 / 2048 (TP8) | 189.1 | 163.9 | −13.3% |
+| 256 / 289 / 4096 (TP8) | 286.0 | 234.8 | −17.9% |
+| 256 / 289 / 8192 (TP8) | 500.7 | 361.0 | −27.9% |
+
+### Accuracy
+
+GSM8K, candidate only, same evaluator settings as above. TP4 scored 97.27% (109 prefill batches in the 1,025–8,192-token `reduce` range). TP8 scored 96.89%; its first attempt failed in the evaluator client before any request completed (`OSError: Too many open files`, container soft `nofile` limit 1,024 on m15-21) and was rerun on a fresh server with `ulimit -n 524288`, all other settings unchanged.
+
+### TP4 end-to-end serving
+
+`utilities/e2e_glm53_flash.sh 8192 1024 0`, random 8,192-token input, 1,024-token output, `--random-range-ratio 1`, `num_prompts = 4 × concurrency`, `REPS=2`, script default `CONCURRENCY="4 4 8 16 32 64"` with the first concurrency-4 run of each repetition excluded as warmup. Values average the two measured repetitions. All requests succeeded in both arms.
+
+| Concurrency | Output tok/s A | Output tok/s B | Δ | Median TTFT ms A | Median TTFT ms B | Δ | Median ITL ms A | Median ITL ms B |
+| −--: | −--: | −--: | −--: | −--: | −--: | −--: | −--: | −--: |
+| 4 | 596.0 | 596.2 | +0.0% | 570.6 | 560.3 | −1.8% | 6.07 | 6.08 |
+| 8 | 1000.7 | 1000.0 | −0.1% | 869.6 | 857.2 | −1.4% | 6.76 | 6.79 |
+| 16 | 1553.6 | 1551.2 | −0.2% | 1461.5 | 1450.6 | −0.7% | 7.91 | 7.94 |
+| 32 | 2273.7 | 2271.9 | −0.1% | 2644.1 | 2634.1 | −0.4% | 9.39 | 9.42 |
+| 64 | 3059.1 | 3062.5 | +0.1% | 5014.5 | 5001.4 | −0.3% | 11.59 | 11.59 |
+
+### TP8 end-to-end serving
+
+`TP=8 utilities/e2e_glm53_flash.sh 8192 1024 0`, random 8,192-token input, 1,024-token output, `--random-range-ratio 1`, `num_prompts = 4 × concurrency`, `REPS=2`, script default `CONCURRENCY="4 4 8 16 32 64"` with the first concurrency-4 run of each repetition excluded as warmup. Values average the two measured repetitions. All requests succeeded in both arms.
+
+| Concurrency | Output tok/s A | Output tok/s B | Δ | Median TTFT ms A | Median TTFT ms B | Δ | Median ITL ms A | Median ITL ms B |
+| −--: | −--: | −--: | −--: | −--: | −--: | −--: | −--: | −--: |
+| 4 | 662.4 | 663.5 | +0.2% | 458.6 | 460.1 | +0.3% | 5.54 | 5.54 |
+| 8 | 1138.5 | 1139.3 | +0.1% | 698.3 | 698.8 | +0.1% | 6.06 | 6.06 |
+| 16 | 1882.8 | 1881.7 | −0.1% | 1171.1 | 1172.2 | +0.1% | 6.60 | 6.61 |
+| 32 | 2818.1 | 2817.0 | −0.0% | 2106.7 | 2107.1 | +0.0% | 7.64 | 7.64 |
+| 64 | 3906.9 | 3906.1 | −0.0% | 3990.9 | 3993.3 | +0.1% | 8.98 | 8.98 |
+
+A = `AITER_FLYDSL_STAGE2_FP8=0`, B = `AITER_FLYDSL_STAGE2_FP8=1`, both with `AITER_MXFP4_INTERMEDIATE=1`. With 8,192-token prompts most prefill chunks are 16,384-token `scatter` batches, so the `reduce` rows run rarely in this workload. TP4 throughput changes by −0.2% to +0.1% (within repetition spread), and TP8 is unchanged.
