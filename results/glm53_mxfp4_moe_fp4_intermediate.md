@@ -1,4 +1,4 @@
-# GLM-5.3-Flash MXFP4 MoE FP4 scatter intermediate — TP4 — MI355X
+# GLM-5.3-Flash MXFP4 MoE FP4 scatter intermediate — TP4 and TP8 — MI355X
 
 `AITER_MXFP4_INTERMEDIATE=1` makes the AITER FlyDSL MoE stage-2 `scatter` epilogue (`flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x256_scatter_sbm128`) write its per-expert partials as MXFP4 (`_f4out` GEMM2) and sum them with `scatter_reduce_mxfp4_kernel`, instead of writing BF16 partials for `scatter_reduce`. No code change; the selector is an AITER environment variable. It only affects token buckets whose tuned row uses the `scatter` epilogue, which for GLM-5.3-Flash are the 16384-token rows (prefill batches of 8,193–16,384 tokens).
 
@@ -6,12 +6,12 @@
 
 | Field | Value |
 | --- | --- |
-| Hardware | MI355X/gfx950, `smci355-ccs-aus-m12-17`, GPUs 4–7 |
+| Hardware | MI355X/gfx950, `smci355-ccs-aus-m12-17`; TP4 on GPUs 4–7, TP8 on GPUs 0–7 |
 | Image | `rocm/sgl-dev:v0.5.22-rocm724-mi35x-20261019`, container `macui-glm53-new` |
 | Source | `RM/glm53` `f320188a6a`, clean, run from `/sgl-workspace/squidward` |
 | AITER | `/sgl-workspace/aiter` branch `validation/glm53-mxfp4-moe` `27b274d332` (image AITER `2bb549102` plus the [#6435](https://github.com/ROCm/aiter/pull/6435) GLM-5.3-Flash MXFP4 MoE configs, aux-kernel shapes and 16384-token rows), clean |
 | Model | `amd/GLM-5.3-Flash-Quark-MXFP4@b5688f25491202978c19c4d036eef579f61bbe07` |
-| Launcher | `utilities/run_glm53_flash.sh --mxfp4` (TP4 recipe: 65,536 context, 64 max running requests, INT4 QuickReduce, full decode CUDA graphs) |
+| Launcher | `utilities/run_glm53_flash.sh --mxfp4`; TP4 recipe (65,536 context, 64 max running requests, INT4 QuickReduce, full decode CUDA graphs) and `TP=8` recipe (131,072 context) |
 | Scripts | `utilities/e2e_glm53_flash.sh` and `utilities/e2e_glm53_flash_gsm8k.sh`, snapshot `6aef5d5fc2` |
 | A/B | Baseline `AITER_MXFP4_INTERMEDIATE=0`, candidate `AITER_MXFP4_INTERMEDIATE=1`; every other field identical; fresh AITER JIT, Triton and TileLang caches per arm |
 
@@ -24,7 +24,7 @@ GSM8K, `utilities/e2e_glm53_flash_gsm8k.sh mxfp4`, 1,319 examples, temperature 1
 | TP4 | 64 | 32,768 | 97.73% | No: largest prefill batch 6,124 tokens (64-request cap) |
 | TP8 | 1,200 | 4,096 | 97.35% | Yes: 7 of 37 prefill batches above 8,192 tokens |
 
-The TP4 GSM8K therefore does not exercise the FP4 path; the TP8 run does. Both ran on AITER `2bb549102` with the same uncommitted changes later committed as `27b274d332` (identical code diff). TP8 used the TP8 recipe (`TP=8`, 131,072 context, all eight GPUs).
+The TP4 GSM8K therefore does not exercise the FP4 path; the TP8 run does. Both ran on AITER `2bb549102` with the same uncommitted changes later committed as `27b274d332` (identical code diff).
 
 ## TP4 end-to-end serving
 
@@ -39,6 +39,20 @@ The TP4 GSM8K therefore does not exercise the FP4 path; the TP8 run does. Both r
 | 64 | 2994.1 | 3015.6 | +0.7% | 5179.0 | 5096.4 | −1.6% | 11.75 | 11.75 |
 
 A = `AITER_MXFP4_INTERMEDIATE=0` (BF16 scatter partials), B = `AITER_MXFP4_INTERMEDIATE=1` (MXFP4 scatter partials). Throughput gains at concurrency 32 and 64 exceed the repetition-to-repetition spread; at 16 and below they are within it. Decode latency is unchanged because decode batches do not use the 16384-token rows.
+
+## TP8 end-to-end serving
+
+`TP=8 utilities/e2e_glm53_flash.sh 8192 1024 0` against the `TP=8` launcher recipe, random 8,192-token input, 1,024-token output, `--random-range-ratio 1`, `num_prompts = 4 × concurrency`, `REPS=2`, script default `CONCURRENCY="4 4 8 16 32 64"` with the first concurrency-4 run of each repetition excluded as warmup. Values average the two measured repetitions. All requests succeeded in both arms.
+
+| Concurrency | Output tok/s A | Output tok/s B | Δ | Median TTFT ms A | Median TTFT ms B | Δ | Median ITL ms A | Median ITL ms B |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 656.2 | 656.2 | −0.0% | 477.0 | 468.7 | −1.7% | 5.59 | 5.59 |
+| 8 | 1125.8 | 1129.7 | +0.4% | 725.2 | 709.0 | −2.2% | 6.10 | 6.10 |
+| 16 | 1851.1 | 1863.3 | +0.7% | 1215.6 | 1186.5 | −2.4% | 6.67 | 6.66 |
+| 32 | 2763.9 | 2785.5 | +0.8% | 2195.3 | 2142.1 | −2.4% | 7.71 | 7.72 |
+| 64 | 3811.0 | 3852.7 | +1.1% | 4154.7 | 4057.3 | −2.3% | 9.09 | 9.09 |
+
+A = `AITER_MXFP4_INTERMEDIATE=0` (BF16 scatter partials), B = `AITER_MXFP4_INTERMEDIATE=1` (MXFP4 scatter partials). From concurrency 8 upward every measured repetition of B exceeds every measured repetition of A; at concurrency 4 throughput is unchanged.
 
 ## Kernel-level effect
 
