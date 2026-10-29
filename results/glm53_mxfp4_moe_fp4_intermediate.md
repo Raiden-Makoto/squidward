@@ -26,6 +26,30 @@ GSM8K, `utilities/e2e_glm53_flash_gsm8k.sh mxfp4`, 1,319 examples, temperature 1
 
 The TP4 GSM8K therefore does not exercise the FP4 path; the TP8 run does. Both ran on AITER `2bb549102` with the same uncommitted changes later committed as `27b274d332` (identical code diff).
 
+### RULER2 long-context check (TP4)
+
+Because GSM8K at TP4 never reaches the 16384-token bucket, accuracy on the FP4 path at TP4 was also checked with `sgl_eval` RULER2 at a 32,768-token sequence length: 12 subtasks × 100 samples, thinking off, 4 concurrent requests (eval defaults), temperature 1.0, top-p 0.95, `max_tokens` unset. It ran as an A/B on `smci355-ccs-aus-m15-21` with the TP4 launcher recipe, source `RM/glm53` `bb1a9c3718` and AITER `validation/glm53-mxfp4-moe-6672` `9135a3d3a` (tuned CSV identical to `27b274d332`), differing only by `AITER_MXFP4_INTERMEDIATE`. 2,393 of 2,417 candidate prefill batches were 16,384-token chunks on the FP4 path. Both arms had zero request errors and zero truncation.
+
+| Subtask | A | B |
+| --- | ---: | ---: |
+| mk_niah_basic | 100.00% | 100.00% |
+| mk_niah_easy | 97.78% | 96.28% |
+| mk_niah_medium | 91.00% | 91.00% |
+| mk_niah_hard | 94.00% | 95.00% |
+| mv_niah_basic | 99.75% | 99.75% |
+| mv_niah_easy | 81.92% | 81.77% |
+| mv_niah_medium | 89.88% | 89.76% |
+| mv_niah_hard | 95.03% | 89.94% |
+| qa_basic | 100.00% | 100.00% |
+| qa_easy | 97.00% | 96.00% |
+| qa_medium | 89.00% | 88.00% |
+| qa_hard | 85.00% | 91.00% |
+| **Score** | **93.36%** | **93.21%** |
+
+A = `AITER_MXFP4_INTERMEDIATE=0`, B = `AITER_MXFP4_INTERMEDIATE=1`. Per-subtask differences go both ways and are within the sampling noise of 100 samples at temperature 1.0; the headline differs by 0.15 points.
+
+MMLU-Pro (12,032 questions, thinking off, TP8, 1,200 threads, 4,096 max tokens, same A/B and source) scored 76.31% (A) and 76.12% (B), but only 24 of about 6,600 prefill batches reached the 16384-token bucket, so it exercises the FP4 path very little. GPQA could not run because its dataset is gated.
+
 ## TP4 end-to-end serving
 
 `utilities/e2e_glm53_flash.sh 8192 1024 0`, random 8,192-token input, 1,024-token output, `--random-range-ratio 1`, `num_prompts = 4 × concurrency`, `REPS=2`, script default `CONCURRENCY="4 4 8 16 32 64"` with the first concurrency-4 run of each repetition excluded as warmup. Values average the two measured repetitions. All requests succeeded in both arms.
