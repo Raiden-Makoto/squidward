@@ -22,10 +22,18 @@ _DEFAULT_PREFILL_CONFIG = {
 }
 _GFX950_GLM53_PREFILL_CONFIG = {
     "BLOCK_M": 16,
-    "BLOCK_N": 256,
+    "BLOCK_N": 512,
     "num_warps": 4,
     "num_stages": 3,
 }
+_GFX950_GLM53_LONG_PREFILL_CONFIG = {
+    "BLOCK_M": 32,
+    "BLOCK_N": 512,
+    "num_warps": 4,
+    "num_stages": 3,
+}
+# Token count from which the taller tile wins, per measured channel width.
+_GFX950_GLM53_LONG_PREFILL_TOKENS = {3072: 32768, 6144: 16384}
 
 
 def _causal_conv1d_prefill_config(
@@ -42,6 +50,8 @@ def _causal_conv1d_prefill_config(
         and width == 4
         and total_tokens >= 8192
     ):
+        if total_tokens >= _GFX950_GLM53_LONG_PREFILL_TOKENS[dim]:
+            return _GFX950_GLM53_LONG_PREFILL_CONFIG
         return _GFX950_GLM53_PREFILL_CONFIG
     return _DEFAULT_PREFILL_CONFIG
 

@@ -17,16 +17,23 @@ class TestCausalConv1dDispatch(CustomTestCase):
             "is_gfx95_supported",
             return_value=True,
         ):
-            for dim in (3072, 6144):
-                with self.subTest(dim=dim):
+            for dim, total_tokens, block_m in (
+                (3072, 8192, 16),
+                (3072, 32767, 16),
+                (3072, 32768, 32),
+                (6144, 8192, 16),
+                (6144, 16383, 16),
+                (6144, 16384, 32),
+            ):
+                with self.subTest(dim=dim, total_tokens=total_tokens):
                     config = causal_conv1d_triton._causal_conv1d_prefill_config(
                         dim=dim,
                         width=4,
-                        total_tokens=8192,
+                        total_tokens=total_tokens,
                         dtype=torch.bfloat16,
                     )
-                    self.assertEqual(config["BLOCK_M"], 16)
-                    self.assertEqual(config["BLOCK_N"], 256)
+                    self.assertEqual(config["BLOCK_M"], block_m)
+                    self.assertEqual(config["BLOCK_N"], 512)
                     self.assertEqual(config["num_warps"], 4)
                     self.assertEqual(config["num_stages"], 3)
 
