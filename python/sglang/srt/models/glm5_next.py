@@ -2218,6 +2218,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
         DeepseekV2WeightLoaderMixin.post_load_weights(
             self, is_nextn=is_nextn, weight_names=weight_names
         )
+        from sglang.kernels.ops.layernorm.mhc import prepack_aiter_mhc_fn
+
+        for module in self.modules():
+            for name in ("hc_attn_fn", "hc_ffn_fn"):
+                fn = getattr(module, name, None)
+                if isinstance(fn, torch.Tensor):
+                    prepack_aiter_mhc_fn(fn)
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is None:
