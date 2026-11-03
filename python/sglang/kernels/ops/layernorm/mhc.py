@@ -42,24 +42,25 @@ _AITER_PACKED_HC_FN = {}
 _AITER_PACKED_HC_FN_SHAPE = (24, 4 * 4096)
 
 
-def prepack_aiter_mhc_fn(fn: torch.Tensor) -> None:
+def prepack_aiter_mhc_fn(fn: torch.Tensor) -> bool:
     """Pack an FP32 hc_fn once for AITER's BF16 hi/lo mHC pre GEMM on gfx950."""
     if (
         not _use_aiter_mhc()
         or fn.dtype != torch.float32
         or tuple(fn.shape) != _AITER_PACKED_HC_FN_SHAPE
     ):
-        return
+        return False
     try:
         from aiter.ops.mhc import mhc_shuffle_fn
     except Exception as err:
         logger.warning("AITER mHC weight packing is unavailable: %s", err)
-        return
+        return False
     with torch.no_grad():
         packed = mhc_shuffle_fn(fn.detach())
     key = id(fn)
     ref = weakref.ref(fn, lambda _: _AITER_PACKED_HC_FN.pop(key, None))
     _AITER_PACKED_HC_FN[key] = (ref, fn._version, packed)
+    return True
 
 
 def _aiter_packed_hc_fn(fn: torch.Tensor) -> torch.Tensor | None:
