@@ -21,19 +21,13 @@ _DEFAULT_PREFILL_CONFIG = {
     "num_stages": 2,
 }
 _GFX950_GLM53_PREFILL_CONFIG = {
-    "BLOCK_M": 16,
-    "BLOCK_N": 512,
-    "num_warps": 4,
-    "num_stages": 3,
-}
-_GFX950_GLM53_LONG_PREFILL_CONFIG = {
     "BLOCK_M": 32,
     "BLOCK_N": 512,
     "num_warps": 4,
     "num_stages": 3,
 }
-# Token count from which the taller tile wins, per measured channel width.
-_GFX950_GLM53_LONG_PREFILL_TOKENS = {3072: 32768, 6144: 16384}
+# Token count from which the GLM tile beats the default, per measured channel width.
+_GFX950_GLM53_PREFILL_MIN_TOKENS = {3072: 24576, 6144: 12288}
 
 
 def _causal_conv1d_prefill_config(
@@ -46,12 +40,9 @@ def _causal_conv1d_prefill_config(
     if (
         is_gfx95_supported()
         and dtype == torch.bfloat16
-        and dim in (3072, 6144)
         and width == 4
-        and total_tokens >= 8192
+        and total_tokens >= _GFX950_GLM53_PREFILL_MIN_TOKENS.get(dim, total_tokens + 1)
     ):
-        if total_tokens >= _GFX950_GLM53_LONG_PREFILL_TOKENS[dim]:
-            return _GFX950_GLM53_LONG_PREFILL_CONFIG
         return _GFX950_GLM53_PREFILL_CONFIG
     return _DEFAULT_PREFILL_CONFIG
 

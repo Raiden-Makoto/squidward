@@ -17,14 +17,7 @@ class TestCausalConv1dDispatch(CustomTestCase):
             "is_gfx95_supported",
             return_value=True,
         ):
-            for dim, total_tokens, block_m in (
-                (3072, 8192, 16),
-                (3072, 32767, 16),
-                (3072, 32768, 32),
-                (6144, 8192, 16),
-                (6144, 16383, 16),
-                (6144, 16384, 32),
-            ):
+            for dim, total_tokens in ((3072, 24576), (6144, 12288)):
                 with self.subTest(dim=dim, total_tokens=total_tokens):
                     config = causal_conv1d_triton._causal_conv1d_prefill_config(
                         dim=dim,
@@ -32,7 +25,7 @@ class TestCausalConv1dDispatch(CustomTestCase):
                         total_tokens=total_tokens,
                         dtype=torch.bfloat16,
                     )
-                    self.assertEqual(config["BLOCK_M"], block_m)
+                    self.assertEqual(config["BLOCK_M"], 32)
                     self.assertEqual(config["BLOCK_N"], 512)
                     self.assertEqual(config["num_warps"], 4)
                     self.assertEqual(config["num_stages"], 3)
@@ -41,7 +34,7 @@ class TestCausalConv1dDispatch(CustomTestCase):
         base = dict(
             dim=6144,
             width=4,
-            total_tokens=8192,
+            total_tokens=12288,
             dtype=torch.bfloat16,
         )
         with patch.object(
@@ -52,7 +45,7 @@ class TestCausalConv1dDispatch(CustomTestCase):
             for field, value in (
                 ("dim", 4096),
                 ("width", 3),
-                ("total_tokens", 8191),
+                ("total_tokens", 12287),
                 ("dtype", torch.float16),
             ):
                 with self.subTest(field=field, value=value):
@@ -61,6 +54,12 @@ class TestCausalConv1dDispatch(CustomTestCase):
                     )
                     self.assertEqual(config["BLOCK_M"], 8)
                     self.assertEqual(config["num_stages"], 2)
+            with self.subTest(dim=3072, total_tokens=24575):
+                config = causal_conv1d_triton._causal_conv1d_prefill_config(
+                    **(base | {"dim": 3072, "total_tokens": 24575})
+                )
+                self.assertEqual(config["BLOCK_M"], 8)
+                self.assertEqual(config["num_stages"], 2)
         with patch.object(
             causal_conv1d_triton,
             "is_gfx95_supported",
