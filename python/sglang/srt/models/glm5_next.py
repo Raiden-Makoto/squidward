@@ -2211,7 +2211,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
             DeepseekV2WeightLoaderMixin.post_load_weights(
                 self, is_nextn=is_nextn, weight_names=weight_names
             )
-        self._prepack_mhc_fn()
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None):
         if self.encoder_only:
@@ -2219,22 +2218,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
         DeepseekV2WeightLoaderMixin.post_load_weights(
             self, is_nextn=is_nextn, weight_names=weight_names
         )
-        self._prepack_mhc_fn()
-
-    def _prepack_mhc_fn(self):
-        from sglang.kernels.ops.layernorm.mhc import prepack_aiter_mhc_fn
-
-        packed = sum(
-            prepack_aiter_mhc_fn(fn)
-            for module in self.modules()
-            for fn in (
-                getattr(module, "hc_attn_fn", None),
-                getattr(module, "hc_ffn_fn", None),
-            )
-            if isinstance(fn, torch.Tensor)
-        )
-        if packed:
-            logger.info("Packed %d mHC pre weights for AITER BF16 GEMM", packed)
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is None:
