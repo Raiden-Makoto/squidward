@@ -28,6 +28,7 @@ export SGLANG_DSA_FUSE_HADAMARD_QUANT=${SGLANG_DSA_FUSE_HADAMARD_QUANT-1}
 # #47336
 export AITER_MXFP4_INTERMEDIATE=${AITER_MXFP4_INTERMEDIATE-1}
 
+DSA_BACKEND=aiter_sparse_mla
 PROFILE_ARGS=()
 EXTRA_ARGS=()
 TP_ARGS=()
@@ -41,16 +42,18 @@ for arg in "$@"; do
       MODEL=${FP8_MODEL}
       ;;
     --profile)
-      PROFILE_ARGS=(--disable-cuda-graph)
+      # Must follow TP_ARGS: the explicit decode backend overrides --disable-cuda-graph.
+      PROFILE_ARGS=(--cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled)
       ;;
     --use-aiter|--aiter)
       export SGLANG_USE_AITER=1
+      DSA_BACKEND=aiter_sparse_mla
       ;;
     --use-triton|--triton)
-      echo "GLM-5.3-Flash does not support the Triton DSA backend on ROCm." >&2
-      exit 2
+      DSA_BACKEND=triton
       ;;
     --use-tilelang|--tilelang)
+      DSA_BACKEND=tilelang
       ;;
     *)
       EXTRA_ARGS+=("${arg}")
@@ -79,7 +82,11 @@ case "${TP}" in
   8)
     export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
     TP_ARGS=(
+      --attention-backend dsa
       --context-length 131072
+      --linear-attn-backend triton
+      --cuda-graph-backend-decode full
+      --cuda-graph-max-bs-decode 512
     )
     ;;
   *)
@@ -96,8 +103,8 @@ exec python3 -m sglang.launch_server \
   --kv-cache-dtype bfloat16 \
   --mem-fraction-static 0.85 \
   --disable-radix-cache \
-  --dsa-prefill-backend aiter_sparse_mla \
-  --dsa-decode-backend aiter_sparse_mla \
+  --dsa-prefill-backend "${DSA_BACKEND}" \
+  --dsa-decode-backend "${DSA_BACKEND}" \
   --moe-runner-backend aiter \
   --reasoning-parser glm45 \
   --tool-call-parser glm47 \
