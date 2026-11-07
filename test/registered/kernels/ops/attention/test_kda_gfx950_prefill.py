@@ -346,7 +346,6 @@ class TestGfx950KDAPrefill(CustomTestCase):
                     )
                 )
 
-
     @torch.inference_mode()
     def test_padded_graph_batch_matches_triton(self):
         """A captured batch pads with empty PAD_SLOT_ID (-1) sequences and junk

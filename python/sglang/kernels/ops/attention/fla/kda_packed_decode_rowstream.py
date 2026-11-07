@@ -158,6 +158,8 @@ def covered(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
 ) -> bool:
+    if not _is_gfx95:
+        return False
     HV, V, K = initial_state.shape[-3:]
     if initial_state.dtype == torch.float32:
         state_ok = True
@@ -166,8 +168,7 @@ def covered(
     else:
         state_ok = False
     return (
-        _is_gfx95
-        and state_ok
+        state_ok
         and K == 128
         and V == 128
         and a.dim() == 2
