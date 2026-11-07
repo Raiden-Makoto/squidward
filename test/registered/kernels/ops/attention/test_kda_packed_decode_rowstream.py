@@ -166,9 +166,7 @@ class TestKdaPackedDecodeRowstream(CustomTestCase):
     def test_bf16_state_padded_slot_and_decode_steps(self):
         for heads, batch in ((16, 64), (8, 128)):
             with self.subTest(heads=heads, batch=batch):
-                self._check(
-                    batch, heads, -5.0, pad=True, state_dtype=torch.bfloat16
-                )
+                self._check(batch, heads, -5.0, pad=True, state_dtype=torch.bfloat16)
                 self._check(
                     batch,
                     heads,
@@ -200,9 +198,7 @@ class TestKdaPackedDecodeRowstream(CustomTestCase):
                 )
                 states = [state0.clone() for _ in range(3)]
                 outs = [
-                    torch.empty(
-                        batch, 1, heads, V, device="cuda", dtype=torch.bfloat16
-                    )
+                    torch.empty(batch, 1, heads, V, device="cuda", dtype=torch.bfloat16)
                     for _ in range(3)
                 ]
 
