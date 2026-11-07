@@ -27,8 +27,12 @@ export SGLANG_OPT_GLM53_KDA_W8A16_DECODE=${SGLANG_OPT_GLM53_KDA_W8A16_DECODE-1}
 export SGLANG_DSA_FUSE_HADAMARD_QUANT=${SGLANG_DSA_FUSE_HADAMARD_QUANT-1}
 # #47336
 export AITER_MXFP4_INTERMEDIATE=${AITER_MXFP4_INTERMEDIATE-1}
+# #49036; an empty value keeps the fp32 state
+MAMBA_SSM_DTYPE=${MAMBA_SSM_DTYPE-bfloat16}
 
 DSA_BACKEND=aiter_sparse_mla
+SSM_ARGS=()
+[[ -n "${MAMBA_SSM_DTYPE}" ]] && SSM_ARGS=(--mamba-ssm-dtype "${MAMBA_SSM_DTYPE}")
 PROFILE_ARGS=()
 EXTRA_ARGS=()
 TP_ARGS=()
@@ -111,5 +115,6 @@ exec python3 -m sglang.launch_server \
   --host 0.0.0.0 \
   --port "${PORT}" \
   "${TP_ARGS[@]}" \
+  "${SSM_ARGS[@]}" \
   "${PROFILE_ARGS[@]}" \
   "${EXTRA_ARGS[@]}"
