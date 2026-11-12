@@ -385,6 +385,16 @@ GLM53_KDA_FUSED_O_NORM_MIN_M = {
     1024: 1,
     2048: 256,
 }
+# SGLANG_OPT_GLM53_FAST_DECODE: with tuned FP8 rows the fused o_norm + FP8
+# o_proj also wins at decode sizes, and the fused [qkv | beta | fg] projection runs
+# as one FP8 GEMM over these token counts. Measured at TP4 (qkv size 6144) only.
+GLM53_KDA_PTPC_DECODE_O_NORM_MIN_M = {
+    1024: 1,
+    2048: 1,
+}
+GLM53_KDA_PTPC_DECODE_M_BY_QKV_SIZE = {
+    6144: (64, 512),
+}
 
 
 class Glm5NextLinearAttention(nn.Module):
@@ -754,6 +764,11 @@ class Glm5NextLinearAttention(nn.Module):
                     qkv_size=self.split_sizes[0],
                     beta_size=self.split_sizes[1],
                     fg_size=self.split_sizes[2],
+                    decode_m_range=(
+                        GLM53_KDA_PTPC_DECODE_M_BY_QKV_SIZE.get(qkv_size)
+                        if envs.SGLANG_OPT_GLM53_FAST_DECODE.get()
+                        else None
+                    ),
                 )
             elif self.fuse_bfg:
                 set_ptpc_method(self.qkv_proj, "qkv_proj", first_stage_max_m)
@@ -876,7 +891,11 @@ class Glm5NextLinearAttention(nn.Module):
         ):
             return False
         local_k = self.o_proj.weight.shape[1]
-        min_m = GLM53_KDA_FUSED_O_NORM_MIN_M.get(local_k)
+        min_m = (
+            GLM53_KDA_PTPC_DECODE_O_NORM_MIN_M
+            if envs.SGLANG_OPT_GLM53_FAST_DECODE.get()
+            else GLM53_KDA_FUSED_O_NORM_MIN_M
+        ).get(local_k)
         if min_m is None:
             return False
         num_tokens = core_attn_out.numel() // local_k

@@ -1233,12 +1233,16 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
         qkv_size: int,
         beta_size: int,
         fg_size: int,
+        decode_m_range: Optional[tuple[int, int]] = None,
     ):
         super().__init__("qkv_proj,f_a_proj,g_a_proj", bf16_max_m)
         self.fp8_max_m = fp8_max_m
         self.qkv_size = qkv_size
         self.beta_size = beta_size
         self.fg_size = fg_size
+        # Token counts that run the whole fused [qkv | beta | fg] projection as one
+        # FP8 GEMM instead of BF16; None keeps BF16 below the prefill window.
+        self.decode_m_range = decode_m_range
 
     def is_active(self, num_tokens: int) -> bool:
         return super().is_active(num_tokens) and num_tokens <= self.fp8_max_m
@@ -1281,7 +1285,32 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
             weight_scale.contiguous(),
             persistent=False,
         )
+        if self.decode_m_range is not None:
+            # gemm_a8w8_bpreshuffle takes 64-row multiples; the padded rows are
+            # sliced off after the GEMM.
+            padded_rows = -(-expected_size // 64) * 64
+            decode_weight = F.pad(weight, (0, 0, 0, padded_rows - expected_size))
+            decode_fp8, decode_scale = aiter.pertoken_quant(
+                decode_weight, quant_dtype=aiter.dtypes.fp8
+            )
+            layer.register_buffer(
+                "_fp8_decode_weight",
+                shuffle_weight(decode_fp8, (16, 16)).contiguous(),
+                persistent=False,
+            )
+            layer.register_buffer(
+                "_fp8_decode_weight_scale",
+                decode_scale.contiguous(),
+                persistent=False,
+            )
         self._fp8_ptpc_ready = True
+
+    def decode_active(self, num_tokens: int) -> bool:
+        return (
+            self._fp8_ptpc_ready
+            and self.decode_m_range is not None
+            and self.decode_m_range[0] <= num_tokens <= self.decode_m_range[1]
+        )
 
     def apply(
         self,
@@ -1289,6 +1318,23 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        num_tokens = x.numel() // x.shape[-1]
+        if bias is None and self.decode_active(num_tokens):
+            import aiter
+
+            rows = self.qkv_size + self.beta_size + self.fg_size
+            x_q, x_scale = aiter.per_token_quant_hip(
+                x.reshape(num_tokens, x.shape[-1]), quant_dtype=aiter.dtypes.fp8
+            )
+            output = aiter.gemm_a8w8_bpreshuffle(
+                x_q,
+                layer._fp8_decode_weight,
+                x_scale,
+                layer._fp8_decode_weight_scale,
+                None,
+                torch.bfloat16,
+            )
+            return output[:, :rows].contiguous().view(*x.shape[:-1], rows)
         return UnquantizedLinearMethod.apply(self, layer, x, bias)
 
     def apply_ptpc_prefill(
@@ -1319,6 +1365,53 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
         beta_weight = layer.weight[self.qkv_size : self.qkv_size + self.beta_size]
         beta = tgemm.mm(x, beta_weight, otype=x.dtype)
         return qkv, beta, fg_a
+
+
+class Glm53DraftLmHeadFp8Method:
+    """FP8 (per-token x per-channel) GLM-5.3-Flash MTP draft lm_head on gfx950, reading
+    an FP8 copy of the shared BF16 head; verify keeps the target's BF16 head, so only
+    draft proposals change. The copy is taken once, so a later in-place update of the
+    shared head weight requires prepare() again."""
+
+    def __init__(self, max_m: int):
+        self.max_m = max_m
+
+    @staticmethod
+    def prepare(layer: torch.nn.Module) -> None:
+        import aiter
+
+        weight_fp8, weight_scale = aiter.pertoken_quant(
+            layer.weight.data, quant_dtype=aiter.dtypes.fp8
+        )
+        layer.register_buffer("_fp8_lm_head_weight", weight_fp8, persistent=False)
+        layer.register_buffer(
+            "_fp8_lm_head_scale",
+            weight_scale.view(1, -1).float().contiguous(),
+            persistent=False,
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        num_tokens = x.shape[0]
+        if bias is None and x.dtype == torch.bfloat16 and 0 < num_tokens <= self.max_m:
+            import aiter
+
+            x_q, x_scale = aiter.per_token_quant_hip(
+                x.contiguous(), quant_dtype=aiter.dtypes.fp8
+            )
+            return torch._scaled_mm(
+                x_q,
+                layer._fp8_lm_head_weight.t(),
+                scale_a=x_scale,
+                scale_b=layer._fp8_lm_head_scale,
+                out_dtype=torch.bfloat16,
+            )
+        logits = torch.matmul(x.to(layer.weight.dtype), layer.weight.T)
+        return logits if bias is None else logits + bias
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):

@@ -453,6 +453,34 @@ class TestGLM53KDAPTPC(CustomTestCase):
             GLM53_KDA_FUSED_O_NORM_MIN_M,
             {1024: 1, 2048: 256},
         )
+        with (
+            patch.object(
+                model_module,
+                "can_use_rms_norm_gated_per_token_fp8",
+                return_value=True,
+            ),
+            envs.SGLANG_OPT_GLM53_FAST_DECODE.override(True),
+        ):
+            for local_k, num_tokens, expected in (
+                (2048, 0, False),
+                (2048, 1, True),
+                (2048, 192, True),
+                (1536, 192, False),
+            ):
+                attention.o_proj.register_parameter(
+                    "weight",
+                    torch.nn.Parameter(
+                        torch.empty(4096, local_k, device="meta"),
+                        requires_grad=False,
+                    ),
+                )
+                core = torch.empty(1, num_tokens, local_k // 128, 128, device="meta")
+                gate = torch.empty(num_tokens, local_k // 128, 128, device="meta")
+                with self.subTest(decode=True, local_k=local_k, num_tokens=num_tokens):
+                    self.assertEqual(
+                        attention._use_fused_o_norm_ptpc(core, gate),
+                        expected,
+                    )
 
     def test_model_selector_rejects_unknown_fused_and_quantized_targets(self):
         model_module = sys.modules[Glm5NextLinearAttention.__module__]

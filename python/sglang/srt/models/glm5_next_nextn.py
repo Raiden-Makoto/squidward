@@ -14,11 +14,20 @@
 
 import logging
 
+import torch
+
+from sglang.srt.environ import envs
+from sglang.srt.layers.quantization.unquant import Glm53DraftLmHeadFp8Method
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.utils import is_gfx95_supported
 
 logger = logging.getLogger(__name__)
+
+# Draft token counts measured faster in FP8 (torch._scaled_mm) than BF16 for the TP4
+# vocab shard on gfx950; larger draft batches keep the BF16 head.
+GLM53_DRAFT_FP8_LM_HEAD_MAX_M = 384
 
 
 class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
@@ -74,6 +83,33 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
             getattr(config, "text_config", config),
             quant_config=quant_config,
             prefix=prefix,
+        )
+
+    def set_embed_and_head(self, embed, head):
+        super().set_embed_and_head(embed, head)
+        self._prepare_draft_fp8_lm_head()
+
+    def _prepare_draft_fp8_lm_head(self) -> None:
+        processor = self.logits_processor
+        if not (
+            envs.SGLANG_OPT_GLM53_FAST_DECODE.get()
+            and envs.SGLANG_USE_AITER.get()
+            and is_gfx95_supported()
+            and self.lm_head.weight.dtype == torch.bfloat16
+            and type(getattr(self.lm_head, "quant_method", None)).__name__
+            == "UnquantizedEmbeddingMethod"
+            and not processor.use_fp32_lm_head
+            and not processor.use_fp32_lm_head_output
+            and processor.rl_on_policy_target is None
+        ):
+            return
+        Glm53DraftLmHeadFp8Method.prepare(self.lm_head)
+        self.lm_head.quant_method = Glm53DraftLmHeadFp8Method(
+            max_m=GLM53_DRAFT_FP8_LM_HEAD_MAX_M
+        )
+        logger.info(
+            "GLM-5.3 MTP draft lm_head runs in FP8 up to %d tokens",
+            GLM53_DRAFT_FP8_LM_HEAD_MAX_M,
         )
 
     def load_weights(self, weights):

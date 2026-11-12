@@ -2559,6 +2559,7 @@ def _post_process_topk_ids(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     padded_rows_masked: bool = False,
+    router_finalized: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_shared_topk_slots = topk_config.num_shared_topk_slots
     use_per_rank_shared_slots = has_per_rank_fused_shared_slots(num_shared_topk_slots)
@@ -2677,7 +2678,7 @@ def _post_process_topk_ids(
         _fold_pad_weights_into_append = (
             _fold_pad_into_append and not use_per_rank_shared_slots
         )
-        if not _fold_pad_into_append:
+        if not _fold_pad_into_append and not router_finalized:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         if (
             envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
@@ -2811,7 +2812,11 @@ def _post_process_topk_ids(
         if _is_cuda:
             # The remap shifts a padded row's -1 and gives it a live shared slot.
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
-    elif num_shared_topk_slots > 0 and fused_shared_experts_scaling_factor is not None:
+    elif (
+        num_shared_topk_slots > 0
+        and fused_shared_experts_scaling_factor is not None
+        and not router_finalized
+    ):
         # Standard EP all-reduces the per-rank shared-expert outputs; without the
         # supplied 1/ep_size factor the shared contribution is summed ep_size times.
         topk_weights[:, -num_shared_topk_slots:] *= fused_shared_experts_scaling_factor
@@ -2823,13 +2828,63 @@ def _post_process_topk_ids(
                 _padded_row_mask(topk_ids, num_token_non_padded)[:, None], -1
             )
 
-    if _is_hip and not _skip_hip_pad_mask and not _fold_pad_weights_into_append:
+    if (
+        _is_hip
+        and not _skip_hip_pad_mask
+        and not _fold_pad_weights_into_append
+        and not router_finalized
+    ):
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
         _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
 
     return topk_ids, topk_weights, recorder_topk_ids
+
+
+def _glm_fused_topk(
+    router_logits: torch.Tensor,
+    correction_bias: Optional[torch.Tensor],
+    topk_config: TopKConfig,
+    num_token_non_padded: Optional[torch.Tensor],
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
+    routing_overridden: bool,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """GLM-5.x routing (sigmoid, one group, top-8 + one global shared expert) as one
+    gfx950 launch, or None for the aiter top-k + shared-expert append it reproduces
+    bit for bit."""
+    if not (
+        _use_aiter
+        and _is_gfx95
+        and envs.SGLANG_OPT_GLM53_FAST_DECODE.get()
+        and topk_config.scoring_func == "sigmoid"
+        and topk_config.renormalize
+        and (topk_config.num_expert_group or 1) == 1
+        and (topk_config.topk_group or 1) == 1
+        and topk_config.num_shared_topk_slots == 1
+        and topk_config.top_k == 9
+        and not topk_config.apply_routed_scaling_factor_on_output
+        and topk_config.custom_routing_function is None
+        and not has_per_rank_fused_shared_slots(topk_config.num_shared_topk_slots)
+        and expert_location_dispatch_info is None
+        and not is_expert_remapping_enabled()
+        and not routing_overridden
+        and not envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
+    ):
+        return None
+    from sglang.kernels.ops.moe.glm_topk_gfx950 import glm_topk, glm_topk_supported
+
+    if not glm_topk_supported(router_logits, correction_bias):
+        return None
+    rsf = topk_config.routed_scaling_factor
+    shared_w = topk_config.fused_shared_experts_scaling_factor
+    return glm_topk(
+        router_logits,
+        correction_bias,
+        1.0 if rsf is None else rsf,
+        1.0 if shared_w is None else shared_w,
+        num_token_non_padded,
+    )
 
 
 def select_experts(
@@ -2867,6 +2922,8 @@ def select_experts(
     packed_topk = None
     # True when the router itself masked rows >= num_token_non_padded.
     padded_rows_masked = False
+    # True when the router wrote the shared slot and the padded rows itself.
+    router_finalized = False
 
     simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
     simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
@@ -2964,29 +3021,41 @@ def select_experts(
                 scoring_func=scoring_func,
             )
         else:
-            from sglang.srt.layers.moe import route_quant_handoff
-
-            route_quant_handoff.bind_select_experts(
+            fused_routing = _glm_fused_topk(
+                router_logits,
+                correction_bias,
+                topk_config,
                 num_token_non_padded,
-                fused_routing_ok=(
-                    expert_location_dispatch_info is None
-                    and not routing_overridden
-                    and num_shared_topk_slots == 0
-                ),
+                expert_location_dispatch_info,
+                routing_overridden,
             )
-            topk_weights, topk_ids = biased_grouped_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                correction_bias=correction_bias,
-                topk=top_k_for_gate,
-                renormalize=renormalize,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-                num_fused_shared_experts=num_shared_topk_slots_for_gate,
-                routed_scaling_factor=routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-            )
-            padded_rows_masked = route_quant_handoff.take_padded_rows_masked()
+            if fused_routing is not None:
+                topk_weights, topk_ids = fused_routing
+                router_finalized = True
+            else:
+                from sglang.srt.layers.moe import route_quant_handoff
+
+                route_quant_handoff.bind_select_experts(
+                    num_token_non_padded,
+                    fused_routing_ok=(
+                        expert_location_dispatch_info is None
+                        and not routing_overridden
+                        and num_shared_topk_slots == 0
+                    ),
+                )
+                topk_weights, topk_ids = biased_grouped_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    correction_bias=correction_bias,
+                    topk=top_k_for_gate,
+                    renormalize=renormalize,
+                    num_expert_group=num_expert_group,
+                    topk_group=topk_group,
+                    num_fused_shared_experts=num_shared_topk_slots_for_gate,
+                    routed_scaling_factor=routed_scaling_factor,
+                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                )
+                padded_rows_masked = route_quant_handoff.take_padded_rows_masked()
     elif torch_native and custom_routing_function is None:
         fold_scale_after_routing = True
         topk_weights, topk_ids = fused_topk_native(
@@ -3159,6 +3228,7 @@ def select_experts(
         layer_id=layer_id,
         expert_location_dispatch_info=expert_location_dispatch_info,
         padded_rows_masked=padded_rows_masked,
+        router_finalized=router_finalized,
     )
 
     if recorder_topk_ids is not None:

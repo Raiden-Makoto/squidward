@@ -243,6 +243,126 @@ class TestGLM53KDAPTPC(CustomTestCase):
             del actual, baseline, candidate, expected, layer, weight, x
             torch.cuda.empty_cache()
 
+    def test_packed_first_stage_fp8_decode_window(self):
+        qkv_size, beta_size, fg_size = 6144, 16, 256
+        output_size = qkv_size + beta_size + fg_size
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        weight = (
+            torch.randn(
+                output_size,
+                4096,
+                device="cuda",
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.01
+        )
+        layer = torch.nn.Module()
+        layer.register_parameter(
+            "weight",
+            torch.nn.Parameter(weight, requires_grad=False),
+        )
+        baseline = UnquantizedLinearMethod()
+        candidate = Glm53KdaPackedPtpcLinearMethod(
+            bf16_max_m=4095,
+            fp8_max_m=16384,
+            qkv_size=qkv_size,
+            beta_size=beta_size,
+            fg_size=fg_size,
+            decode_m_range=(64, 512),
+        )
+        candidate.process_weights_after_loading(layer)
+        self.assertEqual(layer._fp8_decode_weight.shape[0] % 64, 0)
+        self.assertNotIn("_fp8_decode_weight", layer.state_dict())
+        for m in (63, 64, 192, 512, 513):
+            x = (
+                torch.randn(
+                    m,
+                    4096,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                    generator=generator,
+                )
+                * 0.1
+            )
+            expected = baseline.apply(layer, x)
+            actual = candidate.apply(layer, x)
+            with self.subTest(m=m):
+                self.assertEqual(actual.shape, expected.shape)
+                self.assertTrue(actual.is_contiguous())
+                if not candidate.decode_active(m):
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                else:
+                    cosine = torch.nn.functional.cosine_similarity(
+                        actual.float().flatten(),
+                        expected.float().flatten(),
+                        dim=0,
+                    )
+                    self.assertGreater(cosine.item(), 0.995)
+                    self.assertTrue(torch.isfinite(actual).all())
+
+        x = torch.randn(192, 4096, device="cuda", dtype=torch.bfloat16) * 0.1
+        candidate.apply(layer, x)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = candidate.apply(layer, x)
+        x.copy_(torch.randn_like(x) * 0.1)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured, candidate.apply(layer, x), atol=0, rtol=0)
+
+    def test_draft_lm_head_fp8(self):
+        from sglang.srt.layers.quantization.unquant import Glm53DraftLmHeadFp8Method
+
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        weight = (
+            torch.randn(
+                38720,
+                4096,
+                device="cuda",
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.02
+        )
+        layer = torch.nn.Module()
+        layer.register_parameter(
+            "weight",
+            torch.nn.Parameter(weight, requires_grad=False),
+        )
+        method = Glm53DraftLmHeadFp8Method(max_m=384)
+        method.prepare(layer)
+        self.assertNotIn("_fp8_lm_head_weight", layer.state_dict())
+        for m in (1, 32, 384, 385):
+            x = torch.randn(
+                m, 4096, device="cuda", dtype=torch.bfloat16, generator=generator
+            )
+            expected = torch.matmul(x, weight.T)
+            actual = method.apply(layer, x)
+            with self.subTest(m=m):
+                self.assertEqual(actual.shape, expected.shape)
+                self.assertEqual(actual.dtype, torch.bfloat16)
+                if m > 384:
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                else:
+                    cosine = torch.nn.functional.cosine_similarity(
+                        actual.float().flatten(),
+                        expected.float().flatten(),
+                        dim=0,
+                    )
+                    self.assertGreater(cosine.item(), 0.995)
+                    self.assertTrue(torch.isfinite(actual).all())
+
+        x = torch.randn(32, 4096, device="cuda", dtype=torch.bfloat16)
+        method.apply(layer, x)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = method.apply(layer, x)
+        x.copy_(torch.randn_like(x))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured, method.apply(layer, x), atol=0, rtol=0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)

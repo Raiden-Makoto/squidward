@@ -2111,6 +2111,11 @@ class Envs:
     # Opt-in PTPC FP8 repacking for selected BF16 GLM-5.3-Flash KDA
     # projections. Comma-separated module names; empty keeps BF16.
     SGLANG_OPT_GLM53_KDA_PTPC_MODULES = EnvTuple(tuple())
+    # ROCm gfx950 GLM-5.3-Flash decode/MTP-verify path, off by default: one-launch MoE
+    # routing (bit-identical), the MTP draft lm_head on an FP8 copy of the shared head
+    # (verify keeps BF16), and, with the PTPC modules above, the fused KDA first-stage
+    # projection and the fused o_norm + o_proj in FP8 at decode token counts.
+    SGLANG_OPT_GLM53_FAST_DECODE = EnvBool(False)
     # CUDA: fuse inverse RoPE into the UE8M0 FP8 wo_a activation quantization.
     # Off by default; requires the FP8 wo_a path.
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
