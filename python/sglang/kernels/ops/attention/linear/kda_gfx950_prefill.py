@@ -50,7 +50,7 @@ def covers(
         and A_log is not None
         and dt_bias is not None
         and all(x.dtype == torch.bfloat16 for x in (q, k, v, g, beta))
-        and ssm_states.dtype in (torch.float32, torch.bfloat16)
+        and ssm_states.dtype == torch.float32
         and ssm_states.is_contiguous()
         and q.shape == k.shape == v.shape == g.shape
         and q.ndim == 4
@@ -90,9 +90,6 @@ def extend(
     if not (
         # spec-decode extends stay on the reference path
         not kwargs.get("is_spec_decode", False)
-        # breakable prefill CUDA graphs pass padded chunk tables; their extend
-        # reaches this kernel through kda_prefill_graph's eager break instead
-        and kwargs.get("chunk_indices") is None
         and (track_state is None) == (track_chunk_idx is None)
         # aligned-only tracking reads the final state, so h is not needed
         and not (
@@ -116,16 +113,9 @@ def extend(
         return None
     # the launch layout depends on the longest sequence; T bounds it without a sync
     seq_lens = kwargs.get("extend_seq_lens_cpu")
-    if ssm_states.dtype == torch.bfloat16:
-        # The kernel keeps an fp32 state; run it on fp32 copies of the batch's slots.
-        slots = cache_indices.to(torch.int64)
-        states = ssm_states.index_select(0, slots).float()
-        state_slots = torch.arange(
-            slots.numel(), dtype=torch.int32, device=slots.device
-        )
-    else:
-        states = ssm_states
-        state_slots = cache_indices.to(torch.int32).contiguous()
+    # A breakable prefill graph pads the batch to its bound with empty PAD_SLOT_ID
+    # sequences (its chunk tables are not needed); pick the launch path for one.
+    padded = kwargs.get("chunk_indices") is not None
     output = get_kernel("attention.kda_prefill_gfx950", KernelBackend.KDA)(
         q.contiguous(),
         k.contiguous(),
@@ -134,8 +124,8 @@ def extend(
         beta.contiguous(),
         A_log.reshape(-1).float().contiguous(),
         dt_bias.reshape(-1).float().contiguous(),
-        states,
-        state_slots,
+        ssm_states,
+        cache_indices.to(torch.int32).contiguous(),
         query_start_loc.to(torch.int32).contiguous(),
         max(seq_lens) if seq_lens else q.shape[1],
         q.shape[-1] ** -0.5,
@@ -145,7 +135,14 @@ def extend(
             if track_chunk_idx is None
             else track_chunk_idx.to(torch.int64).contiguous()
         ),
+        path_seqs=1 if padded else 0,
     )
-    if states is not ssm_states:
-        ssm_states.index_copy_(0, slots, states.to(ssm_states.dtype))
     return (output, None) if return_intermediate_states else output
+
+
+def preload() -> None:
+    """Load the kernel outside CUDA-graph capture; a no-op off gfx950."""
+    if available():
+        from sglang.kernels.kda_kernels.kda_prefill_gfx950 import ensure_loaded
+
+        ensure_loaded()
