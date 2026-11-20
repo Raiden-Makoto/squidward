@@ -89,6 +89,29 @@ SGLANG_TIMEOUT_KEEP_ALIVE=900
 - `server.log` shows the intended `KV Cache is allocated. dtype:` and `mamba_ssm_dtype`.
 - Both arms' `sglang_command.txt` differ only by the arm flag.
 
-## Not comparable to these runs
+## This branch
 
-The stage-2 runs in `/data2/macui/glm53_agentx_stage2_ab` used `--quick` (600 s window), `--acc real`, an FP8 KV cache with `--enable-linear-replayssm-spec`, and AITER `RM/glm53-stage2-mxfp4`. Their results are not comparable to the tables above.
+This branch merges #48806 (FP8 KV with Triton DSA), #49036 (BF16 KDA state), #47336, #44661, #38764, #48303, #44824 and #48112, and adds the FlyDSL KDA MTP verify kernel, the DSA k-pool indexer, MoE router and BF16 GEMM dispatch, breakable prefill graphs and sort-free top-p. The FlyDSL verify kernel engages only with ReplaySSM spec and 6 or 8 draft tokens, so a run of this branch keeps the driver's FP8 KV default and adds the BF16 state, ReplaySSM spec and the opt-in selectors:
+
+```bash
+cd <SGLang-benchmarks>/Agentic && \
+HIP_VISIBLE_DEVICES=4,5,6,7 \
+PYTHONPATH=<this branch>/python:<aiter> \
+IX=<InferenceX> BENCH_HOME=<bench_home> AIPERF_RUNTIME_DIR=<runtime>/<arm>-r<rep> \
+HF_HUB_CACHE=/data2/huggingface/hub \
+DOCKER=rocm/sgl-dev:v0.5.23-rocm724-mi35x-20261102 \
+SGLANG_OPT_GLM53_KDA_PTPC_MODULES=qkv_proj,f_a_proj,g_a_proj,o_proj \
+SGLANG_DSA_FUSE_HADAMARD_QUANT=1 \
+AITER_MXFP4_INTERMEDIATE=1 \
+./ix_agentx_glm53flash.sh --platform mi355x --gpus 4,5,6,7 \
+  --ckpt /data2/huggingface/hub/amd/GLM-5.3-Flash-Quark-MXFP4 \
+  --conc 64 --dsa-backend triton --tag <TAG>-<arm>-c64-wb-r<rep> \
+  --server-arg --skip-server-warmup \
+  --server-arg "--mamba-ssm-dtype bfloat16" \
+  --server-arg "--enable-linear-replayssm-spec" \
+  <arm flag>
+```
+
+The DSA k-pool top-k, grouped-top-k router and small-K GEMM dispatch are on by default on ROCm; the driver already passes `--cuda-graph-backend-prefill breakable`.
+
+The stage-2 runs in `/data2/macui/glm53_agentx_stage2_ab` used this configuration but are not valid A/Bs: they passed `--quick` (600 s window instead of 3,600 s) and `--acc real` (instead of the simulated 3.56), started every run with empty AITER, Triton and TileLang caches, and shared one aiperf runtime directory between arms.
